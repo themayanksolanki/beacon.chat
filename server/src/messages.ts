@@ -35,6 +35,7 @@ export function storeMessage(input: {
     read_at: null,
   };
 
+  
   db.prepare(
     `INSERT INTO messages (id, sender_id, recipient_id, ciphertext, nonce, created_at, delivered_at, read_at)
      VALUES (@id, @sender_id, @recipient_id, @ciphertext, @nonce, @created_at, @delivered_at, @read_at)`
