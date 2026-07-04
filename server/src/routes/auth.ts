@@ -5,48 +5,48 @@ import { db } from "../db";
 import { requireAuth, signToken, type AuthedRequest } from "../auth";
 import { revokeOtherSessions } from "../socketServer";
 import { generateOtp, hashOtp, MAX_ATTEMPTS, OTP_TTL_MS } from "../otp";
-import { sendOtpSms } from "../sms";
+import { sendOtpEmail } from "../email";
 
 export const authRouter = Router();
 
-const PHONE_REGEX = /^\+[1-9]\d{7,14}$/;
+const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
 const otpRequestLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 5,
-  keyGenerator: (req) => `${ipKeyGenerator(req.ip ?? "")}:${req.body?.phoneNumber ?? ""}`,
+  keyGenerator: (req) => `${ipKeyGenerator(req.ip ?? "")}:${req.body?.email ?? ""}`,
 });
 
 interface UserRow {
   id: string;
-  phone_number: string;
+  email: string;
   public_key: string | null;
   current_session_id: string | null;
 }
 
 interface OtpChallengeRow {
   id: string;
-  phone_number: string;
+  email: string;
   code_hash: string;
   expires_at: number;
   attempts: number;
 }
 
-/** Step 1: user submits their phone number, we text them a one-time code. */
+/** Step 1: user submits their email, we mail them a one-time code. */
 authRouter.post("/otp/request", otpRequestLimiter, async (req, res) => {
-  const { phoneNumber } = req.body ?? {};
+  const { email } = req.body ?? {};
 
-  if (typeof phoneNumber !== "string" || !PHONE_REGEX.test(phoneNumber)) {
-    res.status(400).json({ error: "invalid_phone_number" });
+  if (typeof email !== "string" || !EMAIL_REGEX.test(email)) {
+    res.status(400).json({ error: "invalid_email" });
     return;
   }
 
   const code = generateOtp();
   db.prepare(
-    "INSERT INTO otp_challenges (id, phone_number, code_hash, expires_at, attempts, created_at) VALUES (?, ?, ?, ?, 0, ?)"
-  ).run(randomUUID(), phoneNumber, hashOtp(code, phoneNumber), Date.now() + OTP_TTL_MS, Date.now());
+    "INSERT INTO otp_challenges (id, email, code_hash, expires_at, attempts, created_at) VALUES (?, ?, ?, ?, 0, ?)"
+  ).run(randomUUID(), email, hashOtp(code, email), Date.now() + OTP_TTL_MS, Date.now());
 
-  await sendOtpSms(phoneNumber, code);
+  await sendOtpEmail(email, code);
   res.status(202).json({ ok: true });
 });
 
@@ -56,22 +56,18 @@ authRouter.post("/otp/request", otpRequestLimiter, async (req, res) => {
  * account — any other device gets logged out.
  */
 authRouter.post("/otp/verify", async (req, res) => {
-  const { phoneNumber, code, publicKey } = req.body ?? {};
+  const { email, code, publicKey } = req.body ?? {};
 
-  if (
-    typeof phoneNumber !== "string" ||
-    typeof code !== "string" ||
-    typeof publicKey !== "string"
-  ) {
-    res.status(400).json({ error: "phoneNumber, code and publicKey are required" });
+  if (typeof email !== "string" || typeof code !== "string" || typeof publicKey !== "string") {
+    res.status(400).json({ error: "email, code and publicKey are required" });
     return;
   }
 
   const challenge = db
     .prepare<[string], OtpChallengeRow>(
-      "SELECT * FROM otp_challenges WHERE phone_number = ? ORDER BY created_at DESC LIMIT 1"
+      "SELECT * FROM otp_challenges WHERE email = ? ORDER BY created_at DESC LIMIT 1"
     )
-    .get(phoneNumber);
+    .get(email);
 
   if (!challenge || challenge.expires_at < Date.now()) {
     res.status(400).json({ error: "otp_expired_or_not_found" });
@@ -83,29 +79,29 @@ authRouter.post("/otp/verify", async (req, res) => {
     return;
   }
 
-  if (challenge.code_hash !== hashOtp(code, phoneNumber)) {
+  if (challenge.code_hash !== hashOtp(code, email)) {
     db.prepare("UPDATE otp_challenges SET attempts = attempts + 1 WHERE id = ?").run(challenge.id);
     res.status(401).json({ error: "invalid_code" });
     return;
   }
 
-  db.prepare("DELETE FROM otp_challenges WHERE phone_number = ?").run(phoneNumber);
+  db.prepare("DELETE FROM otp_challenges WHERE email = ?").run(email);
 
   const sessionId = randomUUID();
-  let user = db
-    .prepare<[string], UserRow>("SELECT * FROM users WHERE phone_number = ?")
-    .get(phoneNumber);
+  let user = db.prepare<[string], UserRow>("SELECT * FROM users WHERE email = ?").get(email);
 
   if (user) {
-    db.prepare(
-      "UPDATE users SET public_key = ?, current_session_id = ? WHERE id = ?"
-    ).run(publicKey, sessionId, user.id);
+    db.prepare("UPDATE users SET public_key = ?, current_session_id = ? WHERE id = ?").run(
+      publicKey,
+      sessionId,
+      user.id
+    );
   } else {
     const id = randomUUID();
     db.prepare(
-      "INSERT INTO users (id, phone_number, public_key, current_session_id, created_at) VALUES (?, ?, ?, ?, ?)"
-    ).run(id, phoneNumber, publicKey, sessionId, Date.now());
-    user = { id, phone_number: phoneNumber, public_key: publicKey, current_session_id: sessionId };
+      "INSERT INTO users (id, email, public_key, current_session_id, created_at) VALUES (?, ?, ?, ?, ?)"
+    ).run(id, email, publicKey, sessionId, Date.now());
+    user = { id, email, public_key: publicKey, current_session_id: sessionId };
   }
 
   await revokeOtherSessions(user.id);
@@ -119,7 +115,7 @@ authRouter.get("/session", requireAuth, (req: AuthedRequest, res) => {
     .prepare<[string], UserRow>("SELECT * FROM users WHERE id = ?")
     .get(req.user!.userId);
 
-  res.json({ userId: user!.id, phoneNumber: user!.phone_number });
+  res.json({ userId: user!.id, email: user!.email });
 });
 
 authRouter.post("/logout", requireAuth, (req: AuthedRequest, res) => {

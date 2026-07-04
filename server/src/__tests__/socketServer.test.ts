@@ -5,10 +5,10 @@ import { createSocketServer, revokeOtherSessions } from "../socketServer";
 import { db, initDatabase } from "../db";
 import { signToken } from "../auth";
 
-function seedUser(id: string, phoneNumber: string, sessionId: string) {
+function seedUser(id: string, email: string, sessionId: string) {
   db.prepare(
-    "INSERT INTO users (id, phone_number, public_key, current_session_id, created_at) VALUES (?, ?, ?, ?, ?)"
-  ).run(id, phoneNumber, `${phoneNumber}-pubkey`, sessionId, Date.now());
+    "INSERT INTO users (id, email, public_key, current_session_id, created_at) VALUES (?, ?, ?, ?, ?)"
+  ).run(id, email, `${email}-pubkey`, sessionId, Date.now());
 }
 
 describe("socket relay", () => {
@@ -17,8 +17,8 @@ describe("socket relay", () => {
 
   beforeAll((done: jest.DoneCallback) => {
     initDatabase();
-    seedUser("alice-id", "+15551110000", "alice-session-1");
-    seedUser("bob-id", "+15552220000", "bob-session-1");
+    seedUser("alice-id", "alice@example.com", "alice-session-1");
+    seedUser("bob-id", "bob@example.com", "bob-session-1");
     httpServer = createServer();
     createSocketServer(httpServer);
     httpServer.listen(() => {

@@ -2,30 +2,30 @@ import request from "supertest";
 import { createApp } from "../app";
 import { initDatabase } from "../db";
 
-jest.mock("../sms", () => ({ sendOtpSms: jest.fn() }));
-import { sendOtpSms } from "../sms";
+jest.mock("../email", () => ({ sendOtpEmail: jest.fn(), sendInviteEmail: jest.fn() }));
+import { sendOtpEmail } from "../email";
 
 beforeAll(() => {
   initDatabase();
 });
 
 function lastOtpCode(): string {
-  const mock = sendOtpSms as unknown as jest.Mock;
+  const mock = sendOtpEmail as unknown as jest.Mock;
   const [, code] = mock.mock.calls[mock.mock.calls.length - 1];
   return code;
 }
 
-describe("phone + OTP auth flow", () => {
-  it("logs in with phone + OTP, and a second-device login revokes the first session", async () => {
+describe("email + OTP auth flow", () => {
+  it("logs in with email + OTP, and a second-device login revokes the first session", async () => {
     const app = createApp();
-    const phoneNumber = "+15550001111";
+    const email = "alice@example.com";
 
-    const requestRes = await request(app).post("/auth/otp/request").send({ phoneNumber });
+    const requestRes = await request(app).post("/auth/otp/request").send({ email });
     expect(requestRes.status).toBe(202);
 
     const verifyA = await request(app)
       .post("/auth/otp/verify")
-      .send({ phoneNumber, code: lastOtpCode(), publicKey: "device-a-pubkey" });
+      .send({ email, code: lastOtpCode(), publicKey: "device-a-pubkey" });
     expect(verifyA.status).toBe(200);
     const tokenA = verifyA.body.token;
 
@@ -33,13 +33,13 @@ describe("phone + OTP auth flow", () => {
       .get("/auth/session")
       .set("Authorization", `Bearer ${tokenA}`);
     expect(sessionA.status).toBe(200);
-    expect(sessionA.body.phoneNumber).toBe(phoneNumber);
+    expect(sessionA.body.email).toBe(email);
 
     // Logging in again (a second device) must invalidate tokenA.
-    await request(app).post("/auth/otp/request").send({ phoneNumber });
+    await request(app).post("/auth/otp/request").send({ email });
     const verifyB = await request(app)
       .post("/auth/otp/verify")
-      .send({ phoneNumber, code: lastOtpCode(), publicKey: "device-b-pubkey" });
+      .send({ email, code: lastOtpCode(), publicKey: "device-b-pubkey" });
     expect(verifyB.status).toBe(200);
 
     const staleSession = await request(app)
@@ -51,24 +51,24 @@ describe("phone + OTP auth flow", () => {
 
   it("rejects an incorrect OTP code", async () => {
     const app = createApp();
-    const phoneNumber = "+15550002222";
-    await request(app).post("/auth/otp/request").send({ phoneNumber });
+    const email = "bob@example.com";
+    await request(app).post("/auth/otp/request").send({ email });
 
     const res = await request(app)
       .post("/auth/otp/verify")
-      .send({ phoneNumber, code: "000000", publicKey: "pubkey" });
+      .send({ email, code: "000000", publicKey: "pubkey" });
 
     expect(res.status).toBe(401);
   });
 
   it("logout clears the session so the token stops working", async () => {
     const app = createApp();
-    const phoneNumber = "+15550003333";
-    await request(app).post("/auth/otp/request").send({ phoneNumber });
+    const email = "carol@example.com";
+    await request(app).post("/auth/otp/request").send({ email });
 
     const verifyRes = await request(app)
       .post("/auth/otp/verify")
-      .send({ phoneNumber, code: lastOtpCode(), publicKey: "pubkey" });
+      .send({ email, code: lastOtpCode(), publicKey: "pubkey" });
     const token = verifyRes.body.token;
 
     const logoutRes = await request(app)

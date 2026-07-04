@@ -7,11 +7,13 @@ import { useAuth } from "../auth/AuthContext";
 import PrimaryButton from "../components/PrimaryButton";
 import { colors } from "../theme";
 
-type Props = NativeStackScreenProps<AuthStackParamList, "PhoneEntry">;
+type Props = NativeStackScreenProps<AuthStackParamList, "EmailEntry">;
 
-export default function PhoneEntryScreen({ navigation }: Props) {
+const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+export default function EmailEntryScreen({ navigation }: Props) {
   const { requestOtp } = useAuth();
-  const [phoneNumber, setPhoneNumber] = useState("");
+  const [email, setEmail] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -19,8 +21,8 @@ export default function PhoneEntryScreen({ navigation }: Props) {
     setError(null);
     setLoading(true);
     try {
-      await requestOtp(phoneNumber);
-      navigation.navigate("Otp", { phoneNumber });
+      await requestOtp(email);
+      navigation.navigate("Otp", { email });
     } catch (e) {
       setError(e instanceof Error ? e.message : "Something went wrong");
     } finally {
@@ -30,20 +32,22 @@ export default function PhoneEntryScreen({ navigation }: Props) {
 
   return (
     <View style={styles.container}>
-      <Text style={styles.title}>Enter your phone number</Text>
+      <Text style={styles.title}>Enter your email</Text>
       <TextInput
         style={styles.input}
-        placeholder="+15551234567"
-        keyboardType="phone-pad"
-        autoComplete="tel"
-        value={phoneNumber}
-        onChangeText={setPhoneNumber}
+        placeholder="you@example.com"
+        keyboardType="email-address"
+        autoComplete="email"
+        autoCapitalize="none"
+        autoCorrect={false}
+        value={email}
+        onChangeText={setEmail}
       />
       {error ? <Text style={styles.error}>{error}</Text> : null}
       <PrimaryButton
         title="Send code"
         onPress={onSubmit}
-        disabled={!phoneNumber}
+        disabled={!EMAIL_REGEX.test(email)}
         loading={loading}
       />
     </View>

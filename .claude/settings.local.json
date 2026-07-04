@@ -53,7 +53,10 @@
       "Bash(security find-identity *)",
       "Bash(defaults read *)",
       "Bash(npx eas-cli *)",
-      "Bash(npx --yes @railway/cli --version)"
+      "Bash(npx --yes @railway/cli --version)",
+      "Bash(npx @railway/cli whoami)",
+      "Bash(npx @railway/cli init --help)",
+      "Bash(npx *)"
     ]
   }
 }

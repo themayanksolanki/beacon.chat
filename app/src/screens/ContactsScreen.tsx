@@ -1,17 +1,10 @@
 import { useCallback, useEffect, useState } from "react";
-import {
-  ActivityIndicator,
-  FlatList,
-  Pressable,
-  Share,
-  StyleSheet,
-  Text,
-  View,
-} from "react-native";
+import { ActivityIndicator, Alert, FlatList, Pressable, StyleSheet, Text, View } from "react-native";
 import type { NativeStackScreenProps } from "@react-navigation/native-stack";
 import { Ionicons } from "@expo/vector-icons";
 
 import type { MainStackParamList } from "../../App";
+import { inviteByEmail } from "../api/client";
 import { useAuth } from "../auth/AuthContext";
 import { loadMatchedContacts, type MatchedContact } from "../contacts/matchContacts";
 import { getConversationByPeerKey, insertConversation } from "../db/database";
@@ -19,17 +12,15 @@ import { colorForName, colors, initialFor } from "../theme";
 
 type Props = NativeStackScreenProps<MainStackParamList, "Contacts">;
 
-const INVITE_MESSAGE =
-  "I'm using Beacon to chat — it's not on your Beacon contacts yet. Come join me!";
-
 export default function ContactsScreen({ navigation }: Props) {
-  const { token, phoneNumber } = useAuth();
+  const { token, email } = useAuth();
   const [contacts, setContacts] = useState<MatchedContact[] | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [invitingId, setInvitingId] = useState<string | null>(null);
 
   useEffect(() => {
-    if (!token || !phoneNumber) return;
-    loadMatchedContacts(token, phoneNumber)
+    if (!token || !email) return;
+    loadMatchedContacts(token, email)
       .then(setContacts)
       .catch((e) =>
         setError(
@@ -38,7 +29,7 @@ export default function ContactsScreen({ navigation }: Props) {
             : "Couldn't load contacts."
         )
       );
-  }, [token, phoneNumber]);
+  }, [token, email]);
 
   const openChat = useCallback(
     (contact: MatchedContact) => {
@@ -58,9 +49,21 @@ export default function ContactsScreen({ navigation }: Props) {
     [navigation]
   );
 
-  const invite = useCallback((contact: MatchedContact) => {
-    Share.share({ message: `${contact.name}, ${INVITE_MESSAGE}` }).catch(() => {});
-  }, []);
+  const invite = useCallback(
+    async (contact: MatchedContact) => {
+      if (!token) return;
+      setInvitingId(contact.id);
+      try {
+        await inviteByEmail(token, contact.email);
+        Alert.alert("Invite sent", `We emailed ${contact.name} a link to join Beacon.`);
+      } catch {
+        Alert.alert("Couldn't send invite", "Please try again later.");
+      } finally {
+        setInvitingId(null);
+      }
+    },
+    [token]
+  );
 
   if (error) {
     return (
@@ -96,14 +99,24 @@ export default function ContactsScreen({ navigation }: Props) {
           </View>
           <View style={styles.info}>
             <Text style={styles.name}>{item.name}</Text>
-            <Text style={styles.phone}>{item.phoneNumber}</Text>
+            <Text style={styles.email}>{item.email}</Text>
           </View>
           {item.registered ? (
             <Ionicons name="chevron-forward" size={18} color={colors.textTertiary} />
           ) : (
-            <Pressable style={styles.inviteButton} onPress={() => invite(item)}>
-              <Ionicons name="person-add-outline" size={14} color={colors.accent} />
-              <Text style={styles.inviteText}>Invite</Text>
+            <Pressable
+              style={styles.inviteButton}
+              onPress={() => invite(item)}
+              disabled={invitingId === item.id}
+            >
+              {invitingId === item.id ? (
+                <ActivityIndicator size="small" color={colors.accent} />
+              ) : (
+                <>
+                  <Ionicons name="mail-outline" size={14} color={colors.accent} />
+                  <Text style={styles.inviteText}>Invite</Text>
+                </>
+              )}
             </Pressable>
           )}
         </Pressable>
@@ -130,7 +143,7 @@ const styles = StyleSheet.create({
   avatarText: { fontSize: 16, fontWeight: "700", color: "#fff" },
   info: { flex: 1 },
   name: { fontSize: 16, fontWeight: "600", color: colors.text },
-  phone: { fontSize: 13, color: colors.textSecondary, marginTop: 2 },
+  email: { fontSize: 13, color: colors.textSecondary, marginTop: 2 },
   inviteButton: {
     flexDirection: "row",
     alignItems: "center",
@@ -140,6 +153,8 @@ const styles = StyleSheet.create({
     borderRadius: 16,
     paddingHorizontal: 12,
     paddingVertical: 6,
+    minWidth: 68,
+    justifyContent: "center",
   },
   inviteText: { color: colors.accent, fontWeight: "600", fontSize: 13 },
 });

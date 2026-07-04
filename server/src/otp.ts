@@ -15,8 +15,8 @@ export function generateOtp(): string {
   return randomInt(0, 1_000_000).toString().padStart(6, "0");
 }
 
-export function hashOtp(code: string, phoneNumber: string): string {
-  return createHash("sha256").update(`${OTP_PEPPER}:${phoneNumber}:${code}`).digest("hex");
+export function hashOtp(code: string, email: string): string {
+  return createHash("sha256").update(`${OTP_PEPPER}:${email}:${code}`).digest("hex");
 }
 
 export { OTP_TTL_MS, MAX_ATTEMPTS };

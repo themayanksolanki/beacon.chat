@@ -27,22 +27,22 @@ async function request<T>(path: string, options: RequestOptions = {}): Promise<T
   return res.json();
 }
 
-export function requestOtp(phoneNumber: string) {
+export function requestOtp(email: string) {
   return request<{ ok: true }>("/auth/otp/request", {
     method: "POST",
-    body: JSON.stringify({ phoneNumber }),
+    body: JSON.stringify({ email }),
   });
 }
 
-export function verifyOtp(phoneNumber: string, code: string, publicKey: string) {
+export function verifyOtp(email: string, code: string, publicKey: string) {
   return request<{ token: string; userId: string }>("/auth/otp/verify", {
     method: "POST",
-    body: JSON.stringify({ phoneNumber, code, publicKey }),
+    body: JSON.stringify({ email, code, publicKey }),
   });
 }
 
 export function getSession(token: string) {
-  return request<{ userId: string; phoneNumber: string }>("/auth/session", { token });
+  return request<{ userId: string; email: string }>("/auth/session", { token });
 }
 
 export function logout(token: string) {
@@ -50,16 +50,24 @@ export function logout(token: string) {
 }
 
 export interface LookupMatch {
-  phoneNumber: string;
+  email: string;
   userId: string;
   publicKey: string;
 }
 
-export async function lookupUsers(token: string, phoneNumbers: string[]) {
+export async function lookupUsers(token: string, emails: string[]) {
   const { matches } = await request<{ matches: LookupMatch[] }>("/users/lookup", {
     method: "POST",
     token,
-    body: JSON.stringify({ phoneNumbers }),
+    body: JSON.stringify({ emails }),
   });
   return matches;
+}
+
+export function inviteByEmail(token: string, email: string) {
+  return request<{ ok: true }>("/users/invite", {
+    method: "POST",
+    token,
+    body: JSON.stringify({ email }),
+  });
 }

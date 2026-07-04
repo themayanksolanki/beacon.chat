@@ -9,7 +9,7 @@ import { colorForName, colors, initialFor } from "../theme";
 type Props = NativeStackScreenProps<MainStackParamList, "Settings">;
 
 export default function SettingsScreen({ navigation }: Props) {
-  const { profile, phoneNumber, logout } = useAuth();
+  const { profile, email, logout } = useAuth();
 
   return (
     <View style={styles.container}>
@@ -24,7 +24,7 @@ export default function SettingsScreen({ navigation }: Props) {
           )}
           <View style={styles.info}>
             <Text style={styles.name}>{profile?.fullName}</Text>
-            <Text style={styles.phone}>{phoneNumber}</Text>
+            <Text style={styles.email}>{email}</Text>
           </View>
           <Ionicons name="chevron-forward" size={20} color={colors.textTertiary} />
         </Pressable>
@@ -67,6 +67,6 @@ const styles = StyleSheet.create({
   avatarInitial: { fontSize: 20, fontWeight: "700", color: "#fff" },
   info: { flex: 1 },
   name: { fontSize: 16, fontWeight: "600", color: colors.text },
-  phone: { fontSize: 13, color: colors.textSecondary, marginTop: 2 },
+  email: { fontSize: 13, color: colors.textSecondary, marginTop: 2 },
   logout: { fontSize: 16, color: colors.danger, fontWeight: "500" },
 });

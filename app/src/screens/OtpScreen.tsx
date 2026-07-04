@@ -10,7 +10,7 @@ import { colors } from "../theme";
 type Props = NativeStackScreenProps<AuthStackParamList, "Otp">;
 
 export default function OtpScreen({ route }: Props) {
-  const { phoneNumber } = route.params;
+  const { email } = route.params;
   const { verifyOtp } = useAuth();
   const [code, setCode] = useState("");
   const [loading, setLoading] = useState(false);
@@ -20,7 +20,7 @@ export default function OtpScreen({ route }: Props) {
     setError(null);
     setLoading(true);
     try {
-      await verifyOtp(phoneNumber, code);
+      await verifyOtp(email, code);
       // On success AuthProvider flips status to "signed-in" and the
       // navigator swaps to the main stack on its own.
     } catch (e) {
@@ -32,7 +32,7 @@ export default function OtpScreen({ route }: Props) {
 
   return (
     <View style={styles.container}>
-      <Text style={styles.title}>Enter the code sent to{"\n"}{phoneNumber}</Text>
+      <Text style={styles.title}>Enter the code sent to{"\n"}{email}</Text>
       <TextInput
         style={styles.input}
         placeholder="123456"

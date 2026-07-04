@@ -11,7 +11,7 @@ import ChatScreen from "./src/screens/ChatScreen";
 import ContactsScreen from "./src/screens/ContactsScreen";
 import SettingsScreen from "./src/screens/SettingsScreen";
 import EditProfileScreen from "./src/screens/EditProfileScreen";
-import PhoneEntryScreen from "./src/screens/PhoneEntryScreen";
+import EmailEntryScreen from "./src/screens/EmailEntryScreen";
 import OtpScreen from "./src/screens/OtpScreen";
 import NameEntryScreen from "./src/screens/NameEntryScreen";
 import ProfilePhotoScreen from "./src/screens/ProfilePhotoScreen";
@@ -21,8 +21,8 @@ import { AuthProvider, useAuth } from "./src/auth/AuthContext";
 import { colors } from "./src/theme";
 
 export type AuthStackParamList = {
-  PhoneEntry: undefined;
-  Otp: { phoneNumber: string };
+  EmailEntry: undefined;
+  Otp: { email: string };
 };
 
 export type ProfileStackParamList = {
@@ -97,8 +97,8 @@ function RootNavigator() {
     return (
       <AuthStack.Navigator>
         <AuthStack.Screen
-          name="PhoneEntry"
-          component={PhoneEntryScreen}
+          name="EmailEntry"
+          component={EmailEntryScreen}
           options={{ title: "Sign in" }}
         />
         <AuthStack.Screen name="Otp" component={OtpScreen} options={{ title: "Verify code" }} />

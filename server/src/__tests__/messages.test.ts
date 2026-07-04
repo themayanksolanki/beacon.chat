@@ -2,17 +2,17 @@ import { randomUUID } from "node:crypto";
 import { db, initDatabase } from "../db";
 import { getUndeliveredMessages, markDelivered, storeMessage } from "../messages";
 
-function seedUser(id: string, phoneNumber: string) {
+function seedUser(id: string, email: string) {
   db.prepare(
-    "INSERT INTO users (id, phone_number, public_key, current_session_id, created_at) VALUES (?, ?, ?, ?, ?)"
-  ).run(id, phoneNumber, `${phoneNumber}-pubkey`, `${id}-session`, Date.now());
+    "INSERT INTO users (id, email, public_key, current_session_id, created_at) VALUES (?, ?, ?, ?, ?)"
+  ).run(id, email, `${email}-pubkey`, `${id}-session`, Date.now());
 }
 
 beforeAll(() => {
   initDatabase();
-  seedUser("sender-1", "sender-one");
-  seedUser("recipient-1", "recipient-one");
-  seedUser("recipient-2", "recipient-two");
+  seedUser("sender-1", "sender-one@example.com");
+  seedUser("recipient-1", "recipient-one@example.com");
+  seedUser("recipient-2", "recipient-two@example.com");
 });
 
 describe("message store", () => {

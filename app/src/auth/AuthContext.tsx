@@ -20,11 +20,11 @@ type AuthStatus = "loading" | "signed-out" | "needs-profile" | "signed-in";
 
 interface AuthContextValue {
   status: AuthStatus;
-  phoneNumber: string | null;
+  email: string | null;
   profile: Profile | null;
   token: string | null;
-  requestOtp: (phoneNumber: string) => Promise<void>;
-  verifyOtp: (phoneNumber: string, code: string) => Promise<void>;
+  requestOtp: (email: string) => Promise<void>;
+  verifyOtp: (email: string, code: string) => Promise<void>;
   completeProfile: (fullName: string, photoUri: string | null) => Promise<void>;
   updateProfile: (fullName: string, photoUri: string | null) => Promise<void>;
   logout: () => Promise<void>;
@@ -34,7 +34,7 @@ const AuthContext = createContext<AuthContextValue | null>(null);
 
 export function AuthProvider({ children }: { children: ReactNode }) {
   const [status, setStatus] = useState<AuthStatus>("loading");
-  const [phoneNumber, setPhoneNumber] = useState<string | null>(null);
+  const [email, setEmail] = useState<string | null>(null);
   const [profile, setProfile] = useState<Profile | null>(null);
   const [token, setToken] = useState<string | null>(null);
 
@@ -44,7 +44,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     disconnectSocket();
     void clearSessionToken();
     void clearProfile();
-    setPhoneNumber(null);
+    setEmail(null);
     setProfile(null);
     setToken(null);
     setStatus("signed-out");
@@ -63,7 +63,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
       try {
         const session = await api.getSession(storedToken);
-        setPhoneNumber(session.phoneNumber);
+        setEmail(session.email);
         setToken(storedToken);
         connectSocket(storedToken).on("session:revoked", signOutLocally);
 
@@ -80,19 +80,19 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     })();
   }, [signOutLocally]);
 
-  const requestOtp = useCallback(async (phone: string) => {
-    await api.requestOtp(phone);
+  const requestOtp = useCallback(async (emailAddress: string) => {
+    await api.requestOtp(emailAddress);
   }, []);
 
   const verifyOtp = useCallback(
-    async (phone: string, code: string) => {
+    async (emailAddress: string, code: string) => {
       const identity = await getOrCreateIdentity();
       await sodium.ready;
       const publicKey = sodium.to_base64(identity.publicKey);
 
-      const { token: newToken } = await api.verifyOtp(phone, code, publicKey);
+      const { token: newToken } = await api.verifyOtp(emailAddress, code, publicKey);
       await saveSessionToken(newToken);
-      setPhoneNumber(phone);
+      setEmail(emailAddress);
       setToken(newToken);
       connectSocket(newToken).on("session:revoked", signOutLocally);
 
@@ -129,7 +129,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const value = useMemo(
     () => ({
       status,
-      phoneNumber,
+      email,
       profile,
       token,
       requestOtp,
@@ -138,7 +138,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       updateProfile,
       logout,
     }),
-    [status, phoneNumber, profile, token, requestOtp, verifyOtp, completeProfile, updateProfile, logout]
+    [status, email, profile, token, requestOtp, verifyOtp, completeProfile, updateProfile, logout]
   );
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;

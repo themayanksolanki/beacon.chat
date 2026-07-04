@@ -1,22 +1,22 @@
 import { Router } from "express";
 import { db } from "../db";
-import { requireAuth } from "../auth";
+import { requireAuth, type AuthedRequest } from "../auth";
+import { sendInviteEmail } from "../email";
 
 export const usersRouter = Router();
 
 interface UserRow {
   id: string;
-  phone_number: string;
+  email: string;
   public_key: string | null;
 }
 
-const MAX_LOOKUP_NUMBERS = 500;
+const MAX_LOOKUP_EMAILS = 500;
+const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
-usersRouter.get("/by-phone/:phoneNumber/public-key", requireAuth, (req, res) => {
-  const phoneNumber = String(req.params.phoneNumber);
-  const user = db
-    .prepare<[string], UserRow>("SELECT * FROM users WHERE phone_number = ?")
-    .get(phoneNumber);
+usersRouter.get("/by-email/:email/public-key", requireAuth, (req, res) => {
+  const email = String(req.params.email);
+  const user = db.prepare<[string], UserRow>("SELECT * FROM users WHERE email = ?").get(email);
 
   if (!user || !user.public_key) {
     res.status(404).json({ error: "user not found" });
@@ -27,20 +27,20 @@ usersRouter.get("/by-phone/:phoneNumber/public-key", requireAuth, (req, res) => 
 });
 
 /**
- * Bulk contact-matching lookup: the app sends every phone number from the
+ * Bulk contact-matching lookup: the app sends every email from the
  * device's address book and gets back only the ones registered on Beacon
  * (with a public key, i.e. they've completed OTP verification at least
  * once). Used to distinguish "chat" vs "invite" in the Contacts screen.
  */
 usersRouter.post("/lookup", requireAuth, (req, res) => {
-  const { phoneNumbers } = req.body ?? {};
+  const { emails } = req.body ?? {};
 
-  if (!Array.isArray(phoneNumbers) || phoneNumbers.some((p) => typeof p !== "string")) {
-    res.status(400).json({ error: "phoneNumbers must be an array of strings" });
+  if (!Array.isArray(emails) || emails.some((e) => typeof e !== "string")) {
+    res.status(400).json({ error: "emails must be an array of strings" });
     return;
   }
 
-  const unique = [...new Set(phoneNumbers)].slice(0, MAX_LOOKUP_NUMBERS);
+  const unique = [...new Set(emails)].slice(0, MAX_LOOKUP_EMAILS);
   if (unique.length === 0) {
     res.json({ matches: [] });
     return;
@@ -49,11 +49,28 @@ usersRouter.post("/lookup", requireAuth, (req, res) => {
   const placeholders = unique.map(() => "?").join(",");
   const rows = db
     .prepare<string[], UserRow>(
-      `SELECT id, phone_number, public_key FROM users WHERE phone_number IN (${placeholders}) AND public_key IS NOT NULL`
+      `SELECT id, email, public_key FROM users WHERE email IN (${placeholders}) AND public_key IS NOT NULL`
     )
     .all(...unique);
 
   res.json({
-    matches: rows.map((r) => ({ phoneNumber: r.phone_number, userId: r.id, publicKey: r.public_key })),
+    matches: rows.map((r) => ({ email: r.email, userId: r.id, publicKey: r.public_key })),
   });
+});
+
+/** Invites someone not yet on Beacon via a real email with a join link. */
+usersRouter.post("/invite", requireAuth, async (req: AuthedRequest, res) => {
+  const { email } = req.body ?? {};
+
+  if (typeof email !== "string" || !EMAIL_REGEX.test(email)) {
+    res.status(400).json({ error: "invalid_email" });
+    return;
+  }
+
+  const inviter = db
+    .prepare<[string], UserRow>("SELECT * FROM users WHERE id = ?")
+    .get(req.user!.userId);
+
+  await sendInviteEmail(email, inviter?.email ?? "A Beacon user");
+  res.status(202).json({ ok: true });
 });
