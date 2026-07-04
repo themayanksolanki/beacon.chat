@@ -1,0 +1,51 @@
+{
+  "expo": {
+    "name": "Beacon",
+    "slug": "beacon-chat",
+    "scheme": "beacon-chat",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "userInterfaceStyle": "light",
+    "ios": {
+      "bundleIdentifier": "com.beaconchat.app",
+      "supportsTablet": true,
+      "infoPlist": {
+        "NSFaceIDUsageDescription": "Beacon can use Face ID to protect access to your encryption keys.",
+        "ITSAppUsesNonExemptEncryption": true,
+        "NSAppTransportSecurity": {
+          "NSAllowsLocalNetworking": true
+        }
+      }
+    },
+    "android": {
+      "package": "com.beaconchat.app",
+      "adaptiveIcon": {
+        "backgroundColor": "#E6F4FE",
+        "foregroundImage": "./assets/android-icon-foreground.png",
+        "backgroundImage": "./assets/android-icon-background.png",
+        "monochromeImage": "./assets/android-icon-monochrome.png"
+      },
+      "predictiveBackGestureEnabled": false
+    },
+    "web": {
+      "favicon": "./assets/favicon.png"
+    },
+    "plugins": [
+      "expo-secure-store",
+      "expo-sqlite",
+      [
+        "expo-image-picker",
+        {
+          "photosPermission": "Beacon needs access to your photos so you can set a profile picture."
+        }
+      ],
+      [
+        "expo-contacts",
+        {
+          "contactsPermission": "Beacon needs access to your contacts to show which of them are already on Beacon."
+        }
+      ]
+    ]
+  }
+}

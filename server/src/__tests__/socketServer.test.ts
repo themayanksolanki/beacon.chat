@@ -1,0 +1,127 @@
+import { createServer } from "node:http";
+import type { AddressInfo } from "node:net";
+import { io as ioClient, Socket as ClientSocket } from "socket.io-client";
+import { createSocketServer, revokeOtherSessions } from "../socketServer";
+import { db, initDatabase } from "../db";
+import { signToken } from "../auth";
+
+function seedUser(id: string, phoneNumber: string, sessionId: string) {
+  db.prepare(
+    "INSERT INTO users (id, phone_number, public_key, current_session_id, created_at) VALUES (?, ?, ?, ?, ?)"
+  ).run(id, phoneNumber, `${phoneNumber}-pubkey`, sessionId, Date.now());
+}
+
+describe("socket relay", () => {
+  let httpServer: ReturnType<typeof createServer>;
+  let port: number;
+
+  beforeAll((done: jest.DoneCallback) => {
+    initDatabase();
+    seedUser("alice-id", "+15551110000", "alice-session-1");
+    seedUser("bob-id", "+15552220000", "bob-session-1");
+    httpServer = createServer();
+    createSocketServer(httpServer);
+    httpServer.listen(() => {
+      port = (httpServer.address() as AddressInfo).port;
+      done();
+    });
+  });
+
+  afterAll((done: jest.DoneCallback) => {
+    httpServer.close(done);
+  });
+
+  function connect(userId: string, sessionId: string): ClientSocket {
+    const token = signToken({ userId, sessionId });
+    return ioClient(`http://localhost:${port}`, {
+      auth: { token },
+      transports: ["websocket"],
+      forceNew: true,
+    });
+  }
+
+  it("rejects connections without a valid token", (done: jest.DoneCallback) => {
+    const client = ioClient(`http://localhost:${port}`, {
+      transports: ["websocket"],
+      forceNew: true,
+    });
+
+    client.on("connect_error", (err) => {
+      expect(err.message).toBe("Missing auth token");
+      client.close();
+      done();
+    });
+  });
+
+  it("rejects a token whose session no longer matches the user's current session", (done: jest.DoneCallback) => {
+    const client = connect("alice-id", "stale-session");
+
+    client.on("connect_error", (err) => {
+      expect(err.message).toBe("session_revoked");
+      client.close();
+      done();
+    });
+  });
+
+  it("relays a ciphertext message from sender to recipient", (done: jest.DoneCallback) => {
+    const alice = connect("alice-id", "alice-session-1");
+    const bob = connect("bob-id", "bob-session-1");
+
+    bob.on("message", (message) => {
+      expect(message.sender_id).toBe("alice-id");
+      expect(message.ciphertext).toBe("cipher-blob");
+      expect(message.nonce).toBe("nonce-value");
+      alice.close();
+      bob.close();
+      done();
+    });
+
+    // Both sockets connect independently and in no guaranteed order, so
+    // each "connect" listener must be registered up front rather than
+    // nested inside the other's callback (nesting risks missing an event
+    // that already fired before the inner listener was attached).
+    let aliceConnected = false;
+    let bobConnected = false;
+    const sendIfReady = () => {
+      if (aliceConnected && bobConnected) {
+        alice.emit("message:send", {
+          id: "message-1",
+          recipientId: "bob-id",
+          ciphertext: "cipher-blob",
+          nonce: "nonce-value",
+        });
+      }
+    };
+    alice.on("connect", () => {
+      aliceConnected = true;
+      sendIfReady();
+    });
+    bob.on("connect", () => {
+      bobConnected = true;
+      sendIfReady();
+    });
+  });
+
+  it("force-disconnects a device's socket when it logs in elsewhere", (done: jest.DoneCallback) => {
+    const oldDevice = connect("alice-id", "alice-session-1");
+    let sawRevokedEvent = false;
+
+    oldDevice.on("session:revoked", () => {
+      sawRevokedEvent = true;
+    });
+
+    oldDevice.on("disconnect", () => {
+      expect(sawRevokedEvent).toBe(true);
+      done();
+    });
+
+    oldDevice.on("connect", async () => {
+      // Simulate what /auth/otp/verify does on a second-device login.
+      db.prepare("UPDATE users SET current_session_id = ? WHERE id = ?").run(
+        "alice-session-2",
+        "alice-id"
+      );
+      await revokeOtherSessions("alice-id");
+    });
+  });
+});
