@@ -1,7 +1,14 @@
 import type { Server as HttpServer } from "node:http";
 import { Server, Socket } from "socket.io";
 import { isSessionActive, verifyToken } from "./auth";
-import { deleteMessageForEveryone, getUndeliveredMessages, markDelivered, markRead, storeMessage } from "./messages";
+import {
+  deleteMessageForEveryone,
+  getUndeliveredMessages,
+  markDelivered,
+  markRead,
+  storeMessage,
+  userExists,
+} from "./messages";
 
 interface AuthedSocket extends Socket {
   userId?: string;
@@ -47,41 +54,67 @@ export function createSocketServer(httpServer: HttpServer): Server {
       "message:send",
       (
         payload: { id: string; recipientId: string; ciphertext: string; nonce: string },
-        ack?: (response: { createdAt: number }) => void
+        ack?: (response: { ok: true; createdAt: number } | { ok: false; error: string }) => void
       ) => {
-        const message = storeMessage({
-          id: payload.id,
-          senderId: userId,
-          recipientId: payload.recipientId,
-          ciphertext: payload.ciphertext,
-          nonce: payload.nonce,
-        });
+        try {
+          // recipientId is client-supplied; storeMessage's FK constraint would
+          // otherwise throw here and — uncaught — take down the whole process
+          // for every connected user over one bad payload.
+          if (!userExists(payload.recipientId)) {
+            ack?.({ ok: false, error: "recipient_not_found" });
+            return;
+          }
 
-        io!.to(payload.recipientId).emit("message", message);
-        ack?.({ createdAt: message.created_at });
+          const message = storeMessage({
+            id: payload.id,
+            senderId: userId,
+            recipientId: payload.recipientId,
+            ciphertext: payload.ciphertext,
+            nonce: payload.nonce,
+          });
+
+          io!.to(payload.recipientId).emit("message", message);
+          ack?.({ ok: true, createdAt: message.created_at });
+        } catch (err) {
+          console.error("[socket] message:send failed", err);
+          ack?.({ ok: false, error: "internal_error" });
+        }
       }
     );
 
     socket.on("message:delivered", (payload: { id: string; senderId: string }) => {
-      const deliveredAt = markDelivered(payload.id);
-      io!.to(payload.senderId).emit("message:delivered", { id: payload.id, deliveredAt });
+      try {
+        const deliveredAt = markDelivered(payload.id);
+        io!.to(payload.senderId).emit("message:delivered", { id: payload.id, deliveredAt });
+      } catch (err) {
+        console.error("[socket] message:delivered failed", err);
+      }
     });
 
     socket.on("message:read", (payload: { id: string; senderId: string }) => {
-      const readAt = markRead(payload.id);
-      io!.to(payload.senderId).emit("message:read", { id: payload.id, readAt });
+      try {
+        const readAt = markRead(payload.id);
+        io!.to(payload.senderId).emit("message:read", { id: payload.id, readAt });
+      } catch (err) {
+        console.error("[socket] message:read failed", err);
+      }
     });
 
     socket.on(
       "message:delete",
       (payload: { id: string }, ack?: (response: { ok: true } | { ok: false; error: string }) => void) => {
-        const result = deleteMessageForEveryone(payload.id, userId);
-        if (!result.ok) {
-          ack?.({ ok: false, error: result.error });
-          return;
+        try {
+          const result = deleteMessageForEveryone(payload.id, userId);
+          if (!result.ok) {
+            ack?.({ ok: false, error: result.error });
+            return;
+          }
+          io!.to(result.message.recipient_id).emit("message:deleted", { id: result.message.id });
+          ack?.({ ok: true });
+        } catch (err) {
+          console.error("[socket] message:delete failed", err);
+          ack?.({ ok: false, error: "internal_error" });
         }
-        io!.to(result.message.recipient_id).emit("message:deleted", { id: result.message.id });
-        ack?.({ ok: true });
       }
     );
   });

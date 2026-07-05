@@ -431,15 +431,19 @@ export default function ChatScreen({ route, navigation }: Props) {
 
         getSocket()
           .timeout(SEND_TIMEOUT_MS)
-          .emit("message:send", { id, recipientId: conversationId, ciphertext, nonce }, (err: unknown) => {
-            if (err) {
-              markMessageFailed(id);
-              setMessages((prev) => prev.map((m) => (m.id === id ? { ...m, status: "failed" } : m)));
-              return;
+          .emit(
+            "message:send",
+            { id, recipientId: conversationId, ciphertext, nonce },
+            (err: unknown, response?: { ok: boolean; error?: string }) => {
+              if (err || !response?.ok) {
+                markMessageFailed(id);
+                setMessages((prev) => prev.map((m) => (m.id === id ? { ...m, status: "failed" } : m)));
+                return;
+              }
+              markMessageSent(id);
+              setMessages((prev) => prev.map((m) => (m.id === id ? { ...m, status: "sent" } : m)));
             }
-            markMessageSent(id);
-            setMessages((prev) => prev.map((m) => (m.id === id ? { ...m, status: "sent" } : m)));
-          });
+          );
       } catch (err) {
         console.warn("[chat] failed to send message", err);
         markMessageFailed(id);

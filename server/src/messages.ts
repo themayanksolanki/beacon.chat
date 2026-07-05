@@ -11,6 +11,10 @@ export interface MessageRow {
   read_at: number | null;
 }
 
+export function userExists(id: string): boolean {
+  return !!db.prepare("SELECT 1 FROM users WHERE id = ?").get(id);
+}
+
 /**
  * The message id is generated client-side (by the sender) rather than here,
  * so the sender's own local copy and the recipient's delivered copy share

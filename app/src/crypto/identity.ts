@@ -48,12 +48,10 @@ export async function encryptMessage(
 ) {
   await ensureReady();
   const nonce = sodium.randombytes_buf(sodium.crypto_box_NONCEBYTES);
-  const ciphertext = sodium.crypto_box_easy(
-    sodium.from_string(plaintext),
-    nonce,
-    recipientPublicKey,
-    senderPrivateKey
-  );
+  // crypto_box_easy accepts the message as a plain string directly; unlike
+  // libsodium-wrappers (used only in the Jest mock), the native module here
+  // doesn't expose a from_string helper at all.
+  const ciphertext = sodium.crypto_box_easy(plaintext, nonce, recipientPublicKey, senderPrivateKey);
   return {
     nonce: sodium.to_base64(nonce),
     ciphertext: sodium.to_base64(ciphertext),
