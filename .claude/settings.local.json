@@ -56,7 +56,20 @@
       "Bash(npx --yes @railway/cli --version)",
       "Bash(npx @railway/cli whoami)",
       "Bash(npx @railway/cli init --help)",
-      "Bash(npx *)"
+      "Bash(npx *)",
+      "Bash(disown)",
+      "Bash(lsof -i :4000 -sTCP:LISTEN -n -P)",
+      "Bash(lsof -i :8081 -sTCP:LISTEN -n -P)",
+      "Bash(mkdir -p /private/tmp/claude-501/-Users-mayanksolanki-Documents-beacon-chat/bf432302-b913-4d95-a147-d13e2ec81eda/scratchpad)",
+      "Bash(ps -p 35376 -o pid,command)",
+      "Bash(kill 35376)",
+      "Bash(kill 46942)",
+      "WebSearch",
+      "Bash(find . -iname \"*railway*\" -not -path \"*/node_modules/*\")",
+      "Bash(which railway *)",
+      "Bash(railway --version)",
+      "Bash(eas --version)",
+      "Bash(npm ls *)"
     ]
   }
 }

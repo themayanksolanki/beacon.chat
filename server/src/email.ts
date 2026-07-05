@@ -1,27 +1,34 @@
-import nodemailer from "nodemailer";
+const { BREVO_API_KEY, BREVO_FROM, BREVO_FROM_NAME, APP_DOWNLOAD_URL } = process.env;
 
-const { SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS, SMTP_FROM, APP_DOWNLOAD_URL } = process.env;
+const FROM_ADDRESS = BREVO_FROM ?? "no-reply@beaconchat.app";
+const FROM_NAME = BREVO_FROM_NAME ?? "Beacon";
 
-const transporter =
-  SMTP_HOST && SMTP_USER && SMTP_PASS
-    ? nodemailer.createTransport({
-        host: SMTP_HOST,
-        port: SMTP_PORT ? Number(SMTP_PORT) : 587,
-        secure: Number(SMTP_PORT) === 465,
-        auth: { user: SMTP_USER, pass: SMTP_PASS },
-      })
-    : null;
-
-const FROM_ADDRESS = SMTP_FROM ?? SMTP_USER ?? "no-reply@beaconchat.app";
-
-/** Sends via SMTP when configured; otherwise logs, so local dev needs no email account. */
+/** Sends via Brevo's HTTP API when configured; otherwise logs, so local dev needs no email account. */
 async function sendMail(to: string, subject: string, text: string): Promise<void> {
-  if (!transporter) {
+  if (!BREVO_API_KEY) {
     console.log(`[email stub] To: ${to}\nSubject: ${subject}\n\n${text}`);
     return;
   }
 
-  await transporter.sendMail({ from: FROM_ADDRESS, to, subject, text });
+  const res = await fetch("https://api.brevo.com/v3/smtp/email", {
+    method: "POST",
+    headers: {
+      "api-key": BREVO_API_KEY,
+      "Content-Type": "application/json",
+      Accept: "application/json",
+    },
+    body: JSON.stringify({
+      sender: { email: FROM_ADDRESS, name: FROM_NAME },
+      to: [{ email: to }],
+      subject,
+      textContent: text,
+    }),
+  });
+
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(`brevo_failed_${res.status}: ${body}`);
+  }
 }
 
 export async function sendOtpEmail(email: string, code: string): Promise<void> {
