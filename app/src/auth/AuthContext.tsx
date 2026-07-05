@@ -11,11 +11,19 @@ import sodium from "react-native-libsodium";
 import * as FileSystem from "expo-file-system/legacy";
 
 import * as api from "../api/client";
+import { ApiError } from "../api/client";
 import { getOrCreateIdentity } from "../crypto/identity";
 import { initDatabase } from "../db/database";
 import { connectSocket, disconnectSocket } from "../network/socket";
 import { clearProfile, loadProfile, saveProfile, type Profile } from "../storage/profileStore";
-import { clearSessionToken, loadSessionToken, saveSessionToken } from "../storage/sessionStore";
+import {
+  clearSessionEmail,
+  clearSessionToken,
+  loadSessionEmail,
+  loadSessionToken,
+  saveSessionEmail,
+  saveSessionToken,
+} from "../storage/sessionStore";
 
 type AuthStatus = "loading" | "signed-out" | "needs-profile" | "signed-in";
 
@@ -63,6 +71,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const signOutLocally = useCallback(() => {
     disconnectSocket();
     void clearSessionToken();
+    void clearSessionEmail();
     void clearProfile();
     setEmail(null);
     setProfile(null);
@@ -81,21 +90,38 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         return;
       }
 
+      const localProfile = await loadProfile();
+
       try {
         const session = await api.getSession(storedToken);
+        await saveSessionEmail(session.email);
         setEmail(session.email);
         setToken(storedToken);
         connectSocket(storedToken).on("session:revoked", signOutLocally);
-
-        const localProfile = await loadProfile();
-        if (localProfile) {
-          setProfile(localProfile);
-          setStatus("signed-in");
-        } else {
-          setStatus("needs-profile");
+        setProfile(localProfile);
+        setStatus(localProfile ? "signed-in" : "needs-profile");
+      } catch (err) {
+        // A 401 means the server explicitly rejected this token (expired,
+        // revoked by a login elsewhere, etc.) — that's a real sign-out.
+        // Anything else (network error, Render cold start, timeout) just
+        // means we couldn't confirm the session right now; trust the local
+        // token instead of forcing a re-login over a transient hiccup.
+        if (err instanceof ApiError && err.status === 401) {
+          signOutLocally();
+          return;
         }
-      } catch {
-        signOutLocally();
+
+        const cachedEmail = await loadSessionEmail();
+        if (!cachedEmail) {
+          signOutLocally();
+          return;
+        }
+
+        setEmail(cachedEmail);
+        setToken(storedToken);
+        connectSocket(storedToken).on("session:revoked", signOutLocally);
+        setProfile(localProfile);
+        setStatus(localProfile ? "signed-in" : "needs-profile");
       }
     })();
   }, [signOutLocally]);
@@ -112,6 +138,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
       const { token: newToken } = await api.verifyOtp(emailAddress, code, publicKey);
       await saveSessionToken(newToken);
+      await saveSessionEmail(emailAddress);
       setEmail(emailAddress);
       setToken(newToken);
       connectSocket(newToken).on("session:revoked", signOutLocally);

@@ -4,6 +4,18 @@ interface RequestOptions extends RequestInit {
   token?: string;
 }
 
+// Callers (notably AuthContext's startup check) need to tell "the server
+// explicitly rejected this token" (401) apart from "couldn't reach the
+// server" (network error, Render cold start, etc.) — only the former should
+// ever sign the user out.
+export class ApiError extends Error {
+  status: number;
+  constructor(message: string, status: number) {
+    super(message);
+    this.status = status;
+  }
+}
+
 async function request<T>(path: string, options: RequestOptions = {}): Promise<T> {
   const { token, headers, ...rest } = options;
 
@@ -18,7 +30,7 @@ async function request<T>(path: string, options: RequestOptions = {}): Promise<T
 
   if (!res.ok) {
     const body = await res.json().catch(() => ({}));
-    throw new Error(body.error ?? `request_failed_${res.status}`);
+    throw new ApiError(body.error ?? `request_failed_${res.status}`, res.status);
   }
 
   if (res.status === 204) {
