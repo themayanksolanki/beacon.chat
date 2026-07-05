@@ -127,7 +127,7 @@ function RootNavigator() {
     <MainStack.Navigator initialRouteName="MainTabs">
       <MainStack.Screen name="MainTabs" component={MainTabs} options={{ headerShown: false }} />
       <MainStack.Screen name="Chat" component={ChatScreen} />
-      <MainStack.Screen name="Contacts" component={ContactsScreen} options={{ title: "Contacts" }} />
+      <MainStack.Screen name="Contacts" component={ContactsScreen} options={{ title: "Add People" }} />
       <MainStack.Screen name="Settings" component={SettingsScreen} options={{ title: "Settings" }} />
       <MainStack.Screen
         name="EditProfile"

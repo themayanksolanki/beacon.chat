@@ -2,6 +2,7 @@ import { Router } from "express";
 import { db } from "../db";
 import { requireAuth, type AuthedRequest } from "../auth";
 import { sendInviteEmail } from "../email";
+import { isMongoConnected, profiles } from "../mongo";
 
 export const usersRouter = Router();
 
@@ -27,12 +28,13 @@ usersRouter.get("/by-email/:email/public-key", requireAuth, (req, res) => {
 });
 
 /**
- * Bulk contact-matching lookup: the app sends every email from the
- * device's address book and gets back only the ones registered on Beacon
- * (with a public key, i.e. they've completed OTP verification at least
- * once). Used to distinguish "chat" vs "invite" in the Contacts screen.
+ * Bulk email lookup: the app sends candidate emails (typed manually or read
+ * from the device's address book) and gets back only the ones registered on
+ * Beacon (with a public key, i.e. they've completed OTP verification at
+ * least once), enriched with their Mongo-stored display name/avatar. Used to
+ * distinguish "chat" vs "invite" in the add-by-email screen.
  */
-usersRouter.post("/lookup", requireAuth, (req, res) => {
+usersRouter.post("/lookup", requireAuth, async (req, res) => {
   const { emails } = req.body ?? {};
 
   if (!Array.isArray(emails) || emails.some((e) => typeof e !== "string")) {
@@ -53,8 +55,26 @@ usersRouter.post("/lookup", requireAuth, (req, res) => {
     )
     .all(...unique);
 
+  const profileByUserId = isMongoConnected()
+    ? new Map(
+        (await profiles().find({ userId: { $in: rows.map((r) => r.id) } }).toArray()).map((p) => [
+          p.userId,
+          p,
+        ])
+      )
+    : new Map();
+
   res.json({
-    matches: rows.map((r) => ({ email: r.email, userId: r.id, publicKey: r.public_key })),
+    matches: rows.map((r) => {
+      const profile = profileByUserId.get(r.id);
+      return {
+        email: r.email,
+        userId: r.id,
+        publicKey: r.public_key,
+        name: profile?.name ?? null,
+        avatarUrl: profile?.avatarUrl ?? null,
+      };
+    }),
   });
 });
 

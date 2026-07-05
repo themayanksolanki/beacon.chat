@@ -9,10 +9,27 @@ export interface MatchedContact {
   registered: boolean;
   userId?: string;
   publicKey?: string;
+  avatarUrl?: string | null;
 }
 
-function normalize(raw: string): string {
+export function normalize(raw: string): string {
   return raw.trim().toLowerCase();
+}
+
+/** Looks up a single manually-typed email, for the "add by email" flow. */
+export async function lookupSingleEmail(token: string, email: string): Promise<MatchedContact> {
+  const normalized = normalize(email);
+  const [match] = await lookupUsers(token, [normalized]);
+
+  return {
+    id: normalized,
+    name: match?.name ?? normalized,
+    email: normalized,
+    registered: !!match,
+    userId: match?.userId,
+    publicKey: match?.publicKey,
+    avatarUrl: match?.avatarUrl,
+  };
 }
 
 /**
@@ -57,6 +74,7 @@ export async function loadMatchedContacts(token: string, ownEmail: string): Prom
         registered: !!match,
         userId: match?.userId,
         publicKey: match?.publicKey,
+        avatarUrl: match?.avatarUrl,
       };
     })
     .sort((a, b) => a.name.localeCompare(b.name));

@@ -53,6 +53,8 @@ export interface LookupMatch {
   email: string;
   userId: string;
   publicKey: string;
+  name: string | null;
+  avatarUrl: string | null;
 }
 
 export async function lookupUsers(token: string, emails: string[]) {
@@ -69,5 +71,13 @@ export function inviteByEmail(token: string, email: string) {
     method: "POST",
     token,
     body: JSON.stringify({ email }),
+  });
+}
+
+export function updateRemoteProfile(token: string, name: string, avatarUrl: string | null) {
+  return request<{ ok: true }>("/profile", {
+    method: "PUT",
+    token,
+    body: JSON.stringify({ name, avatarUrl }),
   });
 }

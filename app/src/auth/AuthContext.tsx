@@ -8,6 +8,7 @@ import {
   type ReactNode,
 } from "react";
 import sodium from "react-native-libsodium";
+import * as FileSystem from "expo-file-system/legacy";
 
 import * as api from "../api/client";
 import { getOrCreateIdentity } from "../crypto/identity";
@@ -31,6 +32,25 @@ interface AuthContextValue {
 }
 
 const AuthContext = createContext<AuthContextValue | null>(null);
+
+// The picker/profileStore only deal in local file URIs; the server (and
+// other users' apps) need the image inline, so it's base64-encoded here.
+async function photoUriToDataUrl(photoUri: string): Promise<string> {
+  const base64 = await FileSystem.readAsStringAsync(photoUri, { encoding: "base64" });
+  return `data:image/jpeg;base64,${base64}`;
+}
+
+// Other users need to see this profile, so it's pushed to the server too;
+// failures here are swallowed so a flaky connection can't block onboarding
+// or local profile edits (the local copy is what this device relies on).
+async function pushRemoteProfile(token: string, fullName: string, photoUri: string | null): Promise<void> {
+  try {
+    const avatarUrl = photoUri ? await photoUriToDataUrl(photoUri) : null;
+    await api.updateRemoteProfile(token, fullName, avatarUrl);
+  } catch (err) {
+    console.warn("[profile] failed to sync profile to server", err);
+  }
+}
 
 export function AuthProvider({ children }: { children: ReactNode }) {
   const [status, setStatus] = useState<AuthStatus>("loading");
@@ -107,16 +127,24 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     [signOutLocally]
   );
 
-  const completeProfile = useCallback(async (fullName: string, photoUri: string | null) => {
-    const saved = await saveProfile(fullName, photoUri);
-    setProfile(saved);
-    setStatus("signed-in");
-  }, []);
+  const completeProfile = useCallback(
+    async (fullName: string, photoUri: string | null) => {
+      const saved = await saveProfile(fullName, photoUri);
+      setProfile(saved);
+      setStatus("signed-in");
+      if (token) await pushRemoteProfile(token, fullName, photoUri);
+    },
+    [token]
+  );
 
-  const updateProfile = useCallback(async (fullName: string, photoUri: string | null) => {
-    const saved = await saveProfile(fullName, photoUri);
-    setProfile(saved);
-  }, []);
+  const updateProfile = useCallback(
+    async (fullName: string, photoUri: string | null) => {
+      const saved = await saveProfile(fullName, photoUri);
+      setProfile(saved);
+      if (token) await pushRemoteProfile(token, fullName, photoUri);
+    },
+    [token]
+  );
 
   const logout = useCallback(async () => {
     const currentToken = await loadSessionToken();
