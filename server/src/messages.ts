@@ -63,3 +63,24 @@ export function markRead(messageId: string): number {
   db.prepare("UPDATE messages SET read_at = ? WHERE id = ?").run(readAt, messageId);
   return readAt;
 }
+
+export const DELETE_FOR_EVERYONE_WINDOW_MS = 2 * 60 * 60 * 1000;
+
+export type DeleteForEveryoneResult =
+  | { ok: true; message: MessageRow }
+  | { ok: false; error: "not_found" | "not_sender" | "too_late" };
+
+/**
+ * Only the original sender can delete for everyone, and only within the
+ * time window — enforced here since the client's own check is just UX, not
+ * a security boundary.
+ */
+export function deleteMessageForEveryone(id: string, requesterId: string): DeleteForEveryoneResult {
+  const message = db.prepare<[string], MessageRow>("SELECT * FROM messages WHERE id = ?").get(id);
+  if (!message) return { ok: false, error: "not_found" };
+  if (message.sender_id !== requesterId) return { ok: false, error: "not_sender" };
+  if (Date.now() - message.created_at > DELETE_FOR_EVERYONE_WINDOW_MS) return { ok: false, error: "too_late" };
+
+  db.prepare("DELETE FROM messages WHERE id = ?").run(id);
+  return { ok: true, message };
+}

@@ -76,7 +76,8 @@
       "Bash(sips -Z 1024 -s format png logo.png --out splash-icon.png)",
       "Bash(sips -Z 512 -s format png logo.png --out android-icon-foreground.png)",
       "Bash(sips -Z 48 -s format png logo.png --out favicon.png)",
-      "Bash(sips -g pixelWidth -g pixelHeight icon.png splash-icon.png android-icon-foreground.png favicon.png)"
+      "Bash(sips -g pixelWidth -g pixelHeight icon.png splash-icon.png android-icon-foreground.png favicon.png)",
+      "Bash(npm view *)"
     ]
   }
 }

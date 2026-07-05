@@ -53,6 +53,15 @@ export function verifyOtp(email: string, code: string, publicKey: string) {
   });
 }
 
+// Dev-only: mirrors verifyOtp but skips the code entirely. Only works while
+// the server has SKIP_OTP=true; see EmailEntryScreen for the toggle.
+export function devLogin(email: string, publicKey: string) {
+  return request<{ token: string; userId: string }>("/auth/dev-login", {
+    method: "POST",
+    body: JSON.stringify({ email, publicKey }),
+  });
+}
+
 export function getSession(token: string) {
   return request<{ userId: string; email: string }>("/auth/session", { token });
 }

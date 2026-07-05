@@ -9,7 +9,6 @@ export function connectSocket(authToken: string): Socket {
 
   socket = io(SERVER_URL, {
     auth: { token: authToken },
-    transports: ["websocket"],
   });
 
   return socket;

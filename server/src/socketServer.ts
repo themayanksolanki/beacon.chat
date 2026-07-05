@@ -1,7 +1,7 @@
 import type { Server as HttpServer } from "node:http";
 import { Server, Socket } from "socket.io";
 import { isSessionActive, verifyToken } from "./auth";
-import { getUndeliveredMessages, markDelivered, markRead, storeMessage } from "./messages";
+import { deleteMessageForEveryone, getUndeliveredMessages, markDelivered, markRead, storeMessage } from "./messages";
 
 interface AuthedSocket extends Socket {
   userId?: string;
@@ -71,6 +71,19 @@ export function createSocketServer(httpServer: HttpServer): Server {
       const readAt = markRead(payload.id);
       io!.to(payload.senderId).emit("message:read", { id: payload.id, readAt });
     });
+
+    socket.on(
+      "message:delete",
+      (payload: { id: string }, ack?: (response: { ok: true } | { ok: false; error: string }) => void) => {
+        const result = deleteMessageForEveryone(payload.id, userId);
+        if (!result.ok) {
+          ack?.({ ok: false, error: result.error });
+          return;
+        }
+        io!.to(result.message.recipient_id).emit("message:deleted", { id: result.message.id });
+        ack?.({ ok: true });
+      }
+    );
   });
 
   return io;

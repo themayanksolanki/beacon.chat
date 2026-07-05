@@ -19,6 +19,8 @@ import * as Crypto from "expo-crypto";
 import sodium from "react-native-libsodium";
 import { useFocusEffect } from "@react-navigation/native";
 import type { NativeStackScreenProps } from "@react-navigation/native-stack";
+import { useSafeAreaInsets } from "react-native-safe-area-context";
+import EmojiPicker, { type EmojiType } from "rn-emoji-keyboard";
 
 import type { MainStackParamList } from "../../App";
 import { decryptMessage, encryptMessage, getOrCreateIdentity } from "../crypto/identity";
@@ -29,8 +31,13 @@ import {
   getUnreadIncomingMessages,
   insertMessage,
   markMessageDelivered,
+  markMessageDeletedEverywhere,
+  markMessageFailed,
+  markMessagePending,
   markMessageRead,
   markMessageSent,
+  pinMessage,
+  unpinMessage,
   type MessageRow,
 } from "../db/database";
 import { getSocket } from "../network/socket";
@@ -59,6 +66,8 @@ interface ReplyTarget {
 }
 
 const REPLY_PREVIEW_MAX_LENGTH = 80;
+const SEND_TIMEOUT_MS = 15000;
+const DELETE_FOR_EVERYONE_WINDOW_MS = 2 * 60 * 60 * 1000;
 
 function truncate(text: string) {
   return text.length > REPLY_PREVIEW_MAX_LENGTH ? `${text.slice(0, REPLY_PREVIEW_MAX_LENGTH)}…` : text;
@@ -100,26 +109,33 @@ function buildListItems(messages: MessageRow[]): ListItem[] {
   return items;
 }
 
-function presentMessageActions(callbacks: {
-  onReply: () => void;
-  onCopy: () => void;
-  onDelete: () => void;
-}) {
+interface MessageAction {
+  label: string;
+  onPress: () => void;
+  destructive?: boolean;
+}
+
+function presentMessageActions(actions: MessageAction[]) {
   if (Platform.OS === "ios") {
+    const options = [...actions.map((a) => a.label), "Cancel"];
+    const destructiveButtonIndex = actions
+      .map((a, i) => (a.destructive ? i : -1))
+      .filter((i) => i >= 0);
     ActionSheetIOS.showActionSheetWithOptions(
-      { options: ["Reply", "Copy", "Delete", "Cancel"], destructiveButtonIndex: 2, cancelButtonIndex: 3 },
+      { options, cancelButtonIndex: options.length - 1, destructiveButtonIndex },
       (index) => {
-        if (index === 0) callbacks.onReply();
-        else if (index === 1) callbacks.onCopy();
-        else if (index === 2) callbacks.onDelete();
+        if (index === undefined || index === options.length - 1) return;
+        actions[index]?.onPress();
       }
     );
   } else {
     Alert.alert("Message", undefined, [
-      { text: "Reply", onPress: callbacks.onReply },
-      { text: "Copy", onPress: callbacks.onCopy },
-      { text: "Delete", onPress: callbacks.onDelete, style: "destructive" },
-      { text: "Cancel", style: "cancel" },
+      ...actions.map((a) => ({
+        text: a.label,
+        onPress: a.onPress,
+        style: a.destructive ? ("destructive" as const) : undefined,
+      })),
+      { text: "Cancel", style: "cancel" as const },
     ]);
   }
 }
@@ -132,6 +148,9 @@ function showTimingInfo(message: MessageRow) {
 }
 
 function StatusTicks({ status }: { status: MessageRow["status"] }) {
+  if (status === "failed") {
+    return <Ionicons name="alert-circle" size={14} color={colors.danger} />;
+  }
   if (status === "pending") {
     return <Ionicons name="time-outline" size={13} color="rgba(255,255,255,0.75)" />;
   }
@@ -149,9 +168,22 @@ interface MessageBubbleProps {
   onReply: (message: MessageRow) => void;
   onCopy: (message: MessageRow) => void;
   onDelete: (message: MessageRow) => void;
+  onRetry: (message: MessageRow) => void;
+  onPin: (message: MessageRow) => void;
+  onUnpin: (message: MessageRow) => void;
+  onDeleteForEveryone: (message: MessageRow) => void;
 }
 
-function MessageBubble({ message, onReply, onCopy, onDelete }: MessageBubbleProps) {
+function MessageBubble({
+  message,
+  onReply,
+  onCopy,
+  onDelete,
+  onRetry,
+  onPin,
+  onUnpin,
+  onDeleteForEveryone,
+}: MessageBubbleProps) {
   const translateX = useRef(new Animated.Value(0)).current;
   const replyTriggered = useRef(false);
 
@@ -181,30 +213,76 @@ function MessageBubble({ message, onReply, onCopy, onDelete }: MessageBubbleProp
   ).current;
 
   const isOutgoing = message.direction === "outgoing";
+  const isDeleted = !!message.deleted_at;
+  const isPinned = !!message.pinned_at;
+  const canDeleteForEveryone =
+    isOutgoing && !isDeleted && Date.now() - message.sent_at <= DELETE_FOR_EVERYONE_WINDOW_MS;
+
+  const onLongPress = isDeleted
+    ? undefined
+    : () => {
+        const actions: MessageAction[] = [
+          { label: "Reply", onPress: () => onReply(message) },
+          { label: "Copy", onPress: () => onCopy(message) },
+          {
+            label: isPinned ? "Unpin" : "Pin",
+            onPress: () => (isPinned ? onUnpin(message) : onPin(message)),
+          },
+        ];
+        if (canDeleteForEveryone) {
+          actions.push({
+            label: "Delete for everyone",
+            destructive: true,
+            onPress: () => onDeleteForEveryone(message),
+          });
+        }
+        actions.push({ label: "Delete for me", destructive: true, onPress: () => onDelete(message) });
+        presentMessageActions(actions);
+      };
 
   return (
     <Animated.View {...panResponder.panHandlers} style={{ transform: [{ translateX }] }}>
       <Pressable
         style={[styles.bubble, isOutgoing ? styles.outgoing : styles.incoming]}
-        onLongPress={() =>
-          presentMessageActions({
-            onReply: () => onReply(message),
-            onCopy: () => onCopy(message),
-            onDelete: () => onDelete(message),
-          })
-        }
+        onLongPress={onLongPress}
       >
-        {message.reply_preview ? (
-          <View style={styles.replyQuote}>
-            <Text style={styles.replyQuoteText} numberOfLines={1}>
-              {message.reply_preview}
+        {isDeleted ? (
+          <View style={styles.deletedRow}>
+            <Ionicons
+              name="ban-outline"
+              size={14}
+              color={isOutgoing ? "rgba(255,255,255,0.75)" : colors.textTertiary}
+            />
+            <Text style={isOutgoing ? styles.outgoingDeletedText : styles.incomingDeletedText}>
+              This message was deleted
             </Text>
           </View>
-        ) : null}
-        <Text style={isOutgoing ? styles.outgoingText : styles.incomingText}>{message.plaintext}</Text>
-        <Pressable style={styles.metaRow} onPress={() => showTimingInfo(message)} disabled={!isOutgoing}>
+        ) : (
+          <>
+            {message.reply_preview ? (
+              <View style={styles.replyQuote}>
+                <Text style={styles.replyQuoteText} numberOfLines={1}>
+                  {message.reply_preview}
+                </Text>
+              </View>
+            ) : null}
+            <Text style={isOutgoing ? styles.outgoingText : styles.incomingText}>{message.plaintext}</Text>
+          </>
+        )}
+        <Pressable
+          style={styles.metaRow}
+          onPress={() => (message.status === "failed" ? onRetry(message) : showTimingInfo(message))}
+          disabled={!isOutgoing || isDeleted}
+        >
+          {isPinned ? (
+            <Ionicons
+              name="pin"
+              size={11}
+              color={isOutgoing ? "rgba(255,255,255,0.75)" : colors.textTertiary}
+            />
+          ) : null}
           <Text style={isOutgoing ? styles.metaTextOutgoing : styles.metaTextIncoming}>
-            {formatTime(message.sent_at)}
+            {message.status === "failed" ? "Not sent · tap to retry" : formatTime(message.sent_at)}
           </Text>
           {isOutgoing ? <StatusTicks status={message.status} /> : null}
         </Pressable>
@@ -217,13 +295,16 @@ export default function ChatScreen({ route, navigation }: Props) {
   const { conversationId } = route.params;
   const conversation = getConversationById(conversationId);
   const isTestBot = conversationId === TEST_BOT_CONVERSATION_ID;
+  const insets = useSafeAreaInsets();
 
   const [messages, setMessages] = useState<MessageRow[]>(() => getMessages(conversationId));
   const [draft, setDraft] = useState("");
   const [replyingTo, setReplyingTo] = useState<ReplyTarget | null>(null);
+  const [emojiPickerOpen, setEmojiPickerOpen] = useState(false);
   const listRef = useRef<FlatList<ListItem>>(null);
   const readSentRef = useRef<Set<string>>(new Set());
   const listItems = useMemo(() => buildListItems(messages), [messages]);
+  const pinnedMessage = useMemo(() => messages.find((m) => m.pinned_at) ?? null, [messages]);
 
   useLayoutEffect(() => {
     navigation.setOptions({ title: conversation?.display_name ?? "Chat" });
@@ -261,33 +342,39 @@ export default function ChatScreen({ route, navigation }: Props) {
     const onMessage = async (message: IncomingServerMessage) => {
       if (message.sender_id !== conversationId) return;
 
-      const identity = await getOrCreateIdentity();
-      await sodium.ready;
-      const peerPublicKey = sodium.from_base64(conversation.peer_public_key);
-      const decrypted = await decryptMessage(
-        message.ciphertext,
-        message.nonce,
-        peerPublicKey,
-        identity.privateKey
-      );
-      const payload: MessagePayload = JSON.parse(decrypted);
+      try {
+        const identity = await getOrCreateIdentity();
+        await sodium.ready;
+        const peerPublicKey = sodium.from_base64(conversation.peer_public_key);
+        const decrypted = await decryptMessage(
+          message.ciphertext,
+          message.nonce,
+          peerPublicKey,
+          identity.privateKey
+        );
+        const payload: MessagePayload = JSON.parse(decrypted);
 
-      const row: MessageRow = {
-        id: message.id,
-        conversation_id: conversationId,
-        direction: "incoming",
-        plaintext: payload.text,
-        sent_at: message.created_at,
-        status: "delivered",
-        delivered_at: message.created_at,
-        read_at: null,
-        reply_to_id: payload.replyTo?.id ?? null,
-        reply_preview: payload.replyTo?.preview ?? null,
-      };
-      insertMessage(row);
-      setMessages((prev) => [...prev, row]);
-      getSocket().emit("message:delivered", { id: message.id, senderId: conversationId });
-      markVisibleMessagesRead();
+        const row: MessageRow = {
+          id: message.id,
+          conversation_id: conversationId,
+          direction: "incoming",
+          plaintext: payload.text,
+          sent_at: message.created_at,
+          status: "delivered",
+          delivered_at: message.created_at,
+          read_at: null,
+          reply_to_id: payload.replyTo?.id ?? null,
+          reply_preview: payload.replyTo?.preview ?? null,
+          pinned_at: null,
+          deleted_at: null,
+        };
+        insertMessage(row);
+        setMessages((prev) => [...prev, row]);
+        getSocket().emit("message:delivered", { id: message.id, senderId: conversationId });
+        markVisibleMessagesRead();
+      } catch (err) {
+        console.warn("[chat] failed to process incoming message", err);
+      }
     };
 
     const onDelivered = ({ id, deliveredAt }: { id: string; deliveredAt: number }) => {
@@ -306,15 +393,73 @@ export default function ChatScreen({ route, navigation }: Props) {
       setMessages((prev) => prev.map((m) => (m.id === id ? { ...m, status: "read", read_at: readAt } : m)));
     };
 
+    const onDeletedRemote = ({ id }: { id: string }) => {
+      const deletedAt = Date.now();
+      markMessageDeletedEverywhere(id, deletedAt);
+      setMessages((prev) =>
+        prev.map((m) =>
+          m.id === id ? { ...m, deleted_at: deletedAt, plaintext: "", reply_preview: null, pinned_at: null } : m
+        )
+      );
+    };
+
     socket.on("message", onMessage);
     socket.on("message:delivered", onDelivered);
     socket.on("message:read", onRead);
+    socket.on("message:deleted", onDeletedRemote);
     return () => {
       socket.off("message", onMessage);
       socket.off("message:delivered", onDelivered);
       socket.off("message:read", onRead);
+      socket.off("message:deleted", onDeletedRemote);
     };
   }, [conversation, conversationId, isTestBot, markVisibleMessagesRead]);
+
+  const sendEncrypted = useCallback(
+    async (id: string, text: string, replyTo: ReplyTarget | null) => {
+      if (!conversation) return;
+      try {
+        const payload: MessagePayload = { text, replyTo: replyTo ?? undefined };
+        const identity = await getOrCreateIdentity();
+        await sodium.ready;
+        const peerPublicKey = sodium.from_base64(conversation.peer_public_key);
+        const { ciphertext, nonce } = await encryptMessage(
+          JSON.stringify(payload),
+          peerPublicKey,
+          identity.privateKey
+        );
+
+        getSocket()
+          .timeout(SEND_TIMEOUT_MS)
+          .emit("message:send", { id, recipientId: conversationId, ciphertext, nonce }, (err: unknown) => {
+            if (err) {
+              markMessageFailed(id);
+              setMessages((prev) => prev.map((m) => (m.id === id ? { ...m, status: "failed" } : m)));
+              return;
+            }
+            markMessageSent(id);
+            setMessages((prev) => prev.map((m) => (m.id === id ? { ...m, status: "sent" } : m)));
+          });
+      } catch (err) {
+        console.warn("[chat] failed to send message", err);
+        markMessageFailed(id);
+        setMessages((prev) => prev.map((m) => (m.id === id ? { ...m, status: "failed" } : m)));
+      }
+    },
+    [conversation, conversationId]
+  );
+
+  const onRetry = useCallback(
+    (message: MessageRow) => {
+      markMessagePending(message.id);
+      setMessages((prev) => prev.map((m) => (m.id === message.id ? { ...m, status: "pending" } : m)));
+      const replyTo = message.reply_to_id
+        ? { id: message.reply_to_id, preview: message.reply_preview ?? "" }
+        : null;
+      void sendEncrypted(message.id, message.plaintext, replyTo);
+    },
+    [sendEncrypted]
+  );
 
   const onSend = useCallback(async () => {
     const text = draft.trim();
@@ -335,6 +480,8 @@ export default function ChatScreen({ route, navigation }: Props) {
       read_at: null,
       reply_to_id: activeReply?.id ?? null,
       reply_preview: activeReply?.preview ?? null,
+      pinned_at: null,
+      deleted_at: null,
     };
     insertMessage(outgoing);
     setMessages((prev) => [...prev, outgoing]);
@@ -367,6 +514,8 @@ export default function ChatScreen({ route, navigation }: Props) {
           read_at: null,
           reply_to_id: null,
           reply_preview: null,
+          pinned_at: null,
+          deleted_at: null,
         };
         insertMessage(reply);
         setMessages((prev) => [...prev, reply]);
@@ -374,21 +523,8 @@ export default function ChatScreen({ route, navigation }: Props) {
       return;
     }
 
-    const payload: MessagePayload = { text, replyTo: activeReply ?? undefined };
-    const identity = await getOrCreateIdentity();
-    await sodium.ready;
-    const peerPublicKey = sodium.from_base64(conversation.peer_public_key);
-    const { ciphertext, nonce } = await encryptMessage(
-      JSON.stringify(payload),
-      peerPublicKey,
-      identity.privateKey
-    );
-
-    getSocket().emit("message:send", { id, recipientId: conversationId, ciphertext, nonce }, () => {
-      markMessageSent(id);
-      setMessages((prev) => prev.map((m) => (m.id === id ? { ...m, status: "sent" } : m)));
-    });
-  }, [draft, conversation, conversationId, isTestBot, replyingTo]);
+    void sendEncrypted(id, text, activeReply);
+  }, [draft, conversation, conversationId, isTestBot, replyingTo, sendEncrypted]);
 
   const onCopy = useCallback((message: MessageRow) => {
     Clipboard.setStringAsync(message.plaintext);
@@ -402,6 +538,61 @@ export default function ChatScreen({ route, navigation }: Props) {
   const onReply = useCallback((message: MessageRow) => {
     setReplyingTo({ id: message.id, preview: truncate(message.plaintext) });
   }, []);
+
+  const onPin = useCallback(
+    (message: MessageRow) => {
+      pinMessage(conversationId, message.id);
+      const pinnedAt = Date.now();
+      setMessages((prev) => prev.map((m) => ({ ...m, pinned_at: m.id === message.id ? pinnedAt : null })));
+    },
+    [conversationId]
+  );
+
+  const onUnpin = useCallback((message: MessageRow) => {
+    unpinMessage(message.id);
+    setMessages((prev) => prev.map((m) => (m.id === message.id ? { ...m, pinned_at: null } : m)));
+  }, []);
+
+  const onDeleteForEveryone = useCallback(
+    (message: MessageRow) => {
+      if (isTestBot) return;
+      getSocket()
+        .timeout(SEND_TIMEOUT_MS)
+        .emit(
+          "message:delete",
+          { id: message.id },
+          (err: unknown, response?: { ok: boolean; error?: string }) => {
+            if (err || !response?.ok) {
+              Alert.alert(
+                "Couldn't delete",
+                response?.error === "too_late"
+                  ? "This message is too old to delete for everyone (2 hour limit)."
+                  : "Please try again."
+              );
+              return;
+            }
+            const deletedAt = Date.now();
+            markMessageDeletedEverywhere(message.id, deletedAt);
+            setMessages((prev) =>
+              prev.map((m) =>
+                m.id === message.id
+                  ? { ...m, deleted_at: deletedAt, plaintext: "", reply_preview: null, pinned_at: null }
+                  : m
+              )
+            );
+          }
+        );
+    },
+    [isTestBot]
+  );
+
+  const scrollToMessage = useCallback(
+    (id: string) => {
+      const index = listItems.findIndex((item) => item.id === id);
+      if (index >= 0) listRef.current?.scrollToIndex({ index, animated: true });
+    },
+    [listItems]
+  );
 
   if (!conversation) {
     return (
@@ -417,19 +608,46 @@ export default function ChatScreen({ route, navigation }: Props) {
       behavior={Platform.OS === "ios" ? "padding" : undefined}
       keyboardVerticalOffset={Platform.OS === "ios" ? 90 : 0}
     >
+      {pinnedMessage ? (
+        <Pressable style={styles.pinnedBanner} onPress={() => scrollToMessage(pinnedMessage.id)}>
+          <Ionicons name="pin" size={14} color={colors.accent} />
+          <View style={styles.pinnedBannerText}>
+            <Text style={styles.pinnedBannerLabel}>Pinned message</Text>
+            <Text numberOfLines={1} style={styles.pinnedBannerPreview}>
+              {pinnedMessage.plaintext}
+            </Text>
+          </View>
+          <Pressable onPress={() => onUnpin(pinnedMessage)} hitSlop={8}>
+            <Ionicons name="close-circle" size={20} color={colors.textTertiary} />
+          </Pressable>
+        </Pressable>
+      ) : null}
+
       <FlatList
         ref={listRef}
         data={listItems}
         keyExtractor={(item) => item.id}
         contentContainerStyle={styles.list}
         onContentSizeChange={() => listRef.current?.scrollToEnd({ animated: true })}
+        onScrollToIndexFailed={({ averageItemLength, index }) =>
+          listRef.current?.scrollToOffset({ offset: averageItemLength * index, animated: true })
+        }
         renderItem={({ item }) =>
           item.type === "separator" ? (
             <View style={styles.dateSeparator}>
               <Text style={styles.dateSeparatorText}>{item.label}</Text>
             </View>
           ) : (
-            <MessageBubble message={item.message} onReply={onReply} onCopy={onCopy} onDelete={onDelete} />
+            <MessageBubble
+              message={item.message}
+              onReply={onReply}
+              onCopy={onCopy}
+              onDelete={onDelete}
+              onRetry={onRetry}
+              onPin={onPin}
+              onUnpin={onUnpin}
+              onDeleteForEveryone={onDeleteForEveryone}
+            />
           )
         }
       />
@@ -448,7 +666,10 @@ export default function ChatScreen({ route, navigation }: Props) {
         </View>
       ) : null}
 
-      <View style={styles.inputRow}>
+      <View style={[styles.inputRow, { paddingBottom: 8 + insets.bottom }]}>
+        <Pressable style={styles.emojiButton} onPress={() => setEmojiPickerOpen(true)} hitSlop={8}>
+          <Ionicons name="happy-outline" size={24} color={colors.textSecondary} />
+        </Pressable>
         <TextInput
           style={styles.input}
           value={draft}
@@ -464,6 +685,15 @@ export default function ChatScreen({ route, navigation }: Props) {
           <Ionicons name="arrow-up" size={20} color={draft.trim() ? "#fff" : colors.accent} />
         </Pressable>
       </View>
+
+      <EmojiPicker
+        open={emojiPickerOpen}
+        onClose={() => setEmojiPickerOpen(false)}
+        onEmojiSelected={(emoji: EmojiType) => setDraft((prev) => prev + emoji.emoji)}
+        enableSearchBar
+        enableRecentlyUsed
+        categoryPosition="floating"
+      />
     </KeyboardAvoidingView>
   );
 }
@@ -498,6 +728,9 @@ const styles = StyleSheet.create({
   incoming: { alignSelf: "flex-start", backgroundColor: colors.bubbleIncoming, borderBottomLeftRadius: 4 },
   outgoingText: { color: "#fff", fontSize: 15.5 },
   incomingText: { color: colors.text, fontSize: 15.5 },
+  deletedRow: { flexDirection: "row", alignItems: "center", gap: 6 },
+  outgoingDeletedText: { color: "rgba(255,255,255,0.75)", fontSize: 15, fontStyle: "italic" },
+  incomingDeletedText: { color: colors.textTertiary, fontSize: 15, fontStyle: "italic" },
   replyQuote: {
     borderLeftWidth: 3,
     borderLeftColor: "rgba(255,255,255,0.6)",
@@ -523,6 +756,19 @@ const styles = StyleSheet.create({
   replyBannerText: { flex: 1, marginRight: 8 },
   replyBannerLabel: { fontSize: 11, color: colors.accent, fontWeight: "600" },
   replyBannerPreview: { fontSize: 13, color: colors.text },
+  pinnedBanner: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
+    backgroundColor: colors.accentSoft,
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    borderBottomWidth: StyleSheet.hairlineWidth,
+    borderBottomColor: colors.border,
+  },
+  pinnedBannerText: { flex: 1 },
+  pinnedBannerLabel: { fontSize: 11, color: colors.accent, fontWeight: "600" },
+  pinnedBannerPreview: { fontSize: 13, color: colors.text },
   inputRow: {
     flexDirection: "row",
     alignItems: "flex-end",
@@ -531,6 +777,12 @@ const styles = StyleSheet.create({
     backgroundColor: colors.surface,
     borderTopWidth: StyleSheet.hairlineWidth,
     borderTopColor: colors.border,
+  },
+  emojiButton: {
+    width: 40,
+    height: 40,
+    alignItems: "center",
+    justifyContent: "center",
   },
   input: {
     flex: 1,

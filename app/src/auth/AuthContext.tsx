@@ -34,6 +34,7 @@ interface AuthContextValue {
   token: string | null;
   requestOtp: (email: string) => Promise<void>;
   verifyOtp: (email: string, code: string) => Promise<void>;
+  devLogin: (email: string) => Promise<void>;
   completeProfile: (fullName: string, photoUri: string | null) => Promise<void>;
   updateProfile: (fullName: string, photoUri: string | null) => Promise<void>;
   logout: () => Promise<void>;
@@ -130,13 +131,10 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     await api.requestOtp(emailAddress);
   }, []);
 
-  const verifyOtp = useCallback(
-    async (emailAddress: string, code: string) => {
-      const identity = await getOrCreateIdentity();
-      await sodium.ready;
-      const publicKey = sodium.to_base64(identity.publicKey);
-
-      const { token: newToken } = await api.verifyOtp(emailAddress, code, publicKey);
+  // Shared tail for anything that ends with "here's a fresh session token" —
+  // real OTP verification and the SKIP_OTP dev bypass both land here.
+  const establishSession = useCallback(
+    async (emailAddress: string, newToken: string) => {
       await saveSessionToken(newToken);
       await saveSessionEmail(emailAddress);
       setEmail(emailAddress);
@@ -152,6 +150,32 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       }
     },
     [signOutLocally]
+  );
+
+  const verifyOtp = useCallback(
+    async (emailAddress: string, code: string) => {
+      const identity = await getOrCreateIdentity();
+      await sodium.ready;
+      const publicKey = sodium.to_base64(identity.publicKey);
+
+      const { token: newToken } = await api.verifyOtp(emailAddress, code, publicKey);
+      await establishSession(emailAddress, newToken);
+    },
+    [establishSession]
+  );
+
+  // Dev-only: see EmailEntryScreen for the EXPO_PUBLIC_SKIP_OTP toggle. Only
+  // succeeds if the server also has SKIP_OTP=true.
+  const devLogin = useCallback(
+    async (emailAddress: string) => {
+      const identity = await getOrCreateIdentity();
+      await sodium.ready;
+      const publicKey = sodium.to_base64(identity.publicKey);
+
+      const { token: newToken } = await api.devLogin(emailAddress, publicKey);
+      await establishSession(emailAddress, newToken);
+    },
+    [establishSession]
   );
 
   const completeProfile = useCallback(
@@ -189,11 +213,12 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       token,
       requestOtp,
       verifyOtp,
+      devLogin,
       completeProfile,
       updateProfile,
       logout,
     }),
-    [status, email, profile, token, requestOtp, verifyOtp, completeProfile, updateProfile, logout]
+    [status, email, profile, token, requestOtp, verifyOtp, devLogin, completeProfile, updateProfile, logout]
   );
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;

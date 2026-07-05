@@ -43,6 +43,8 @@ export function initDatabase() {
     ["read_at", "ALTER TABLE messages ADD COLUMN read_at INTEGER"],
     ["reply_to_id", "ALTER TABLE messages ADD COLUMN reply_to_id TEXT"],
     ["reply_preview", "ALTER TABLE messages ADD COLUMN reply_preview TEXT"],
+    ["pinned_at", "ALTER TABLE messages ADD COLUMN pinned_at INTEGER"],
+    ["deleted_at", "ALTER TABLE messages ADD COLUMN deleted_at INTEGER"],
   ];
   for (const [column, statement] of migrations) {
     if (!existingColumns.has(column)) {
@@ -51,7 +53,7 @@ export function initDatabase() {
   }
 }
 
-export type MessageStatus = "pending" | "sent" | "delivered" | "read";
+export type MessageStatus = "pending" | "sent" | "delivered" | "read" | "failed";
 
 export interface MessageRow {
   id: string;
@@ -64,13 +66,15 @@ export interface MessageRow {
   read_at: number | null;
   reply_to_id: string | null;
   reply_preview: string | null;
+  pinned_at: number | null;
+  deleted_at: number | null;
 }
 
 export function insertMessage(message: MessageRow) {
   db.runSync(
     `INSERT INTO messages
-       (id, conversation_id, direction, plaintext, sent_at, status, delivered_at, read_at, reply_to_id, reply_preview)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       (id, conversation_id, direction, plaintext, sent_at, status, delivered_at, read_at, reply_to_id, reply_preview, pinned_at, deleted_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [
       message.id,
       message.conversation_id,
@@ -82,6 +86,8 @@ export function insertMessage(message: MessageRow) {
       message.read_at,
       message.reply_to_id,
       message.reply_preview,
+      message.pinned_at,
+      message.deleted_at,
     ]
   );
 }
@@ -104,6 +110,14 @@ export function markMessageSent(id: string): void {
   db.runSync(`UPDATE messages SET status = 'sent' WHERE id = ? AND status = 'pending'`, [id]);
 }
 
+export function markMessageFailed(id: string): void {
+  db.runSync(`UPDATE messages SET status = 'failed' WHERE id = ? AND status = 'pending'`, [id]);
+}
+
+export function markMessagePending(id: string): void {
+  db.runSync(`UPDATE messages SET status = 'pending' WHERE id = ? AND status = 'failed'`, [id]);
+}
+
 export function markMessageDelivered(id: string, deliveredAt: number): void {
   db.runSync(
     `UPDATE messages SET status = 'delivered', delivered_at = ?
@@ -118,6 +132,35 @@ export function markMessageRead(id: string, readAt: number): void {
 
 export function deleteMessage(id: string): void {
   db.runSync(`DELETE FROM messages WHERE id = ?`, [id]);
+}
+
+// Only one message pinned per conversation at a time — pinning a new one
+// replaces the last.
+export function pinMessage(conversationId: string, id: string): void {
+  db.withTransactionSync(() => {
+    db.runSync(`UPDATE messages SET pinned_at = NULL WHERE conversation_id = ?`, [conversationId]);
+    db.runSync(`UPDATE messages SET pinned_at = ? WHERE id = ?`, [Date.now(), id]);
+  });
+}
+
+export function unpinMessage(id: string): void {
+  db.runSync(`UPDATE messages SET pinned_at = NULL WHERE id = ?`, [id]);
+}
+
+export function getPinnedMessage(conversationId: string): MessageRow | null {
+  return db.getFirstSync<MessageRow>(
+    `SELECT * FROM messages WHERE conversation_id = ? AND pinned_at IS NOT NULL ORDER BY pinned_at DESC LIMIT 1`,
+    [conversationId]
+  );
+}
+
+// Tombstones the message (clears its plaintext) rather than removing the
+// row, so both sides render a "message deleted" placeholder in its place.
+export function markMessageDeletedEverywhere(id: string, deletedAt: number): void {
+  db.runSync(
+    `UPDATE messages SET deleted_at = ?, plaintext = '', reply_preview = NULL, pinned_at = NULL WHERE id = ?`,
+    [deletedAt, id]
+  );
 }
 
 export interface ConversationRow {
@@ -141,7 +184,8 @@ export function getConversationSummaries(): ConversationSummary[] {
   return db.getAllSync<ConversationSummary>(`
     SELECT
       c.*,
-      (SELECT plaintext FROM messages m WHERE m.conversation_id = c.id ORDER BY m.sent_at DESC LIMIT 1) AS last_message,
+      (SELECT CASE WHEN m.deleted_at IS NOT NULL THEN 'This message was deleted' ELSE m.plaintext END
+         FROM messages m WHERE m.conversation_id = c.id ORDER BY m.sent_at DESC LIMIT 1) AS last_message,
       (SELECT sent_at FROM messages m WHERE m.conversation_id = c.id ORDER BY m.sent_at DESC LIMIT 1) AS last_message_at,
       (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id AND m.direction = 'incoming' AND m.read_at IS NULL) AS unread_count
     FROM conversations c

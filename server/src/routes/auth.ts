@@ -87,6 +87,16 @@ authRouter.post("/otp/verify", async (req, res) => {
 
   db.prepare("DELETE FROM otp_challenges WHERE email = ?").run(email);
 
+  const { token, userId } = await issueSession(email, publicKey);
+  res.status(200).json({ token, userId });
+});
+
+/**
+ * Upserts the user for this email/publicKey, revokes any other active
+ * session, and signs a fresh token. Shared by the real OTP flow and the
+ * SKIP_OTP dev bypass below — both end in the same session state.
+ */
+async function issueSession(email: string, publicKey: string): Promise<{ token: string; userId: string }> {
   const sessionId = randomUUID();
   let user = db.prepare<[string], UserRow>("SELECT * FROM users WHERE email = ?").get(email);
 
@@ -106,9 +116,27 @@ authRouter.post("/otp/verify", async (req, res) => {
 
   await revokeOtherSessions(user.id);
 
-  const token = signToken({ userId: user.id, sessionId });
-  res.status(200).json({ token, userId: user.id });
-});
+  return { token: signToken({ userId: user.id, sessionId }), userId: user.id };
+}
+
+/**
+ * Dev-only bypass so the OTP email round trip doesn't have to be exercised
+ * on every test login. Only active when SKIP_OTP=true — never enable this
+ * in production, it's a full authentication bypass by design.
+ */
+if (process.env.SKIP_OTP === "true") {
+  authRouter.post("/dev-login", async (req, res) => {
+    const { email, publicKey } = req.body ?? {};
+
+    if (typeof email !== "string" || !EMAIL_REGEX.test(email) || typeof publicKey !== "string") {
+      res.status(400).json({ error: "email and publicKey are required" });
+      return;
+    }
+
+    const { token, userId } = await issueSession(email, publicKey);
+    res.status(200).json({ token, userId });
+  });
+}
 
 authRouter.get("/session", requireAuth, (req: AuthedRequest, res) => {
   const user = db

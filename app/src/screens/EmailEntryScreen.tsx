@@ -11,8 +11,12 @@ type Props = NativeStackScreenProps<AuthStackParamList, "EmailEntry">;
 
 const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
+// Dev-only: skips OTP entirely and signs in directly (server must also have
+// SKIP_OTP=true, see server/.env.example). Remove/unset before shipping.
+const SKIP_OTP = process.env.EXPO_PUBLIC_SKIP_OTP === "true";
+
 export default function EmailEntryScreen({ navigation }: Props) {
-  const { requestOtp } = useAuth();
+  const { requestOtp, devLogin } = useAuth();
   const [email, setEmail] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -21,6 +25,12 @@ export default function EmailEntryScreen({ navigation }: Props) {
     setError(null);
     setLoading(true);
     try {
+      if (SKIP_OTP) {
+        await devLogin(email);
+        // On success AuthProvider flips status and the navigator swaps
+        // stacks on its own — no Otp screen involved.
+        return;
+      }
       await requestOtp(email);
       navigation.navigate("Otp", { email });
     } catch (e) {
@@ -45,7 +55,7 @@ export default function EmailEntryScreen({ navigation }: Props) {
       />
       {error ? <Text style={styles.error}>{error}</Text> : null}
       <PrimaryButton
-        title="Send code"
+        title={SKIP_OTP ? "Continue" : "Send code"}
         onPress={onSubmit}
         disabled={!EMAIL_REGEX.test(email)}
         loading={loading}
