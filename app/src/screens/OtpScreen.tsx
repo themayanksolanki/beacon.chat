@@ -1,15 +1,18 @@
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import { StyleSheet, Text, TextInput, View } from "react-native";
 import type { NativeStackScreenProps } from "@react-navigation/native-stack";
 
 import type { AuthStackParamList } from "../../App";
 import { useAuth } from "../auth/AuthContext";
 import PrimaryButton from "../components/PrimaryButton";
-import { colors } from "../theme";
+import { useTheme } from "../ThemeContext";
+import type { ThemeColors } from "../theme";
 
 type Props = NativeStackScreenProps<AuthStackParamList, "Otp">;
 
 export default function OtpScreen({ route }: Props) {
+  const { colors } = useTheme();
+  const styles = useMemo(() => createStyles(colors), [colors]);
   const { email } = route.params;
   const { verifyOtp } = useAuth();
   const [code, setCode] = useState("");
@@ -36,6 +39,7 @@ export default function OtpScreen({ route }: Props) {
       <TextInput
         style={styles.input}
         placeholder="123456"
+        placeholderTextColor={colors.textTertiary}
         keyboardType="number-pad"
         maxLength={6}
         value={code}
@@ -47,18 +51,20 @@ export default function OtpScreen({ route }: Props) {
   );
 }
 
-const styles = StyleSheet.create({
-  container: { flex: 1, justifyContent: "center", padding: 24 },
-  title: { fontSize: 20, fontWeight: "600", marginBottom: 16, color: colors.text },
-  input: {
-    borderWidth: 1,
-    borderColor: colors.border,
-    backgroundColor: colors.background,
-    borderRadius: 10,
-    padding: 12,
-    fontSize: 16,
-    marginBottom: 16,
-    letterSpacing: 4,
-  },
-  error: { color: colors.danger, marginBottom: 12 },
-});
+const createStyles = (colors: ThemeColors) =>
+  StyleSheet.create({
+    container: { flex: 1, justifyContent: "center", padding: 24, backgroundColor: colors.background },
+    title: { fontSize: 20, fontWeight: "600", marginBottom: 16, color: colors.text },
+    input: {
+      borderWidth: 1,
+      borderColor: colors.border,
+      backgroundColor: colors.surface,
+      color: colors.text,
+      borderRadius: 10,
+      padding: 12,
+      fontSize: 16,
+      marginBottom: 16,
+      letterSpacing: 4,
+    },
+    error: { color: colors.danger, marginBottom: 12 },
+  });

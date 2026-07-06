@@ -77,7 +77,26 @@
       "Bash(sips -Z 512 -s format png logo.png --out android-icon-foreground.png)",
       "Bash(sips -Z 48 -s format png logo.png --out favicon.png)",
       "Bash(sips -g pixelWidth -g pixelHeight icon.png splash-icon.png android-icon-foreground.png favicon.png)",
-      "Bash(npm view *)"
+      "Bash(npm view *)",
+      "Bash(tee /private/tmp/claude-501/-Users-mayanksolanki-Documents-beacon-chat/74397f74-165f-4e38-a362-08b4d97bfbf8/scratchpad/ios-sim-build.log)",
+      "Bash(tee /private/tmp/claude-501/-Users-mayanksolanki-Documents-beacon-chat/74397f74-165f-4e38-a362-08b4d97bfbf8/scratchpad/ios-sim-build2.log)",
+      "Bash(system_profiler SPUSBDataType)",
+      "Bash(tee /private/tmp/claude-501/-Users-mayanksolanki-Documents-beacon-chat/74397f74-165f-4e38-a362-08b4d97bfbf8/scratchpad/ios-device-attempt.log)",
+      "Bash(plutil -p /Users/mayanksolanki/Library/Developer/CoreSimulator/Devices/3C851364-7108-4CBD-8003-EB05BD0FF894/data/Containers/Bundle/Application/*/Beacon.app/Info.plist)",
+      "Bash(rm -f /tmp/expo_build2.log)",
+      "Bash(nohup npx expo run:ios --device \"3C851364-7108-4CBD-8003-EB05BD0FF894\")",
+      "WebFetch(domain:dribbble.com)",
+      "WebFetch(domain:github.com)",
+      "Bash(python3 -c \"import json,sys; d=json.load\\(sys.stdin\\); print\\(d['version']\\); print\\(d.get\\('peerDependencies'\\)\\)\")",
+      "Bash(git status *)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "Bash(kill 8133 8038)",
+      "Bash(rm -f /tmp/pod_install2.log)",
+      "Bash(nohup pod install)",
+      "Bash(echo \"started $!\")",
+      "Bash(rm -f /tmp/expo_build3.log)",
+      "Bash(rm -f /tmp/expo_build4.log)",
+      "Bash(lsof -i :8081 -sTCP:LISTEN)"
     ]
   }
 }

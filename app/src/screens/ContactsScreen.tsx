@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   ActivityIndicator,
   Alert,
@@ -23,13 +23,16 @@ import {
   type MatchedContact,
 } from "../contacts/matchContacts";
 import { getConversationByPeerKey, insertConversation } from "../db/database";
-import { colorForName, colors, initialFor } from "../theme";
+import { useTheme } from "../ThemeContext";
+import { colorForName, initialFor, type ThemeColors } from "../theme";
 
 type Props = NativeStackScreenProps<MainStackParamList, "Contacts">;
 
 const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
 export default function ContactsScreen({ navigation }: Props) {
+  const { colors } = useTheme();
+  const styles = useMemo(() => createStyles(colors), [colors]);
   const { token, email } = useAuth();
   const [contacts, setContacts] = useState<MatchedContact[] | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -132,6 +135,7 @@ export default function ContactsScreen({ navigation }: Props) {
             <TextInput
               style={styles.input}
               placeholder="Add by email"
+              placeholderTextColor={colors.textTertiary}
               autoCapitalize="none"
               autoCorrect={false}
               keyboardType="email-address"
@@ -194,6 +198,8 @@ function ContactRow({
   onChat: (contact: MatchedContact) => void;
   onInvite: (contact: MatchedContact) => void;
 }) {
+  const { colors } = useTheme();
+  const styles = useMemo(() => createStyles(colors), [colors]);
   return (
     <Pressable
       style={styles.row}
@@ -229,65 +235,67 @@ function ContactRow({
   );
 }
 
-const styles = StyleSheet.create({
-  center: { flex: 1, alignItems: "center", justifyContent: "center", gap: 8 },
-  empty: { color: colors.textTertiary, textAlign: "center", marginTop: 24 },
-  error: { color: colors.textSecondary, textAlign: "center", paddingHorizontal: 24 },
-  addSection: { paddingTop: 12, paddingHorizontal: 16, backgroundColor: colors.surface },
-  addRow: { flexDirection: "row", gap: 8 },
-  input: {
-    flex: 1,
-    borderWidth: 1,
-    borderColor: colors.border,
-    backgroundColor: colors.background,
-    borderRadius: 10,
-    paddingHorizontal: 12,
-    paddingVertical: 10,
-    fontSize: 15,
-  },
-  addButton: {
-    backgroundColor: colors.accent,
-    borderRadius: 10,
-    paddingHorizontal: 18,
-    alignItems: "center",
-    justifyContent: "center",
-  },
-  addButtonText: { color: "#fff", fontWeight: "700", fontSize: 15 },
-  manualError: { color: colors.danger, fontSize: 13, marginTop: 6 },
-  sectionLabel: {
-    color: colors.textTertiary,
-    fontSize: 13,
-    fontWeight: "600",
-    textTransform: "uppercase",
-    marginTop: 20,
-    marginBottom: 4,
-  },
-  row: {
-    flexDirection: "row",
-    alignItems: "center",
-    justifyContent: "space-between",
-    paddingHorizontal: 16,
-    paddingVertical: 10,
-    gap: 12,
-    borderBottomWidth: StyleSheet.hairlineWidth,
-    borderBottomColor: colors.border,
-  },
-  avatar: { width: 44, height: 44, borderRadius: 22, alignItems: "center", justifyContent: "center" },
-  avatarText: { fontSize: 16, fontWeight: "700", color: "#fff" },
-  info: { flex: 1 },
-  name: { fontSize: 16, fontWeight: "600", color: colors.text },
-  email: { fontSize: 13, color: colors.textSecondary, marginTop: 2 },
-  inviteButton: {
-    flexDirection: "row",
-    alignItems: "center",
-    gap: 4,
-    borderWidth: 1,
-    borderColor: colors.accent,
-    borderRadius: 16,
-    paddingHorizontal: 12,
-    paddingVertical: 6,
-    minWidth: 68,
-    justifyContent: "center",
-  },
-  inviteText: { color: colors.accent, fontWeight: "600", fontSize: 13 },
-});
+const createStyles = (colors: ThemeColors) =>
+  StyleSheet.create({
+    center: { flex: 1, alignItems: "center", justifyContent: "center", gap: 8 },
+    empty: { color: colors.textTertiary, textAlign: "center", marginTop: 24 },
+    error: { color: colors.textSecondary, textAlign: "center", paddingHorizontal: 24 },
+    addSection: { paddingTop: 12, paddingHorizontal: 16, backgroundColor: colors.surface },
+    addRow: { flexDirection: "row", gap: 8 },
+    input: {
+      flex: 1,
+      borderWidth: 1,
+      borderColor: colors.border,
+      backgroundColor: colors.background,
+      color: colors.text,
+      borderRadius: 10,
+      paddingHorizontal: 12,
+      paddingVertical: 10,
+      fontSize: 15,
+    },
+    addButton: {
+      backgroundColor: colors.accent,
+      borderRadius: 10,
+      paddingHorizontal: 18,
+      alignItems: "center",
+      justifyContent: "center",
+    },
+    addButtonText: { color: "#fff", fontWeight: "700", fontSize: 15 },
+    manualError: { color: colors.danger, fontSize: 13, marginTop: 6 },
+    sectionLabel: {
+      color: colors.textTertiary,
+      fontSize: 13,
+      fontWeight: "600",
+      textTransform: "uppercase",
+      marginTop: 20,
+      marginBottom: 4,
+    },
+    row: {
+      flexDirection: "row",
+      alignItems: "center",
+      justifyContent: "space-between",
+      paddingHorizontal: 16,
+      paddingVertical: 10,
+      gap: 12,
+      borderBottomWidth: StyleSheet.hairlineWidth,
+      borderBottomColor: colors.border,
+    },
+    avatar: { width: 44, height: 44, borderRadius: 22, alignItems: "center", justifyContent: "center" },
+    avatarText: { fontSize: 16, fontWeight: "700", color: "#fff" },
+    info: { flex: 1 },
+    name: { fontSize: 16, fontWeight: "600", color: colors.text },
+    email: { fontSize: 13, color: colors.textSecondary, marginTop: 2 },
+    inviteButton: {
+      flexDirection: "row",
+      alignItems: "center",
+      gap: 4,
+      borderWidth: 1,
+      borderColor: colors.accent,
+      borderRadius: 16,
+      paddingHorizontal: 12,
+      paddingVertical: 6,
+      minWidth: 68,
+      justifyContent: "center",
+    },
+    inviteText: { color: colors.accent, fontWeight: "600", fontSize: 13 },
+  });

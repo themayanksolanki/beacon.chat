@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import { Image, Pressable, StyleSheet, Text, TextInput, View } from "react-native";
 import * as ImagePicker from "expo-image-picker";
 import type { NativeStackScreenProps } from "@react-navigation/native-stack";
@@ -7,13 +7,16 @@ import { Ionicons } from "@expo/vector-icons";
 import type { MainStackParamList } from "../../App";
 import { useAuth } from "../auth/AuthContext";
 import PrimaryButton from "../components/PrimaryButton";
-import { colorForName, colors, initialFor } from "../theme";
+import { useTheme } from "../ThemeContext";
+import { colorForName, initialFor, type ThemeColors } from "../theme";
 
 type Props = NativeStackScreenProps<MainStackParamList, "EditProfile">;
 
 const MIN_NAME_LENGTH = 3;
 
 export default function EditProfileScreen({ navigation }: Props) {
+  const { colors } = useTheme();
+  const styles = useMemo(() => createStyles(colors), [colors]);
   const { profile, updateProfile } = useAuth();
   const [fullName, setFullName] = useState(profile?.fullName ?? "");
   const [photoUri, setPhotoUri] = useState<string | null>(profile?.photoUri ?? null);
@@ -80,6 +83,7 @@ export default function EditProfileScreen({ navigation }: Props) {
       <TextInput
         style={styles.input}
         placeholder="Full name"
+        placeholderTextColor={colors.textTertiary}
         autoCapitalize="words"
         value={fullName}
         onChangeText={setFullName}
@@ -101,43 +105,45 @@ export default function EditProfileScreen({ navigation }: Props) {
   );
 }
 
-const styles = StyleSheet.create({
-  container: { flex: 1, alignItems: "center", padding: 24, paddingTop: 40 },
-  avatarWrap: { position: "relative" },
-  preview: {
-    width: 140,
-    height: 140,
-    borderRadius: 70,
-    alignItems: "center",
-    justifyContent: "center",
-  },
-  placeholderText: { color: "#fff", fontSize: 44, fontWeight: "700" },
-  cameraBadge: {
-    position: "absolute",
-    bottom: 4,
-    right: 4,
-    width: 32,
-    height: 32,
-    borderRadius: 16,
-    backgroundColor: colors.accent,
-    alignItems: "center",
-    justifyContent: "center",
-    borderWidth: 2,
-    borderColor: colors.surface,
-  },
-  changePhotoLabel: { color: colors.accent, fontSize: 14, fontWeight: "600", marginTop: 10 },
-  input: {
-    width: "100%",
-    borderWidth: 1,
-    borderColor: colors.border,
-    backgroundColor: colors.background,
-    borderRadius: 10,
-    padding: 12,
-    fontSize: 16,
-    marginTop: 28,
-  },
-  memberSinceRow: { flexDirection: "row", alignItems: "center", gap: 4, marginTop: 12 },
-  memberSince: { color: colors.textTertiary, fontSize: 13 },
-  error: { color: colors.danger, marginTop: 12 },
-  saveSpacing: { marginTop: 28, width: "100%" },
-});
+const createStyles = (colors: ThemeColors) =>
+  StyleSheet.create({
+    container: { flex: 1, alignItems: "center", padding: 24, paddingTop: 40, backgroundColor: colors.background },
+    avatarWrap: { position: "relative" },
+    preview: {
+      width: 140,
+      height: 140,
+      borderRadius: 70,
+      alignItems: "center",
+      justifyContent: "center",
+    },
+    placeholderText: { color: "#fff", fontSize: 44, fontWeight: "700" },
+    cameraBadge: {
+      position: "absolute",
+      bottom: 4,
+      right: 4,
+      width: 32,
+      height: 32,
+      borderRadius: 16,
+      backgroundColor: colors.accent,
+      alignItems: "center",
+      justifyContent: "center",
+      borderWidth: 2,
+      borderColor: colors.surface,
+    },
+    changePhotoLabel: { color: colors.accent, fontSize: 14, fontWeight: "600", marginTop: 10 },
+    input: {
+      width: "100%",
+      borderWidth: 1,
+      borderColor: colors.border,
+      backgroundColor: colors.surface,
+      color: colors.text,
+      borderRadius: 10,
+      padding: 12,
+      fontSize: 16,
+      marginTop: 28,
+    },
+    memberSinceRow: { flexDirection: "row", alignItems: "center", gap: 4, marginTop: 12 },
+    memberSince: { color: colors.textTertiary, fontSize: 13 },
+    error: { color: colors.danger, marginTop: 12 },
+    saveSpacing: { marginTop: 28, width: "100%" },
+  });

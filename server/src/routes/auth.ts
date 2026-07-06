@@ -4,7 +4,7 @@ import { randomUUID } from "node:crypto";
 import { db } from "../db";
 import { requireAuth, signToken, type AuthedRequest } from "../auth";
 import { revokeOtherSessions } from "../socketServer";
-import { generateOtp, hashOtp, MAX_ATTEMPTS, OTP_TTL_MS } from "../otp";
+import { generateOtp, hashOtp, otpHashesMatch, MAX_ATTEMPTS, OTP_TTL_MS } from "../otp";
 import { sendOtpEmail } from "../email";
 
 export const authRouter = Router();
@@ -40,6 +40,10 @@ authRouter.post("/otp/request", otpRequestLimiter, async (req, res) => {
     res.status(400).json({ error: "invalid_email" });
     return;
   }
+
+  // Opportunistic cleanup: otherwise every request leaves a row behind
+  // forever, since nothing else ever deletes expired challenges.
+  db.prepare("DELETE FROM otp_challenges WHERE email = ? AND expires_at < ?").run(email, Date.now());
 
   const code = generateOtp();
   db.prepare(
@@ -79,7 +83,7 @@ authRouter.post("/otp/verify", async (req, res) => {
     return;
   }
 
-  if (challenge.code_hash !== hashOtp(code, email)) {
+  if (!otpHashesMatch(challenge.code_hash, hashOtp(code, email))) {
     db.prepare("UPDATE otp_challenges SET attempts = attempts + 1 WHERE id = ?").run(challenge.id);
     res.status(401).json({ error: "invalid_code" });
     return;

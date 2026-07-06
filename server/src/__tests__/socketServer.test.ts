@@ -102,6 +102,41 @@ describe("socket relay", () => {
     });
   });
 
+  it("relays a reaction from reactor to the message's sender", (done: jest.DoneCallback) => {
+    const alice = connect("alice-id", "alice-session-1");
+    const bob = connect("bob-id", "bob-session-1");
+
+    alice.on("reaction:set", (reaction) => {
+      expect(reaction.message_id).toBe("message-for-reaction");
+      expect(reaction.sender_id).toBe("bob-id");
+      expect(reaction.ciphertext).toBe("cipher-thumbs-up");
+      alice.close();
+      bob.close();
+      done();
+    });
+
+    let aliceConnected = false;
+    let bobConnected = false;
+    const sendIfReady = () => {
+      if (aliceConnected && bobConnected) {
+        bob.emit("reaction:set", {
+          messageId: "message-for-reaction",
+          recipientId: "alice-id",
+          ciphertext: "cipher-thumbs-up",
+          nonce: "nonce-value",
+        });
+      }
+    };
+    alice.on("connect", () => {
+      aliceConnected = true;
+      sendIfReady();
+    });
+    bob.on("connect", () => {
+      bobConnected = true;
+      sendIfReady();
+    });
+  });
+
   it("force-disconnects a device's socket when it logs in elsewhere", (done: jest.DoneCallback) => {
     const oldDevice = connect("alice-id", "alice-session-1");
     let sawRevokedEvent = false;

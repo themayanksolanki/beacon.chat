@@ -47,6 +47,22 @@ export function initDatabase() {
 
     CREATE INDEX IF NOT EXISTS idx_messages_recipient
       ON messages(recipient_id, delivered_at);
+
+    -- One reaction per (message, reactor); ciphertext/nonce only, same as
+    -- messages — the server never sees which emoji was used.
+    CREATE TABLE IF NOT EXISTS reactions (
+      message_id TEXT NOT NULL,
+      sender_id TEXT NOT NULL,
+      recipient_id TEXT NOT NULL,
+      ciphertext TEXT NOT NULL,
+      nonce TEXT NOT NULL,
+      created_at INTEGER NOT NULL,
+      delivered_at INTEGER,
+      PRIMARY KEY (message_id, sender_id)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_reactions_recipient
+      ON reactions(recipient_id, delivered_at);
   `);
 
   // read_at was added after the messages table already shipped; guard the
@@ -78,6 +94,12 @@ export function initDatabase() {
       DROP TABLE users;
       ALTER TABLE users_new RENAME TO users;
     `);
+  }
+
+  // Presence: last_seen_at is set when a user's final socket disconnects.
+  const currentUserColumns = db.prepare("PRAGMA table_info(users)").all() as { name: string }[];
+  if (!currentUserColumns.some((c) => c.name === "last_seen_at")) {
+    db.exec("ALTER TABLE users ADD COLUMN last_seen_at INTEGER");
   }
 
   const otpColumns = db.prepare("PRAGMA table_info(otp_challenges)").all() as { name: string }[];

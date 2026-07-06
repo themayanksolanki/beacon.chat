@@ -6,12 +6,14 @@
     "version": "1.0.0",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
-    "userInterfaceStyle": "light",
+    "userInterfaceStyle": "automatic",
     "ios": {
       "bundleIdentifier": "com.beaconchat.app",
       "supportsTablet": true,
       "infoPlist": {
         "NSFaceIDUsageDescription": "Beacon can use Face ID to protect access to your encryption keys.",
+        "NSCameraUsageDescription": "Beacon needs camera access for video calls.",
+        "NSMicrophoneUsageDescription": "Beacon needs microphone access for voice and video calls.",
         "ITSAppUsesNonExemptEncryption": true,
         "NSAppTransportSecurity": {
           "NSAllowsLocalNetworking": true
@@ -29,6 +31,7 @@
       "predictiveBackGestureEnabled": false,
       "permissions": [
         "android.permission.RECORD_AUDIO",
+        "android.permission.CAMERA",
         "android.permission.READ_CONTACTS",
         "android.permission.WRITE_CONTACTS"
       ]
@@ -50,6 +53,12 @@
         "expo-contacts",
         {
           "contactsPermission": "Beacon needs access to your contacts to show which of them are already on Beacon."
+        }
+      ],
+      [
+        "expo-audio",
+        {
+          "microphonePermission": "Beacon needs microphone access for voice and video calls."
         }
       ]
     ],

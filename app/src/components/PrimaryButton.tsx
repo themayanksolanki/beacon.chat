@@ -1,6 +1,8 @@
+import { useMemo } from "react";
 import { ActivityIndicator, Pressable, StyleSheet, Text } from "react-native";
 
-import { colors } from "../theme";
+import { useTheme } from "../ThemeContext";
+import type { ThemeColors } from "../theme";
 
 interface Props {
   title: string;
@@ -11,6 +13,8 @@ interface Props {
 }
 
 export default function PrimaryButton({ title, onPress, disabled, loading, variant = "filled" }: Props) {
+  const { colors } = useTheme();
+  const styles = useMemo(() => createStyles(colors), [colors]);
   const isOutline = variant === "outline";
   return (
     <Pressable
@@ -31,12 +35,13 @@ export default function PrimaryButton({ title, onPress, disabled, loading, varia
   );
 }
 
-const styles = StyleSheet.create({
-  button: { borderRadius: 12, paddingVertical: 14, alignItems: "center", width: "100%" },
-  filled: { backgroundColor: colors.accent },
-  filledDisabled: { backgroundColor: colors.accentSoft },
-  filledText: { color: "#fff", fontSize: 16, fontWeight: "700" },
-  outline: { borderWidth: 1.5, borderColor: colors.accent, backgroundColor: colors.surface },
-  outlineDisabled: { borderColor: colors.border },
-  outlineText: { color: colors.accent, fontSize: 16, fontWeight: "700" },
-});
+const createStyles = (colors: ThemeColors) =>
+  StyleSheet.create({
+    button: { borderRadius: 12, paddingVertical: 14, alignItems: "center", width: "100%" },
+    filled: { backgroundColor: colors.accent },
+    filledDisabled: { backgroundColor: colors.accentSoft },
+    filledText: { color: "#fff", fontSize: 16, fontWeight: "700" },
+    outline: { borderWidth: 1.5, borderColor: colors.accent, backgroundColor: colors.surface },
+    outlineDisabled: { borderColor: colors.border },
+    outlineText: { color: colors.accent, fontSize: 16, fontWeight: "700" },
+  });

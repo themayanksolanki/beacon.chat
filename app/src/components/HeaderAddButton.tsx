@@ -2,10 +2,11 @@ import { Pressable, StyleSheet } from "react-native";
 import { useNavigation } from "@react-navigation/native";
 import { Ionicons } from "@expo/vector-icons";
 
-import { colors } from "../theme";
+import { useTheme } from "../ThemeContext";
 
 export default function HeaderAddButton() {
   const navigation = useNavigation();
+  const { colors } = useTheme();
 
   return (
     <Pressable

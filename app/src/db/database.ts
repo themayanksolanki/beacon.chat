@@ -29,6 +29,20 @@ export function initDatabase() {
 
     CREATE INDEX IF NOT EXISTS idx_messages_conversation
       ON messages(conversation_id, sent_at);
+
+    CREATE TABLE IF NOT EXISTS calls (
+      id TEXT PRIMARY KEY NOT NULL,
+      conversation_id TEXT NOT NULL,
+      direction TEXT NOT NULL CHECK (direction IN ('outgoing', 'incoming')),
+      kind TEXT NOT NULL CHECK (kind IN ('audio', 'video')),
+      status TEXT NOT NULL CHECK (status IN ('completed', 'missed', 'declined', 'failed')),
+      started_at INTEGER NOT NULL,
+      answered_at INTEGER,
+      ended_at INTEGER,
+      FOREIGN KEY (conversation_id) REFERENCES conversations(id)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_calls_started_at ON calls(started_at);
   `);
 
   // status/delivered_at/read_at/reply_* were added after this table already
@@ -45,6 +59,15 @@ export function initDatabase() {
     ["reply_preview", "ALTER TABLE messages ADD COLUMN reply_preview TEXT"],
     ["pinned_at", "ALTER TABLE messages ADD COLUMN pinned_at INTEGER"],
     ["deleted_at", "ALTER TABLE messages ADD COLUMN deleted_at INTEGER"],
+    ["reaction_mine", "ALTER TABLE messages ADD COLUMN reaction_mine TEXT"],
+    ["reaction_peer", "ALTER TABLE messages ADD COLUMN reaction_peer TEXT"],
+    ["kind", "ALTER TABLE messages ADD COLUMN kind TEXT NOT NULL DEFAULT 'text'"],
+    ["audio_uri", "ALTER TABLE messages ADD COLUMN audio_uri TEXT"],
+    ["duration_ms", "ALTER TABLE messages ADD COLUMN duration_ms INTEGER"],
+    ["waveform", "ALTER TABLE messages ADD COLUMN waveform TEXT"],
+    ["image_uri", "ALTER TABLE messages ADD COLUMN image_uri TEXT"],
+    ["image_width", "ALTER TABLE messages ADD COLUMN image_width INTEGER"],
+    ["image_height", "ALTER TABLE messages ADD COLUMN image_height INTEGER"],
   ];
   for (const [column, statement] of migrations) {
     if (!existingColumns.has(column)) {
@@ -54,6 +77,7 @@ export function initDatabase() {
 }
 
 export type MessageStatus = "pending" | "sent" | "delivered" | "read" | "failed";
+export type MessageKind = "text" | "voice" | "image";
 
 export interface MessageRow {
   id: string;
@@ -68,13 +92,25 @@ export interface MessageRow {
   reply_preview: string | null;
   pinned_at: number | null;
   deleted_at: number | null;
+  reaction_mine: string | null;
+  reaction_peer: string | null;
+  kind: MessageKind;
+  /** Local file uri for the decrypted/recorded audio clip. Only set when kind === 'voice'. */
+  audio_uri: string | null;
+  duration_ms: number | null;
+  /** JSON-encoded array of 0..1 amplitude samples. Only set when kind === 'voice'. */
+  waveform: string | null;
+  /** Local file uri for the decrypted/compressed image. Only set when kind === 'image'. */
+  image_uri: string | null;
+  image_width: number | null;
+  image_height: number | null;
 }
 
 export function insertMessage(message: MessageRow) {
   db.runSync(
     `INSERT INTO messages
-       (id, conversation_id, direction, plaintext, sent_at, status, delivered_at, read_at, reply_to_id, reply_preview, pinned_at, deleted_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       (id, conversation_id, direction, plaintext, sent_at, status, delivered_at, read_at, reply_to_id, reply_preview, pinned_at, deleted_at, reaction_mine, reaction_peer, kind, audio_uri, duration_ms, waveform, image_uri, image_width, image_height)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [
       message.id,
       message.conversation_id,
@@ -88,8 +124,25 @@ export function insertMessage(message: MessageRow) {
       message.reply_preview,
       message.pinned_at,
       message.deleted_at,
+      message.reaction_mine,
+      message.reaction_peer,
+      message.kind,
+      message.audio_uri,
+      message.duration_ms,
+      message.waveform,
+      message.image_uri,
+      message.image_width,
+      message.image_height,
     ]
   );
+}
+
+export function setMyReaction(id: string, emoji: string | null): void {
+  db.runSync(`UPDATE messages SET reaction_mine = ? WHERE id = ?`, [emoji, id]);
+}
+
+export function setPeerReaction(id: string, emoji: string | null): void {
+  db.runSync(`UPDATE messages SET reaction_peer = ? WHERE id = ?`, [emoji, id]);
 }
 
 export function getMessages(conversationId: string): MessageRow[] {
@@ -104,6 +157,10 @@ export function getUnreadIncomingMessages(conversationId: string): MessageRow[] 
     `SELECT * FROM messages WHERE conversation_id = ? AND direction = 'incoming' AND read_at IS NULL`,
     [conversationId]
   );
+}
+
+export function clearMessages(conversationId: string): void {
+  db.runSync(`DELETE FROM messages WHERE conversation_id = ?`, [conversationId]);
 }
 
 export function markMessageSent(id: string): void {
@@ -177,6 +234,8 @@ export function getConversations(): ConversationRow[] {
 export interface ConversationSummary extends ConversationRow {
   last_message: string | null;
   last_message_at: number | null;
+  last_message_direction: "outgoing" | "incoming" | null;
+  last_message_status: MessageStatus | null;
   unread_count: number;
 }
 
@@ -187,6 +246,8 @@ export function getConversationSummaries(): ConversationSummary[] {
       (SELECT CASE WHEN m.deleted_at IS NOT NULL THEN 'This message was deleted' ELSE m.plaintext END
          FROM messages m WHERE m.conversation_id = c.id ORDER BY m.sent_at DESC LIMIT 1) AS last_message,
       (SELECT sent_at FROM messages m WHERE m.conversation_id = c.id ORDER BY m.sent_at DESC LIMIT 1) AS last_message_at,
+      (SELECT direction FROM messages m WHERE m.conversation_id = c.id ORDER BY m.sent_at DESC LIMIT 1) AS last_message_direction,
+      (SELECT status FROM messages m WHERE m.conversation_id = c.id ORDER BY m.sent_at DESC LIMIT 1) AS last_message_status,
       (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id AND m.direction = 'incoming' AND m.read_at IS NULL) AS unread_count
     FROM conversations c
     ORDER BY COALESCE(last_message_at, c.created_at) DESC
@@ -209,6 +270,65 @@ export function insertConversation(conversation: ConversationRow): void {
     `INSERT INTO conversations (id, peer_public_key, display_name, created_at) VALUES (?, ?, ?, ?)`,
     [conversation.id, conversation.peer_public_key, conversation.display_name, conversation.created_at]
   );
+}
+
+export type CallDirection = "outgoing" | "incoming";
+export type CallKind = "audio" | "video";
+export type CallStatus = "completed" | "missed" | "declined" | "failed";
+
+export interface CallRow {
+  id: string;
+  conversation_id: string;
+  direction: CallDirection;
+  kind: CallKind;
+  status: CallStatus;
+  started_at: number;
+  answered_at: number | null;
+  ended_at: number | null;
+}
+
+export function insertCall(call: CallRow): void {
+  db.runSync(
+    `INSERT INTO calls (id, conversation_id, direction, kind, status, started_at, answered_at, ended_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    [
+      call.id,
+      call.conversation_id,
+      call.direction,
+      call.kind,
+      call.status,
+      call.started_at,
+      call.answered_at,
+      call.ended_at,
+    ]
+  );
+}
+
+export function updateCallOutcome(
+  id: string,
+  status: CallStatus,
+  answeredAt: number | null,
+  endedAt: number
+): void {
+  db.runSync(`UPDATE calls SET status = ?, answered_at = ?, ended_at = ? WHERE id = ?`, [
+    status,
+    answeredAt,
+    endedAt,
+    id,
+  ]);
+}
+
+export interface CallHistoryEntry extends CallRow {
+  display_name: string | null;
+}
+
+export function getCallHistory(): CallHistoryEntry[] {
+  return db.getAllSync<CallHistoryEntry>(`
+    SELECT calls.*, conversations.display_name
+    FROM calls
+    JOIN conversations ON conversations.id = calls.conversation_id
+    ORDER BY calls.started_at DESC
+  `);
 }
 
 export default db;

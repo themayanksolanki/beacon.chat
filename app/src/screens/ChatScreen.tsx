@@ -1,6 +1,5 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import {
-  ActionSheetIOS,
   Alert,
   Animated,
   FlatList,
@@ -16,6 +15,7 @@ import {
 import { Ionicons } from "@expo/vector-icons";
 import * as Clipboard from "expo-clipboard";
 import * as Crypto from "expo-crypto";
+import * as ImagePicker from "expo-image-picker";
 import sodium from "react-native-libsodium";
 import { useFocusEffect } from "@react-navigation/native";
 import type { NativeStackScreenProps } from "@react-navigation/native-stack";
@@ -23,6 +23,11 @@ import { useSafeAreaInsets } from "react-native-safe-area-context";
 import EmojiPicker, { type EmojiType } from "rn-emoji-keyboard";
 
 import type { MainStackParamList } from "../../App";
+import { useVoiceRecorder, type RecordedVoice } from "../audio/useVoiceRecorder";
+import { persistRecordedVoice, readVoiceMessageBase64, writeVoiceMessageBase64 } from "../audio/voiceStorage";
+import ImageMessageBubble from "../components/ImageMessageBubble";
+import MessageActionMenu, { type MessageAction, type MessageMenuAnchor } from "../components/MessageActionMenu";
+import VoiceMessageBubble from "../components/VoiceMessageBubble";
 import { decryptMessage, encryptMessage, getOrCreateIdentity } from "../crypto/identity";
 import {
   deleteMessage,
@@ -37,18 +42,32 @@ import {
   markMessageRead,
   markMessageSent,
   pinMessage,
+  setMyReaction,
+  setPeerReaction,
   unpinMessage,
   type MessageRow,
 } from "../db/database";
+import { compressImage } from "../media/imageCompression";
+import { deleteImageMessage, persistPickedImage, readImageMessageBase64, writeImageMessageBase64 } from "../media/imageStorage";
+import { useCall } from "../calls/CallContext";
 import { getSocket } from "../network/socket";
+import { usePresence } from "../presence/PresenceContext";
 import { TEST_BOT_CONVERSATION_ID } from "../testBot";
-import { colors } from "../theme";
+import { useTheme } from "../ThemeContext";
+import { colorForName, initialFor, type ThemeColors } from "../theme";
+
+const VOICE_MESSAGE_LABEL = "🎤 Voice message";
+const IMAGE_MESSAGE_LABEL = "📷 Photo";
 
 type Props = NativeStackScreenProps<MainStackParamList, "Chat">;
 
-interface MessagePayload {
-  text: string;
-  replyTo?: { id: string; preview: string };
+type MessagePayload =
+  | { kind: "text"; text: string; replyTo?: { id: string; preview: string } }
+  | { kind: "voice"; audio: string; durationMs: number; waveform: number[]; replyTo?: { id: string; preview: string } }
+  | { kind: "image"; image: string; width: number; height: number; replyTo?: { id: string; preview: string } };
+
+interface ReactionPayload {
+  emoji: string;
 }
 
 interface IncomingServerMessage {
@@ -58,6 +77,14 @@ interface IncomingServerMessage {
   ciphertext: string;
   nonce: string;
   created_at: number;
+}
+
+interface IncomingServerReaction {
+  message_id: string;
+  sender_id: string;
+  recipient_id: string;
+  ciphertext: string;
+  nonce: string;
 }
 
 interface ReplyTarget {
@@ -77,6 +104,13 @@ function formatTime(ts: number) {
   return new Date(ts).toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" });
 }
 
+function formatRecordingTime(ms: number): string {
+  const totalSeconds = Math.floor(ms / 1000);
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  return `${minutes}:${String(seconds).padStart(2, "0")}`;
+}
+
 function isSameDay(a: Date, b: Date) {
   return a.getFullYear() === b.getFullYear() && a.getMonth() === b.getMonth() && a.getDate() === b.getDate();
 }
@@ -91,53 +125,86 @@ function dayLabel(ts: number): string {
   return date.toLocaleDateString(undefined, { month: "long", day: "numeric", year: "numeric" });
 }
 
+function formatLastSeen(ts: number): string {
+  const label = dayLabel(ts);
+  if (label === "Today") return `last seen today at ${formatTime(ts)}`;
+  if (label === "Yesterday") return `last seen yesterday at ${formatTime(ts)}`;
+  return `last seen ${label}`;
+}
+
+function ChatHeaderTitle({
+  name,
+  online,
+  lastSeenAt,
+  onPress,
+}: {
+  name: string;
+  online: boolean;
+  lastSeenAt: number | null;
+  onPress: () => void;
+}) {
+  const { colors } = useTheme();
+  const styles = useMemo(() => createStyles(colors), [colors]);
+
+  return (
+    <Pressable style={styles.headerTitleRow} onPress={onPress} hitSlop={8}>
+      <View style={[styles.headerAvatar, { backgroundColor: colorForName(name) }]}>
+        <Text style={styles.headerAvatarText}>{initialFor(name)}</Text>
+      </View>
+      <View style={styles.headerTextCol}>
+        <Text style={styles.headerName} numberOfLines={1}>
+          {name}
+        </Text>
+        {online ? (
+          <Text style={styles.headerStatus}>Active now</Text>
+        ) : lastSeenAt ? (
+          <Text style={styles.headerStatus}>{formatLastSeen(lastSeenAt)}</Text>
+        ) : null}
+      </View>
+    </Pressable>
+  );
+}
+
+function ChatHeaderCallButtons({ conversationId }: { conversationId: string }) {
+  const { colors } = useTheme();
+  const { startCall } = useCall();
+
+  return (
+    <View style={{ flexDirection: "row", gap: 18 }}>
+      <Pressable onPress={() => startCall(conversationId, "audio")} hitSlop={8}>
+        <Ionicons name="call-outline" size={22} color={colors.accent} />
+      </Pressable>
+      <Pressable onPress={() => startCall(conversationId, "video")} hitSlop={8}>
+        <Ionicons name="videocam-outline" size={24} color={colors.accent} />
+      </Pressable>
+    </View>
+  );
+}
+
 type ListItem =
   | { type: "separator"; id: string; label: string }
-  | { type: "message"; id: string; message: MessageRow };
+  | { type: "message"; id: string; message: MessageRow; isGroupEnd: boolean };
 
+/**
+ * Consecutive messages from the same side are visually grouped (tighter
+ * spacing, tail corner only on the last one) — a day boundary or a change
+ * in direction always ends a group.
+ */
 function buildListItems(messages: MessageRow[]): ListItem[] {
   const items: ListItem[] = [];
   let lastLabel: string | null = null;
-  for (const message of messages) {
+  for (let i = 0; i < messages.length; i++) {
+    const message = messages[i];
     const label = dayLabel(message.sent_at);
     if (label !== lastLabel) {
       items.push({ type: "separator", id: `sep-${message.id}`, label });
       lastLabel = label;
     }
-    items.push({ type: "message", id: message.id, message });
+    const next = messages[i + 1];
+    const isGroupEnd = !next || next.direction !== message.direction || dayLabel(next.sent_at) !== label;
+    items.push({ type: "message", id: message.id, message, isGroupEnd });
   }
   return items;
-}
-
-interface MessageAction {
-  label: string;
-  onPress: () => void;
-  destructive?: boolean;
-}
-
-function presentMessageActions(actions: MessageAction[]) {
-  if (Platform.OS === "ios") {
-    const options = [...actions.map((a) => a.label), "Cancel"];
-    const destructiveButtonIndex = actions
-      .map((a, i) => (a.destructive ? i : -1))
-      .filter((i) => i >= 0);
-    ActionSheetIOS.showActionSheetWithOptions(
-      { options, cancelButtonIndex: options.length - 1, destructiveButtonIndex },
-      (index) => {
-        if (index === undefined || index === options.length - 1) return;
-        actions[index]?.onPress();
-      }
-    );
-  } else {
-    Alert.alert("Message", undefined, [
-      ...actions.map((a) => ({
-        text: a.label,
-        onPress: a.onPress,
-        style: a.destructive ? ("destructive" as const) : undefined,
-      })),
-      { text: "Cancel", style: "cancel" as const },
-    ]);
-  }
 }
 
 function showTimingInfo(message: MessageRow) {
@@ -148,6 +215,7 @@ function showTimingInfo(message: MessageRow) {
 }
 
 function StatusTicks({ status }: { status: MessageRow["status"] }) {
+  const { colors } = useTheme();
   if (status === "failed") {
     return <Ionicons name="alert-circle" size={14} color={colors.danger} />;
   }
@@ -165,6 +233,7 @@ function StatusTicks({ status }: { status: MessageRow["status"] }) {
 
 interface MessageBubbleProps {
   message: MessageRow;
+  isGroupEnd: boolean;
   onReply: (message: MessageRow) => void;
   onCopy: (message: MessageRow) => void;
   onDelete: (message: MessageRow) => void;
@@ -172,10 +241,13 @@ interface MessageBubbleProps {
   onPin: (message: MessageRow) => void;
   onUnpin: (message: MessageRow) => void;
   onDeleteForEveryone: (message: MessageRow) => void;
+  onOpenMenu: (message: MessageRow, actions: MessageAction[], anchor: MessageMenuAnchor) => void;
+  onCancelSend: (message: MessageRow) => void;
 }
 
 function MessageBubble({
   message,
+  isGroupEnd,
   onReply,
   onCopy,
   onDelete,
@@ -183,9 +255,14 @@ function MessageBubble({
   onPin,
   onUnpin,
   onDeleteForEveryone,
+  onOpenMenu,
+  onCancelSend,
 }: MessageBubbleProps) {
+  const { colors } = useTheme();
+  const styles = useMemo(() => createStyles(colors), [colors]);
   const translateX = useRef(new Animated.Value(0)).current;
   const replyTriggered = useRef(false);
+  const bubbleRef = useRef<View>(null);
 
   const panResponder = useRef(
     PanResponder.create({
@@ -217,98 +294,189 @@ function MessageBubble({
   const isPinned = !!message.pinned_at;
   const canDeleteForEveryone =
     isOutgoing && !isDeleted && Date.now() - message.sent_at <= DELETE_FOR_EVERYONE_WINDOW_MS;
+  const hasReaction = !isDeleted && !!(message.reaction_mine || message.reaction_peer);
 
   const onLongPress = isDeleted
     ? undefined
     : () => {
         const actions: MessageAction[] = [
-          { label: "Reply", onPress: () => onReply(message) },
-          { label: "Copy", onPress: () => onCopy(message) },
+          { label: "Reply", icon: "arrow-undo-outline", onPress: () => onReply(message) },
+          { label: "Copy", icon: "copy-outline", onPress: () => onCopy(message) },
           {
             label: isPinned ? "Unpin" : "Pin",
+            icon: isPinned ? "pin" : "pin-outline",
             onPress: () => (isPinned ? onUnpin(message) : onPin(message)),
           },
         ];
         if (canDeleteForEveryone) {
           actions.push({
             label: "Delete for everyone",
+            icon: "trash-outline",
             destructive: true,
             onPress: () => onDeleteForEveryone(message),
           });
         }
-        actions.push({ label: "Delete for me", destructive: true, onPress: () => onDelete(message) });
-        presentMessageActions(actions);
+        actions.push({
+          label: "Delete for me",
+          icon: "trash-outline",
+          destructive: true,
+          onPress: () => onDelete(message),
+        });
+
+        bubbleRef.current?.measureInWindow((x, y, width, height) => {
+          onOpenMenu(message, actions, { x, y, width, height });
+        });
       };
 
   return (
-    <Animated.View {...panResponder.panHandlers} style={{ transform: [{ translateX }] }}>
-      <Pressable
-        style={[styles.bubble, isOutgoing ? styles.outgoing : styles.incoming]}
-        onLongPress={onLongPress}
-      >
-        {isDeleted ? (
-          <View style={styles.deletedRow}>
-            <Ionicons
-              name="ban-outline"
-              size={14}
-              color={isOutgoing ? "rgba(255,255,255,0.75)" : colors.textTertiary}
-            />
-            <Text style={isOutgoing ? styles.outgoingDeletedText : styles.incomingDeletedText}>
-              This message was deleted
+    <Animated.View
+      {...panResponder.panHandlers}
+      style={[
+        { transform: [{ translateX }] },
+        hasReaction ? styles.bubbleRowReacted : isGroupEnd ? styles.bubbleRowSpaced : styles.bubbleRowTight,
+      ]}
+    >
+      <View style={{ alignSelf: isOutgoing ? "flex-end" : "flex-start" }}>
+        <Pressable
+          ref={bubbleRef}
+          style={[
+            styles.bubble,
+            isOutgoing ? styles.outgoing : styles.incoming,
+            !isGroupEnd && (isOutgoing ? styles.outgoingGrouped : styles.incomingGrouped),
+          ]}
+          onLongPress={onLongPress}
+        >
+          {isDeleted ? (
+            <View style={styles.deletedRow}>
+              <Ionicons
+                name="ban-outline"
+                size={14}
+                color={isOutgoing ? "rgba(255,255,255,0.75)" : colors.textTertiary}
+              />
+              <Text style={isOutgoing ? styles.outgoingDeletedText : styles.incomingDeletedText}>
+                This message was deleted
+              </Text>
+            </View>
+          ) : (
+            <>
+              {message.reply_preview ? (
+                <View
+                  style={[styles.replyQuote, isOutgoing ? styles.replyQuoteOutgoing : styles.replyQuoteIncoming]}
+                >
+                  <Text
+                    style={isOutgoing ? styles.replyQuoteTextOutgoing : styles.replyQuoteTextIncoming}
+                    numberOfLines={1}
+                  >
+                    {message.reply_preview}
+                  </Text>
+                </View>
+              ) : null}
+              {message.kind === "voice" ? (
+                <VoiceMessageBubble
+                  audioUri={message.audio_uri}
+                  durationMs={message.duration_ms ?? 0}
+                  waveform={message.waveform ? JSON.parse(message.waveform) : []}
+                  isOutgoing={isOutgoing}
+                />
+              ) : message.kind === "image" ? (
+                <ImageMessageBubble
+                  imageUri={message.image_uri}
+                  width={message.image_width ?? 0}
+                  height={message.image_height ?? 0}
+                  isSending={isOutgoing && message.status === "pending"}
+                  onCancelSend={
+                    isOutgoing && message.status === "pending" ? () => onCancelSend(message) : undefined
+                  }
+                />
+              ) : (
+                <Text style={isOutgoing ? styles.outgoingText : styles.incomingText}>{message.plaintext}</Text>
+              )}
+            </>
+          )}
+          <Pressable
+            style={styles.metaRow}
+            onPress={() => (message.status === "failed" ? onRetry(message) : showTimingInfo(message))}
+            disabled={!isOutgoing || isDeleted}
+          >
+            {isPinned ? (
+              <Ionicons
+                name="pin"
+                size={11}
+                color={isOutgoing ? "rgba(255,255,255,0.75)" : colors.textTertiary}
+              />
+            ) : null}
+            <Text style={isOutgoing ? styles.metaTextOutgoing : styles.metaTextIncoming}>
+              {message.status === "failed" ? "Not sent · tap to retry" : formatTime(message.sent_at)}
+            </Text>
+            {isOutgoing ? <StatusTicks status={message.status} /> : null}
+          </Pressable>
+        </Pressable>
+
+        {!isDeleted && (message.reaction_mine || message.reaction_peer) ? (
+          <View style={[styles.reactionBadge, isOutgoing ? styles.reactionBadgeOutgoing : styles.reactionBadgeIncoming]}>
+            <Text style={styles.reactionBadgeText}>
+              {Array.from(new Set([message.reaction_mine, message.reaction_peer].filter(Boolean))).join(" ")}
             </Text>
           </View>
-        ) : (
-          <>
-            {message.reply_preview ? (
-              <View style={styles.replyQuote}>
-                <Text style={styles.replyQuoteText} numberOfLines={1}>
-                  {message.reply_preview}
-                </Text>
-              </View>
-            ) : null}
-            <Text style={isOutgoing ? styles.outgoingText : styles.incomingText}>{message.plaintext}</Text>
-          </>
-        )}
-        <Pressable
-          style={styles.metaRow}
-          onPress={() => (message.status === "failed" ? onRetry(message) : showTimingInfo(message))}
-          disabled={!isOutgoing || isDeleted}
-        >
-          {isPinned ? (
-            <Ionicons
-              name="pin"
-              size={11}
-              color={isOutgoing ? "rgba(255,255,255,0.75)" : colors.textTertiary}
-            />
-          ) : null}
-          <Text style={isOutgoing ? styles.metaTextOutgoing : styles.metaTextIncoming}>
-            {message.status === "failed" ? "Not sent · tap to retry" : formatTime(message.sent_at)}
-          </Text>
-          {isOutgoing ? <StatusTicks status={message.status} /> : null}
-        </Pressable>
-      </Pressable>
+        ) : null}
+      </View>
     </Animated.View>
   );
 }
 
 export default function ChatScreen({ route, navigation }: Props) {
   const { conversationId } = route.params;
-  const conversation = getConversationById(conversationId);
+  const conversation = useMemo(() => getConversationById(conversationId), [conversationId]);
   const isTestBot = conversationId === TEST_BOT_CONVERSATION_ID;
   const insets = useSafeAreaInsets();
+  const { colors } = useTheme();
+  const styles = useMemo(() => createStyles(colors), [colors]);
 
   const [messages, setMessages] = useState<MessageRow[]>(() => getMessages(conversationId));
   const [draft, setDraft] = useState("");
   const [replyingTo, setReplyingTo] = useState<ReplyTarget | null>(null);
   const [emojiPickerOpen, setEmojiPickerOpen] = useState(false);
+  const [menu, setMenu] = useState<{
+    message: MessageRow;
+    actions: MessageAction[];
+    anchor: MessageMenuAnchor;
+  } | null>(null);
   const listRef = useRef<FlatList<ListItem>>(null);
   const readSentRef = useRef<Set<string>>(new Set());
   const listItems = useMemo(() => buildListItems(messages), [messages]);
   const pinnedMessage = useMemo(() => messages.find((m) => m.pinned_at) ?? null, [messages]);
 
+  const openMenu = useCallback(
+    (message: MessageRow, actions: MessageAction[], anchor: MessageMenuAnchor) => {
+      setMenu({ message, actions, anchor });
+    },
+    []
+  );
+
+  const { presence, subscribe } = usePresence();
+  useEffect(() => {
+    if (!isTestBot) subscribe([conversationId]);
+  }, [conversationId, isTestBot, subscribe]);
+
+  const peerPresence = presence[conversationId];
+
   useLayoutEffect(() => {
-    navigation.setOptions({ title: conversation?.display_name ?? "Chat" });
-  }, [navigation, conversation?.display_name]);
+    const name = conversation?.display_name ?? "Chat";
+    navigation.setOptions({
+      title: name,
+      headerTitle: isTestBot
+        ? undefined
+        : () => (
+            <ChatHeaderTitle
+              name={name}
+              online={peerPresence?.online ?? false}
+              lastSeenAt={peerPresence?.lastSeenAt ?? null}
+              onPress={() => navigation.navigate("ContactInfo", { conversationId })}
+            />
+          ),
+      headerRight: isTestBot ? undefined : () => <ChatHeaderCallButtons conversationId={conversationId} />,
+    });
+  }, [navigation, conversation?.display_name, isTestBot, peerPresence, conversationId]);
 
   const markVisibleMessagesRead = useCallback(() => {
     if (!conversation || isTestBot) return;
@@ -321,7 +489,7 @@ export default function ChatScreen({ route, navigation }: Props) {
       if (readSentRef.current.has(row.id)) continue;
       readSentRef.current.add(row.id);
       markMessageRead(row.id, now);
-      getSocket().emit("message:read", { id: row.id, senderId: conversationId });
+      getSocket().emit("message:read", { id: row.id });
       changed = true;
     }
     if (changed) {
@@ -331,8 +499,9 @@ export default function ChatScreen({ route, navigation }: Props) {
 
   useFocusEffect(
     useCallback(() => {
+      setMessages(getMessages(conversationId));
       markVisibleMessagesRead();
-    }, [markVisibleMessagesRead])
+    }, [conversationId, markVisibleMessagesRead])
   );
 
   useEffect(() => {
@@ -353,12 +522,15 @@ export default function ChatScreen({ route, navigation }: Props) {
           identity.privateKey
         );
         const payload: MessagePayload = JSON.parse(decrypted);
+        const audioUri = payload.kind === "voice" ? writeVoiceMessageBase64(payload.audio, message.id) : null;
+        const imageUri = payload.kind === "image" ? writeImageMessageBase64(payload.image, message.id) : null;
 
         const row: MessageRow = {
           id: message.id,
           conversation_id: conversationId,
           direction: "incoming",
-          plaintext: payload.text,
+          plaintext:
+            payload.kind === "voice" ? VOICE_MESSAGE_LABEL : payload.kind === "image" ? IMAGE_MESSAGE_LABEL : payload.text,
           sent_at: message.created_at,
           status: "delivered",
           delivered_at: message.created_at,
@@ -367,10 +539,19 @@ export default function ChatScreen({ route, navigation }: Props) {
           reply_preview: payload.replyTo?.preview ?? null,
           pinned_at: null,
           deleted_at: null,
+          reaction_mine: null,
+          reaction_peer: null,
+          kind: payload.kind,
+          audio_uri: audioUri,
+          duration_ms: payload.kind === "voice" ? payload.durationMs : null,
+          waveform: payload.kind === "voice" ? JSON.stringify(payload.waveform) : null,
+          image_uri: imageUri,
+          image_width: payload.kind === "image" ? payload.width : null,
+          image_height: payload.kind === "image" ? payload.height : null,
         };
         insertMessage(row);
         setMessages((prev) => [...prev, row]);
-        getSocket().emit("message:delivered", { id: message.id, senderId: conversationId });
+        getSocket().emit("message:delivered", { id: message.id });
         markVisibleMessagesRead();
       } catch (err) {
         console.warn("[chat] failed to process incoming message", err);
@@ -403,23 +584,59 @@ export default function ChatScreen({ route, navigation }: Props) {
       );
     };
 
+    const onReactionSet = async (reaction: IncomingServerReaction) => {
+      if (reaction.sender_id !== conversationId) return;
+      try {
+        const identity = await getOrCreateIdentity();
+        await sodium.ready;
+        const peerPublicKey = sodium.from_base64(conversation.peer_public_key);
+        const decrypted = await decryptMessage(
+          reaction.ciphertext,
+          reaction.nonce,
+          peerPublicKey,
+          identity.privateKey
+        );
+        const payload: ReactionPayload = JSON.parse(decrypted);
+        setPeerReaction(reaction.message_id, payload.emoji);
+        setMessages((prev) =>
+          prev.map((m) => (m.id === reaction.message_id ? { ...m, reaction_peer: payload.emoji } : m))
+        );
+      } catch (err) {
+        console.warn("[chat] failed to process incoming reaction", err);
+      }
+    };
+
+    const onReactionCleared = ({ messageId, senderId }: { messageId: string; senderId: string }) => {
+      if (senderId !== conversationId) return;
+      setPeerReaction(messageId, null);
+      setMessages((prev) => prev.map((m) => (m.id === messageId ? { ...m, reaction_peer: null } : m)));
+    };
+
     socket.on("message", onMessage);
     socket.on("message:delivered", onDelivered);
     socket.on("message:read", onRead);
     socket.on("message:deleted", onDeletedRemote);
+    socket.on("reaction:set", onReactionSet);
+    socket.on("reaction:cleared", onReactionCleared);
     return () => {
       socket.off("message", onMessage);
       socket.off("message:delivered", onDelivered);
       socket.off("message:read", onRead);
       socket.off("message:deleted", onDeletedRemote);
+      socket.off("reaction:set", onReactionSet);
+      socket.off("reaction:cleared", onReactionCleared);
     };
   }, [conversation, conversationId, isTestBot, markVisibleMessagesRead]);
 
-  const sendEncrypted = useCallback(
-    async (id: string, text: string, replyTo: ReplyTarget | null) => {
+  // Ids of pending sends the user cancelled locally (image uploads, via the
+  // bubble's cross button) — the socket ack for these may still arrive after
+  // the message row is already gone, and must be ignored rather than reviving it.
+  const cancelledSendIdsRef = useRef<Set<string>>(new Set());
+
+  const sendPayload = useCallback(
+    async (id: string, payload: MessagePayload) => {
       if (!conversation) return;
       try {
-        const payload: MessagePayload = { text, replyTo: replyTo ?? undefined };
         const identity = await getOrCreateIdentity();
         await sodium.ready;
         const peerPublicKey = sodium.from_base64(conversation.peer_public_key);
@@ -435,6 +652,7 @@ export default function ChatScreen({ route, navigation }: Props) {
             "message:send",
             { id, recipientId: conversationId, ciphertext, nonce },
             (err: unknown, response?: { ok: boolean; error?: string }) => {
+              if (cancelledSendIdsRef.current.delete(id)) return;
               if (err || !response?.ok) {
                 markMessageFailed(id);
                 setMessages((prev) => prev.map((m) => (m.id === id ? { ...m, status: "failed" } : m)));
@@ -445,6 +663,7 @@ export default function ChatScreen({ route, navigation }: Props) {
             }
           );
       } catch (err) {
+        if (cancelledSendIdsRef.current.delete(id)) return;
         console.warn("[chat] failed to send message", err);
         markMessageFailed(id);
         setMessages((prev) => prev.map((m) => (m.id === id ? { ...m, status: "failed" } : m)));
@@ -453,6 +672,43 @@ export default function ChatScreen({ route, navigation }: Props) {
     [conversation, conversationId]
   );
 
+  const sendEncrypted = useCallback(
+    (id: string, text: string, replyTo: ReplyTarget | null) =>
+      sendPayload(id, { kind: "text", text, replyTo: replyTo ?? undefined }),
+    [sendPayload]
+  );
+
+  const sendVoiceEncrypted = useCallback(
+    (id: string, audioUri: string, durationMs: number, waveform: number[], replyTo: ReplyTarget | null) =>
+      sendPayload(id, {
+        kind: "voice",
+        audio: readVoiceMessageBase64(audioUri),
+        durationMs,
+        waveform,
+        replyTo: replyTo ?? undefined,
+      }),
+    [sendPayload]
+  );
+
+  const sendImageEncrypted = useCallback(
+    (id: string, imageUri: string, width: number, height: number, replyTo: ReplyTarget | null) =>
+      sendPayload(id, {
+        kind: "image",
+        image: readImageMessageBase64(imageUri),
+        width,
+        height,
+        replyTo: replyTo ?? undefined,
+      }),
+    [sendPayload]
+  );
+
+  const onCancelSend = useCallback((message: MessageRow) => {
+    cancelledSendIdsRef.current.add(message.id);
+    deleteMessage(message.id);
+    setMessages((prev) => prev.filter((m) => m.id !== message.id));
+    if (message.image_uri) deleteImageMessage(message.image_uri);
+  }, []);
+
   const onRetry = useCallback(
     (message: MessageRow) => {
       markMessagePending(message.id);
@@ -460,9 +716,27 @@ export default function ChatScreen({ route, navigation }: Props) {
       const replyTo = message.reply_to_id
         ? { id: message.reply_to_id, preview: message.reply_preview ?? "" }
         : null;
-      void sendEncrypted(message.id, message.plaintext, replyTo);
+      if (message.kind === "voice" && message.audio_uri) {
+        void sendVoiceEncrypted(
+          message.id,
+          message.audio_uri,
+          message.duration_ms ?? 0,
+          message.waveform ? JSON.parse(message.waveform) : [],
+          replyTo
+        );
+      } else if (message.kind === "image" && message.image_uri) {
+        void sendImageEncrypted(
+          message.id,
+          message.image_uri,
+          message.image_width ?? 0,
+          message.image_height ?? 0,
+          replyTo
+        );
+      } else {
+        void sendEncrypted(message.id, message.plaintext, replyTo);
+      }
     },
-    [sendEncrypted]
+    [sendEncrypted, sendVoiceEncrypted, sendImageEncrypted]
   );
 
   const onSend = useCallback(async () => {
@@ -486,6 +760,15 @@ export default function ChatScreen({ route, navigation }: Props) {
       reply_preview: activeReply?.preview ?? null,
       pinned_at: null,
       deleted_at: null,
+      reaction_mine: null,
+      reaction_peer: null,
+      kind: "text",
+      audio_uri: null,
+      duration_ms: null,
+      waveform: null,
+      image_uri: null,
+      image_width: null,
+      image_height: null,
     };
     insertMessage(outgoing);
     setMessages((prev) => [...prev, outgoing]);
@@ -520,6 +803,15 @@ export default function ChatScreen({ route, navigation }: Props) {
           reply_preview: null,
           pinned_at: null,
           deleted_at: null,
+          reaction_mine: null,
+          reaction_peer: null,
+          kind: "text",
+          audio_uri: null,
+          duration_ms: null,
+          waveform: null,
+          image_uri: null,
+          image_width: null,
+          image_height: null,
         };
         insertMessage(reply);
         setMessages((prev) => [...prev, reply]);
@@ -529,6 +821,140 @@ export default function ChatScreen({ route, navigation }: Props) {
 
     void sendEncrypted(id, text, activeReply);
   }, [draft, conversation, conversationId, isTestBot, replyingTo, sendEncrypted]);
+
+  const onVoiceRecorded = useCallback(
+    async ({ uri, durationMs, waveform }: RecordedVoice) => {
+      if (!conversation) return;
+      const activeReply = replyingTo;
+      setReplyingTo(null);
+
+      const id = Crypto.randomUUID();
+      const persistedUri = await persistRecordedVoice(uri, id);
+      const outgoing: MessageRow = {
+        id,
+        conversation_id: conversationId,
+        direction: "outgoing",
+        plaintext: VOICE_MESSAGE_LABEL,
+        sent_at: Date.now(),
+        status: "pending",
+        delivered_at: null,
+        read_at: null,
+        reply_to_id: activeReply?.id ?? null,
+        reply_preview: activeReply?.preview ?? null,
+        pinned_at: null,
+        deleted_at: null,
+        reaction_mine: null,
+        reaction_peer: null,
+        kind: "voice",
+        audio_uri: persistedUri,
+        duration_ms: durationMs,
+        waveform: JSON.stringify(waveform),
+        image_uri: null,
+        image_width: null,
+        image_height: null,
+      };
+      insertMessage(outgoing);
+      setMessages((prev) => [...prev, outgoing]);
+
+      if (isTestBot) {
+        markMessageSent(id);
+        setMessages((prev) => prev.map((m) => (m.id === id ? { ...m, status: "sent" } : m)));
+        return;
+      }
+
+      void sendVoiceEncrypted(id, persistedUri, durationMs, waveform, activeReply);
+    },
+    [conversation, conversationId, isTestBot, replyingTo, sendVoiceEncrypted]
+  );
+
+  const voiceRecorder = useVoiceRecorder(onVoiceRecorded);
+
+  const sendImage = useCallback(
+    async (uri: string, width: number, height: number) => {
+      if (!conversation) return;
+      const activeReply = replyingTo;
+      setReplyingTo(null);
+
+      const id = Crypto.randomUUID();
+      try {
+        const compressed = await compressImage(uri, width, height);
+        const persistedUri = await persistPickedImage(compressed.uri, id);
+
+        const outgoing: MessageRow = {
+          id,
+          conversation_id: conversationId,
+          direction: "outgoing",
+          plaintext: IMAGE_MESSAGE_LABEL,
+          sent_at: Date.now(),
+          status: "pending",
+          delivered_at: null,
+          read_at: null,
+          reply_to_id: activeReply?.id ?? null,
+          reply_preview: activeReply?.preview ?? null,
+          pinned_at: null,
+          deleted_at: null,
+          reaction_mine: null,
+          reaction_peer: null,
+          kind: "image",
+          audio_uri: null,
+          duration_ms: null,
+          waveform: null,
+          image_uri: persistedUri,
+          image_width: compressed.width,
+          image_height: compressed.height,
+        };
+        insertMessage(outgoing);
+        setMessages((prev) => [...prev, outgoing]);
+
+        if (isTestBot) {
+          markMessageSent(id);
+          setMessages((prev) => prev.map((m) => (m.id === id ? { ...m, status: "sent" } : m)));
+          return;
+        }
+
+        void sendImageEncrypted(id, persistedUri, compressed.width, compressed.height, activeReply);
+      } catch (err) {
+        console.warn("[chat] failed to prepare image for sending", err);
+        Alert.alert("Couldn't send photo", "Please try again.");
+      }
+    },
+    [conversation, conversationId, isTestBot, replyingTo, sendImageEncrypted]
+  );
+
+  const pickImage = useCallback(
+    async (source: "camera" | "library") => {
+      if (!conversation) return;
+      const permission =
+        source === "camera"
+          ? await ImagePicker.requestCameraPermissionsAsync()
+          : await ImagePicker.requestMediaLibraryPermissionsAsync();
+      if (!permission.granted) {
+        Alert.alert(
+          source === "camera" ? "Camera access needed" : "Photo access needed",
+          "Enable access in Settings to share photos."
+        );
+        return;
+      }
+
+      const result =
+        source === "camera"
+          ? await ImagePicker.launchCameraAsync({ mediaTypes: ["images"], quality: 0.9 })
+          : await ImagePicker.launchImageLibraryAsync({ mediaTypes: ["images"], quality: 0.9 });
+
+      if (result.canceled || !result.assets[0]) return;
+      const asset = result.assets[0];
+      await sendImage(asset.uri, asset.width, asset.height);
+    },
+    [conversation, sendImage]
+  );
+
+  const showImageSourceOptions = useCallback(() => {
+    Alert.alert("Send Photo", undefined, [
+      { text: "Take Photo", onPress: () => void pickImage("camera") },
+      { text: "Choose from Library", onPress: () => void pickImage("library") },
+      { text: "Cancel", style: "cancel" },
+    ]);
+  }, [pickImage]);
 
   const onCopy = useCallback((message: MessageRow) => {
     Clipboard.setStringAsync(message.plaintext);
@@ -556,6 +982,36 @@ export default function ChatScreen({ route, navigation }: Props) {
     unpinMessage(message.id);
     setMessages((prev) => prev.map((m) => (m.id === message.id ? { ...m, pinned_at: null } : m)));
   }, []);
+
+  const onReact = useCallback(
+    async (message: MessageRow, emoji: string) => {
+      const isClearing = message.reaction_mine === emoji;
+      const nextEmoji = isClearing ? null : emoji;
+      setMyReaction(message.id, nextEmoji);
+      setMessages((prev) => prev.map((m) => (m.id === message.id ? { ...m, reaction_mine: nextEmoji } : m)));
+
+      if (isTestBot || !conversation) return;
+      try {
+        if (isClearing) {
+          getSocket().emit("reaction:clear", { messageId: message.id, recipientId: conversationId });
+          return;
+        }
+        const identity = await getOrCreateIdentity();
+        await sodium.ready;
+        const peerPublicKey = sodium.from_base64(conversation.peer_public_key);
+        const payload: ReactionPayload = { emoji };
+        const { ciphertext, nonce } = await encryptMessage(
+          JSON.stringify(payload),
+          peerPublicKey,
+          identity.privateKey
+        );
+        getSocket().emit("reaction:set", { messageId: message.id, recipientId: conversationId, ciphertext, nonce });
+      } catch (err) {
+        console.warn("[chat] failed to send reaction", err);
+      }
+    },
+    [conversation, conversationId, isTestBot]
+  );
 
   const onDeleteForEveryone = useCallback(
     (message: MessageRow) => {
@@ -644,6 +1100,7 @@ export default function ChatScreen({ route, navigation }: Props) {
           ) : (
             <MessageBubble
               message={item.message}
+              isGroupEnd={item.isGroupEnd}
               onReply={onReply}
               onCopy={onCopy}
               onDelete={onDelete}
@@ -651,9 +1108,20 @@ export default function ChatScreen({ route, navigation }: Props) {
               onPin={onPin}
               onUnpin={onUnpin}
               onDeleteForEveryone={onDeleteForEveryone}
+              onOpenMenu={openMenu}
+              onCancelSend={onCancelSend}
             />
           )
         }
+      />
+
+      <MessageActionMenu
+        visible={!!menu}
+        anchor={menu?.anchor ?? null}
+        actions={menu?.actions ?? []}
+        currentReaction={menu?.message.reaction_mine ?? null}
+        onReact={menu ? (emoji) => onReact(menu.message, emoji) : undefined}
+        onClose={() => setMenu(null)}
       />
 
       {replyingTo ? (
@@ -671,23 +1139,52 @@ export default function ChatScreen({ route, navigation }: Props) {
       ) : null}
 
       <View style={[styles.inputRow, { paddingBottom: 8 + insets.bottom }]}>
-        <Pressable style={styles.emojiButton} onPress={() => setEmojiPickerOpen(true)} hitSlop={8}>
-          <Ionicons name="happy-outline" size={24} color={colors.textSecondary} />
-        </Pressable>
-        <TextInput
-          style={styles.input}
-          value={draft}
-          onChangeText={setDraft}
-          placeholder="Message"
-          multiline
-        />
-        <Pressable
-          style={[styles.sendButton, !draft.trim() && styles.sendButtonDisabled]}
-          onPress={onSend}
-          disabled={!draft.trim()}
-        >
-          <Ionicons name="arrow-up" size={20} color={draft.trim() ? "#fff" : colors.accent} />
-        </Pressable>
+        {voiceRecorder.isRecording ? (
+          <Animated.View
+            style={[styles.recordingBar, { transform: [{ translateX: voiceRecorder.translateX }] }]}
+          >
+            <View style={styles.recordingDot} />
+            <Text style={styles.recordingTime} numberOfLines={1}>
+              {formatRecordingTime(voiceRecorder.durationMs)}
+            </Text>
+            <View style={styles.slideHint}>
+              <Ionicons name="chevron-back" size={14} color={colors.textTertiary} />
+              <Text style={styles.slideHintText}>
+                {voiceRecorder.cancelArmed ? "Release to cancel" : "Slide to cancel"}
+              </Text>
+            </View>
+          </Animated.View>
+        ) : (
+          <>
+            <Pressable style={styles.emojiButton} onPress={() => setEmojiPickerOpen(true)} hitSlop={8}>
+              <Ionicons name="happy-outline" size={24} color={colors.textSecondary} />
+            </Pressable>
+            <Pressable style={styles.emojiButton} onPress={showImageSourceOptions} hitSlop={8}>
+              <Ionicons name="camera-outline" size={24} color={colors.textSecondary} />
+            </Pressable>
+            <TextInput
+              style={styles.input}
+              value={draft}
+              onChangeText={setDraft}
+              placeholder="Message"
+              placeholderTextColor={colors.textTertiary}
+              multiline
+            />
+          </>
+        )}
+
+        {draft.trim() ? (
+          <Pressable style={styles.sendButton} onPress={onSend}>
+            <Ionicons name="arrow-up" size={20} color="#fff" />
+          </Pressable>
+        ) : (
+          <View
+            style={[styles.micButton, voiceRecorder.isRecording && styles.micButtonActive]}
+            {...voiceRecorder.panHandlers}
+          >
+            <Ionicons name="mic" size={20} color={voiceRecorder.isRecording ? "#fff" : colors.textSecondary} />
+          </View>
+        )}
       </View>
 
       <EmojiPicker
@@ -702,110 +1199,163 @@ export default function ChatScreen({ route, navigation }: Props) {
   );
 }
 
-const styles = StyleSheet.create({
-  flex: { flex: 1, backgroundColor: colors.background },
-  center: { flex: 1, alignItems: "center", justifyContent: "center" },
-  missing: { color: colors.textTertiary },
-  list: { padding: 12, gap: 6 },
-  dateSeparator: { alignItems: "center", marginVertical: 10 },
-  dateSeparatorText: {
-    fontSize: 12,
-    color: colors.textSecondary,
-    backgroundColor: "rgba(120,120,128,0.12)",
-    paddingHorizontal: 10,
-    paddingVertical: 4,
-    borderRadius: 10,
-    overflow: "hidden",
-  },
-  bubble: {
-    maxWidth: "80%",
-    borderRadius: 18,
-    paddingHorizontal: 14,
-    paddingVertical: 8,
-    shadowColor: "#000",
-    shadowOffset: { width: 0, height: 1 },
-    shadowOpacity: 0.06,
-    shadowRadius: 2,
-    elevation: 1,
-  },
-  outgoing: { alignSelf: "flex-end", backgroundColor: colors.accent, borderBottomRightRadius: 4 },
-  incoming: { alignSelf: "flex-start", backgroundColor: colors.bubbleIncoming, borderBottomLeftRadius: 4 },
-  outgoingText: { color: "#fff", fontSize: 15.5 },
-  incomingText: { color: colors.text, fontSize: 15.5 },
-  deletedRow: { flexDirection: "row", alignItems: "center", gap: 6 },
-  outgoingDeletedText: { color: "rgba(255,255,255,0.75)", fontSize: 15, fontStyle: "italic" },
-  incomingDeletedText: { color: colors.textTertiary, fontSize: 15, fontStyle: "italic" },
-  replyQuote: {
-    borderLeftWidth: 3,
-    borderLeftColor: "rgba(255,255,255,0.6)",
-    paddingLeft: 6,
-    marginBottom: 4,
-  },
-  replyQuoteText: { fontSize: 12, color: "rgba(0,0,0,0.55)", fontStyle: "italic" },
-  metaRow: { flexDirection: "row", alignItems: "center", justifyContent: "flex-end", marginTop: 4, gap: 4 },
-  metaTextOutgoing: { fontSize: 11, color: "rgba(255,255,255,0.8)" },
-  metaTextIncoming: { fontSize: 11, color: colors.textSecondary },
-  replyBanner: {
-    flexDirection: "row",
-    alignItems: "center",
-    justifyContent: "space-between",
-    backgroundColor: colors.surface,
-    paddingHorizontal: 12,
-    paddingVertical: 8,
-    borderTopWidth: StyleSheet.hairlineWidth,
-    borderTopColor: colors.border,
-    borderLeftWidth: 3,
-    borderLeftColor: colors.accent,
-  },
-  replyBannerText: { flex: 1, marginRight: 8 },
-  replyBannerLabel: { fontSize: 11, color: colors.accent, fontWeight: "600" },
-  replyBannerPreview: { fontSize: 13, color: colors.text },
-  pinnedBanner: {
-    flexDirection: "row",
-    alignItems: "center",
-    gap: 8,
-    backgroundColor: colors.accentSoft,
-    paddingHorizontal: 12,
-    paddingVertical: 8,
-    borderBottomWidth: StyleSheet.hairlineWidth,
-    borderBottomColor: colors.border,
-  },
-  pinnedBannerText: { flex: 1 },
-  pinnedBannerLabel: { fontSize: 11, color: colors.accent, fontWeight: "600" },
-  pinnedBannerPreview: { fontSize: 13, color: colors.text },
-  inputRow: {
-    flexDirection: "row",
-    alignItems: "flex-end",
-    padding: 8,
-    gap: 8,
-    backgroundColor: colors.surface,
-    borderTopWidth: StyleSheet.hairlineWidth,
-    borderTopColor: colors.border,
-  },
-  emojiButton: {
-    width: 40,
-    height: 40,
-    alignItems: "center",
-    justifyContent: "center",
-  },
-  input: {
-    flex: 1,
-    borderWidth: 1,
-    borderColor: colors.border,
-    backgroundColor: colors.background,
-    borderRadius: 20,
-    paddingHorizontal: 14,
-    paddingVertical: 10,
-    fontSize: 15.5,
-    maxHeight: 100,
-  },
-  sendButton: {
-    backgroundColor: colors.accent,
-    width: 40,
-    height: 40,
-    borderRadius: 20,
-    alignItems: "center",
-    justifyContent: "center",
-  },
-  sendButtonDisabled: { backgroundColor: colors.accentSoft },
-});
+const createStyles = (colors: ThemeColors) =>
+  StyleSheet.create({
+    flex: { flex: 1, backgroundColor: colors.background },
+    center: { flex: 1, alignItems: "center", justifyContent: "center" },
+    missing: { color: colors.textTertiary },
+    headerTitleRow: { flexDirection: "row", alignItems: "center", gap: 8, maxWidth: 220 },
+    headerAvatar: { width: 32, height: 32, borderRadius: 16, alignItems: "center", justifyContent: "center" },
+    headerAvatarText: { fontSize: 13, fontWeight: "700", color: "#fff" },
+    headerTextCol: { flexShrink: 1 },
+    headerName: { fontSize: 16, fontWeight: "600", color: colors.text },
+    headerStatus: { fontSize: 12, color: colors.textSecondary },
+    list: { padding: 12 },
+    dateSeparator: { alignItems: "center", marginVertical: 10 },
+    dateSeparatorText: {
+      fontSize: 12,
+      color: colors.textSecondary,
+      backgroundColor: "rgba(120,120,128,0.12)",
+      paddingHorizontal: 10,
+      paddingVertical: 4,
+      borderRadius: 10,
+      overflow: "hidden",
+    },
+    bubbleRowSpaced: { marginBottom: 10 },
+    bubbleRowTight: { marginBottom: 2 },
+    bubbleRowReacted: { marginBottom: 18 },
+    bubble: {
+      maxWidth: "80%",
+      borderRadius: 20,
+      paddingHorizontal: 14,
+      paddingVertical: 8,
+      shadowColor: "#000",
+      shadowOffset: { width: 0, height: 1 },
+      shadowOpacity: 0.06,
+      shadowRadius: 2,
+      elevation: 1,
+    },
+    outgoing: { alignSelf: "flex-end", backgroundColor: colors.accent, borderBottomRightRadius: 6 },
+    incoming: { alignSelf: "flex-start", backgroundColor: colors.bubbleIncoming, borderBottomLeftRadius: 6 },
+    outgoingGrouped: { borderBottomRightRadius: 20 },
+    incomingGrouped: { borderBottomLeftRadius: 20 },
+    reactionBadge: {
+      position: "absolute",
+      bottom: -10,
+      backgroundColor: colors.surface,
+      borderRadius: 12,
+      paddingHorizontal: 6,
+      paddingVertical: 2,
+      borderWidth: StyleSheet.hairlineWidth,
+      borderColor: colors.border,
+      shadowColor: "#000",
+      shadowOffset: { width: 0, height: 1 },
+      shadowOpacity: 0.1,
+      shadowRadius: 2,
+      elevation: 2,
+    },
+    reactionBadgeOutgoing: { right: 6 },
+    reactionBadgeIncoming: { left: 6 },
+    reactionBadgeText: { fontSize: 13 },
+    outgoingText: { color: "#fff", fontSize: 15.5 },
+    incomingText: { color: colors.text, fontSize: 15.5 },
+    deletedRow: { flexDirection: "row", alignItems: "center", gap: 6 },
+    outgoingDeletedText: { color: "rgba(255,255,255,0.75)", fontSize: 15, fontStyle: "italic" },
+    incomingDeletedText: { color: colors.textTertiary, fontSize: 15, fontStyle: "italic" },
+    replyQuote: { paddingLeft: 6, marginBottom: 4 },
+    replyQuoteOutgoing: { borderLeftWidth: 3, borderLeftColor: "rgba(255,255,255,0.6)" },
+    replyQuoteIncoming: { borderLeftWidth: 3, borderLeftColor: colors.accent },
+    replyQuoteTextOutgoing: { fontSize: 12, color: "rgba(255,255,255,0.85)", fontStyle: "italic" },
+    replyQuoteTextIncoming: { fontSize: 12, color: colors.textSecondary, fontStyle: "italic" },
+    metaRow: { flexDirection: "row", alignItems: "center", justifyContent: "flex-end", marginTop: 4, gap: 4 },
+    metaTextOutgoing: { fontSize: 11, color: "rgba(255,255,255,0.8)" },
+    metaTextIncoming: { fontSize: 11, color: colors.textSecondary },
+    replyBanner: {
+      flexDirection: "row",
+      alignItems: "center",
+      justifyContent: "space-between",
+      backgroundColor: colors.surface,
+      paddingHorizontal: 12,
+      paddingVertical: 8,
+      borderTopWidth: StyleSheet.hairlineWidth,
+      borderTopColor: colors.border,
+      borderLeftWidth: 3,
+      borderLeftColor: colors.accent,
+    },
+    replyBannerText: { flex: 1, marginRight: 8 },
+    replyBannerLabel: { fontSize: 11, color: colors.accent, fontWeight: "600" },
+    replyBannerPreview: { fontSize: 13, color: colors.text },
+    pinnedBanner: {
+      flexDirection: "row",
+      alignItems: "center",
+      gap: 8,
+      backgroundColor: colors.accentSoft,
+      paddingHorizontal: 12,
+      paddingVertical: 8,
+      borderBottomWidth: StyleSheet.hairlineWidth,
+      borderBottomColor: colors.border,
+    },
+    pinnedBannerText: { flex: 1 },
+    pinnedBannerLabel: { fontSize: 11, color: colors.accent, fontWeight: "600" },
+    pinnedBannerPreview: { fontSize: 13, color: colors.text },
+    inputRow: {
+      flexDirection: "row",
+      alignItems: "flex-end",
+      padding: 8,
+      gap: 8,
+      backgroundColor: colors.surface,
+      borderTopWidth: StyleSheet.hairlineWidth,
+      borderTopColor: colors.border,
+    },
+    emojiButton: {
+      width: 40,
+      height: 40,
+      alignItems: "center",
+      justifyContent: "center",
+    },
+    input: {
+      flex: 1,
+      borderWidth: 1,
+      borderColor: colors.border,
+      backgroundColor: colors.background,
+      color: colors.text,
+      borderRadius: 20,
+      paddingHorizontal: 14,
+      paddingVertical: 10,
+      fontSize: 15.5,
+      maxHeight: 100,
+    },
+    sendButton: {
+      backgroundColor: colors.accent,
+      width: 40,
+      height: 40,
+      borderRadius: 20,
+      alignItems: "center",
+      justifyContent: "center",
+    },
+    micButton: {
+      width: 40,
+      height: 40,
+      borderRadius: 20,
+      alignItems: "center",
+      justifyContent: "center",
+    },
+    micButtonActive: { backgroundColor: colors.danger },
+    recordingBar: {
+      flex: 1,
+      flexDirection: "row",
+      alignItems: "center",
+      gap: 8,
+      paddingHorizontal: 14,
+      paddingVertical: 10,
+    },
+    recordingDot: { width: 10, height: 10, borderRadius: 5, backgroundColor: colors.danger },
+    recordingTime: {
+      fontSize: 14,
+      color: colors.text,
+      width: 46,
+      fontVariant: ["tabular-nums"],
+    },
+    slideHint: { flex: 1, flexDirection: "row", alignItems: "center", justifyContent: "center", gap: 4 },
+    slideHintText: { fontSize: 13, color: colors.textTertiary },
+  });

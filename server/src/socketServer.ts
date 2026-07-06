@@ -2,16 +2,57 @@ import type { Server as HttpServer } from "node:http";
 import { Server, Socket } from "socket.io";
 import { isSessionActive, verifyToken } from "./auth";
 import {
+  clearReaction,
   deleteMessageForEveryone,
   getUndeliveredMessages,
+  getUndeliveredReactions,
   markDelivered,
+  markReactionDelivered,
   markRead,
+  setReaction,
   storeMessage,
   userExists,
 } from "./messages";
+import { getLastSeen, setLastSeen } from "./presence";
 
 interface AuthedSocket extends Socket {
   userId?: string;
+}
+
+interface ActiveCall {
+  callId: string;
+  callerId: string;
+  calleeId: string;
+}
+
+// Ephemeral signaling state only — calls aren't persisted server-side, so a
+// restart just drops any in-flight calls (clients time out and redial).
+const activeCalls = new Map<string, ActiveCall>();
+const userActiveCall = new Map<string, string>();
+
+function otherParty(call: ActiveCall, userId: string): string {
+  return userId === call.callerId ? call.calleeId : call.callerId;
+}
+
+function endActiveCall(callId: string, io: Server, reason: string, notify: string[]): void {
+  const call = activeCalls.get(callId);
+  if (!call) return;
+  activeCalls.delete(callId);
+  userActiveCall.delete(call.callerId);
+  userActiveCall.delete(call.calleeId);
+  for (const userId of notify) {
+    io.to(userId).emit("call:end", { callId, reason });
+  }
+}
+
+// Socket count per user rather than a plain Set, so a brief overlap between
+// an old and new connection (reconnect, or the old device's socket lingering
+// a moment after login-elsewhere revocation) doesn't flip presence offline
+// and back on.
+const onlineUsers = new Map<string, number>();
+
+function presenceRoom(userId: string): string {
+  return `presence:${userId}`;
 }
 
 let io: Server | undefined;
@@ -19,6 +60,9 @@ let io: Server | undefined;
 export function createSocketServer(httpServer: HttpServer): Server {
   io = new Server(httpServer, {
     cors: { origin: "*" },
+    // Default is 1MB; encrypted voice-note payloads ride through the same
+    // message:send event as text and can exceed that.
+    maxHttpBufferSize: 15 * 1024 * 1024,
   });
 
   io.use((socket: AuthedSocket, next) => {
@@ -46,8 +90,22 @@ export function createSocketServer(httpServer: HttpServer): Server {
     // relayed to them regardless of which socket/device they're on.
     socket.join(userId);
 
+    const wasOffline = !onlineUsers.has(userId);
+    onlineUsers.set(userId, (onlineUsers.get(userId) ?? 0) + 1);
+    if (wasOffline) {
+      io!.to(presenceRoom(userId)).emit("presence:update", { userId, online: true, lastSeenAt: null });
+    }
+
     for (const pending of getUndeliveredMessages(userId)) {
       socket.emit("message", pending);
+    }
+
+    // Fire-and-forget: marked delivered as soon as it's flushed rather than
+    // waiting for a client ack, same tradeoff as the rest of presence-style
+    // metadata — worst case a reaction is a step behind after a crash, never lost data.
+    for (const reaction of getUndeliveredReactions(userId)) {
+      socket.emit("reaction:set", reaction);
+      markReactionDelivered(reaction.message_id, reaction.sender_id);
     }
 
     socket.on(
@@ -82,19 +140,21 @@ export function createSocketServer(httpServer: HttpServer): Server {
       }
     );
 
-    socket.on("message:delivered", (payload: { id: string; senderId: string }) => {
+    socket.on("message:delivered", (payload: { id: string }) => {
       try {
-        const deliveredAt = markDelivered(payload.id);
-        io!.to(payload.senderId).emit("message:delivered", { id: payload.id, deliveredAt });
+        const result = markDelivered(payload.id, userId);
+        if (!result.ok) return;
+        io!.to(result.senderId).emit("message:delivered", { id: payload.id, deliveredAt: result.at });
       } catch (err) {
         console.error("[socket] message:delivered failed", err);
       }
     });
 
-    socket.on("message:read", (payload: { id: string; senderId: string }) => {
+    socket.on("message:read", (payload: { id: string }) => {
       try {
-        const readAt = markRead(payload.id);
-        io!.to(payload.senderId).emit("message:read", { id: payload.id, readAt });
+        const result = markRead(payload.id, userId);
+        if (!result.ok) return;
+        io!.to(result.senderId).emit("message:read", { id: payload.id, readAt: result.at });
       } catch (err) {
         console.error("[socket] message:read failed", err);
       }
@@ -117,6 +177,166 @@ export function createSocketServer(httpServer: HttpServer): Server {
         }
       }
     );
+
+    socket.on(
+      "reaction:set",
+      (
+        payload: { messageId: string; recipientId: string; ciphertext: string; nonce: string },
+        ack?: (response: { ok: true } | { ok: false; error: string }) => void
+      ) => {
+        try {
+          if (!userExists(payload.recipientId)) {
+            ack?.({ ok: false, error: "recipient_not_found" });
+            return;
+          }
+          const reaction = setReaction({
+            messageId: payload.messageId,
+            senderId: userId,
+            recipientId: payload.recipientId,
+            ciphertext: payload.ciphertext,
+            nonce: payload.nonce,
+          });
+          io!.to(payload.recipientId).emit("reaction:set", reaction);
+          ack?.({ ok: true });
+        } catch (err) {
+          console.error("[socket] reaction:set failed", err);
+          ack?.({ ok: false, error: "internal_error" });
+        }
+      }
+    );
+
+    socket.on(
+      "reaction:clear",
+      (
+        payload: { messageId: string; recipientId: string },
+        ack?: (response: { ok: true } | { ok: false; error: string }) => void
+      ) => {
+        try {
+          clearReaction(payload.messageId, userId);
+          io!.to(payload.recipientId).emit("reaction:cleared", { messageId: payload.messageId, senderId: userId });
+          ack?.({ ok: true });
+        } catch (err) {
+          console.error("[socket] reaction:clear failed", err);
+          ack?.({ ok: false, error: "internal_error" });
+        }
+      }
+    );
+
+    socket.on(
+      "presence:subscribe",
+      (
+        payload: { userIds: string[] },
+        ack?: (snapshot: { userId: string; online: boolean; lastSeenAt: number | null }[]) => void
+      ) => {
+        const snapshot = payload.userIds.map((id) => {
+          socket.join(presenceRoom(id));
+          const online = onlineUsers.has(id);
+          return { userId: id, online, lastSeenAt: online ? null : getLastSeen(id) };
+        });
+        ack?.(snapshot);
+      }
+    );
+
+    // --- Calling (WebRTC signaling relay only — no media touches this server) ---
+
+    socket.on(
+      "call:invite",
+      (
+        payload: { callId: string; calleeId: string; kind: "audio" | "video"; sdp: unknown },
+        ack?: (response: { ok: true } | { ok: false; error: string }) => void
+      ) => {
+        try {
+          if (!userExists(payload.calleeId)) {
+            ack?.({ ok: false, error: "recipient_not_found" });
+            return;
+          }
+          if (userActiveCall.has(userId) || userActiveCall.has(payload.calleeId)) {
+            ack?.({ ok: false, error: "busy" });
+            return;
+          }
+
+          activeCalls.set(payload.callId, {
+            callId: payload.callId,
+            callerId: userId,
+            calleeId: payload.calleeId,
+          });
+          userActiveCall.set(userId, payload.callId);
+          userActiveCall.set(payload.calleeId, payload.callId);
+
+          io!.to(payload.calleeId).emit("call:invite", {
+            callId: payload.callId,
+            callerId: userId,
+            kind: payload.kind,
+            sdp: payload.sdp,
+          });
+          ack?.({ ok: true });
+        } catch (err) {
+          console.error("[socket] call:invite failed", err);
+          ack?.({ ok: false, error: "internal_error" });
+        }
+      }
+    );
+
+    socket.on("call:answer", (payload: { callId: string; sdp: unknown }) => {
+      try {
+        const call = activeCalls.get(payload.callId);
+        if (!call || call.calleeId !== userId) return;
+        io!.to(call.callerId).emit("call:answer", { callId: payload.callId, sdp: payload.sdp });
+      } catch (err) {
+        console.error("[socket] call:answer failed", err);
+      }
+    });
+
+    socket.on("call:ice-candidate", (payload: { callId: string; candidate: unknown }) => {
+      try {
+        const call = activeCalls.get(payload.callId);
+        if (!call || (call.callerId !== userId && call.calleeId !== userId)) return;
+        io!.to(otherParty(call, userId)).emit("call:ice-candidate", {
+          callId: payload.callId,
+          candidate: payload.candidate,
+        });
+      } catch (err) {
+        console.error("[socket] call:ice-candidate failed", err);
+      }
+    });
+
+    socket.on("call:reject", (payload: { callId: string }) => {
+      try {
+        const call = activeCalls.get(payload.callId);
+        if (!call || call.calleeId !== userId) return;
+        endActiveCall(payload.callId, io!, "rejected", [call.callerId]);
+      } catch (err) {
+        console.error("[socket] call:reject failed", err);
+      }
+    });
+
+    socket.on("call:end", (payload: { callId: string }) => {
+      try {
+        const call = activeCalls.get(payload.callId);
+        if (!call || (call.callerId !== userId && call.calleeId !== userId)) return;
+        endActiveCall(payload.callId, io!, "ended", [otherParty(call, userId)]);
+      } catch (err) {
+        console.error("[socket] call:end failed", err);
+      }
+    });
+
+    socket.on("disconnect", () => {
+      const callId = userActiveCall.get(userId);
+      if (callId) {
+        const call = activeCalls.get(callId);
+        if (call) endActiveCall(callId, io!, "disconnected", [otherParty(call, userId)]);
+      }
+
+      const remaining = (onlineUsers.get(userId) ?? 1) - 1;
+      if (remaining > 0) {
+        onlineUsers.set(userId, remaining);
+        return;
+      }
+      onlineUsers.delete(userId);
+      const lastSeenAt = Date.now();
+      setLastSeen(userId, lastSeenAt);
+      io!.to(presenceRoom(userId)).emit("presence:update", { userId, online: false, lastSeenAt });
+    });
   });
 
   return io;

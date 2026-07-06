@@ -16,11 +16,14 @@ export interface TokenPayload {
 }
 
 export function signToken(payload: TokenPayload): string {
-  return jwt.sign(payload, JWT_SECRET, { expiresIn: "90d" });
+  return jwt.sign(payload, JWT_SECRET, { expiresIn: "90d", algorithm: "HS256" });
 }
 
+// Pin the algorithm rather than trusting the one in the token header —
+// otherwise a forged token could pick e.g. "none" or switch HMAC/RSA in ways
+// that defeat verification.
 export function verifyToken(token: string): TokenPayload {
-  return jwt.verify(token, JWT_SECRET) as unknown as TokenPayload;
+  return jwt.verify(token, JWT_SECRET, { algorithms: ["HS256"] }) as unknown as TokenPayload;
 }
 
 interface UserRow {

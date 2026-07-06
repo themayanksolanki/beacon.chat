@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import { Image, StyleSheet, Text, View } from "react-native";
 import * as ImagePicker from "expo-image-picker";
 import type { NativeStackScreenProps } from "@react-navigation/native-stack";
@@ -7,11 +7,14 @@ import { Ionicons } from "@expo/vector-icons";
 import type { ProfileStackParamList } from "../../App";
 import { useAuth } from "../auth/AuthContext";
 import PrimaryButton from "../components/PrimaryButton";
-import { colors } from "../theme";
+import { useTheme } from "../ThemeContext";
+import type { ThemeColors } from "../theme";
 
 type Props = NativeStackScreenProps<ProfileStackParamList, "ProfilePhoto">;
 
 export default function ProfilePhotoScreen({ route }: Props) {
+  const { colors } = useTheme();
+  const styles = useMemo(() => createStyles(colors), [colors]);
   const { fullName } = route.params;
   const { completeProfile } = useAuth();
   const [photoUri, setPhotoUri] = useState<string | null>(null);
@@ -72,11 +75,12 @@ export default function ProfilePhotoScreen({ route }: Props) {
   );
 }
 
-const styles = StyleSheet.create({
-  container: { flex: 1, justifyContent: "center", padding: 24, alignItems: "center" },
-  title: { fontSize: 20, fontWeight: "600", marginBottom: 16, color: colors.text },
-  preview: { width: 160, height: 160, borderRadius: 80, marginBottom: 16 },
-  placeholder: { backgroundColor: colors.background, alignItems: "center", justifyContent: "center" },
-  error: { color: colors.danger, marginVertical: 8 },
-  finishSpacing: { marginTop: 16, width: "100%" },
-});
+const createStyles = (colors: ThemeColors) =>
+  StyleSheet.create({
+    container: { flex: 1, justifyContent: "center", padding: 24, alignItems: "center", backgroundColor: colors.background },
+    title: { fontSize: 20, fontWeight: "600", marginBottom: 16, color: colors.text },
+    preview: { width: 160, height: 160, borderRadius: 80, marginBottom: 16 },
+    placeholder: { backgroundColor: colors.surface, alignItems: "center", justifyContent: "center" },
+    error: { color: colors.danger, marginVertical: 8 },
+    finishSpacing: { marginTop: 16, width: "100%" },
+  });
