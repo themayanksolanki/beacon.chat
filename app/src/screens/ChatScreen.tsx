@@ -17,18 +17,18 @@ import * as Clipboard from "expo-clipboard";
 import * as Crypto from "expo-crypto";
 import * as ImagePicker from "expo-image-picker";
 import sodium from "react-native-libsodium";
-import { useFocusEffect } from "@react-navigation/native";
+import { useFocusEffect, useIsFocused } from "@react-navigation/native";
 import type { NativeStackScreenProps } from "@react-navigation/native-stack";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import EmojiPicker, { type EmojiType } from "rn-emoji-keyboard";
 
 import type { MainStackParamList } from "../../App";
 import { useVoiceRecorder, type RecordedVoice } from "../audio/useVoiceRecorder";
-import { persistRecordedVoice, readVoiceMessageBase64, writeVoiceMessageBase64 } from "../audio/voiceStorage";
+import { persistRecordedVoice, readVoiceMessageBase64 } from "../audio/voiceStorage";
 import ImageMessageBubble from "../components/ImageMessageBubble";
 import MessageActionMenu, { type MessageAction, type MessageMenuAnchor } from "../components/MessageActionMenu";
 import VoiceMessageBubble from "../components/VoiceMessageBubble";
-import { decryptMessage, encryptMessage, getOrCreateIdentity } from "../crypto/identity";
+import { encryptMessage, getOrCreateIdentity } from "../crypto/identity";
 import {
   deleteMessage,
   getConversationById,
@@ -43,14 +43,14 @@ import {
   markMessageSent,
   pinMessage,
   setMyReaction,
-  setPeerReaction,
   unpinMessage,
   type MessageRow,
 } from "../db/database";
 import { compressImage } from "../media/imageCompression";
-import { deleteImageMessage, persistPickedImage, readImageMessageBase64, writeImageMessageBase64 } from "../media/imageStorage";
+import { deleteImageMessage, persistPickedImage, readImageMessageBase64 } from "../media/imageStorage";
 import { useCall } from "../calls/CallContext";
 import { getSocket } from "../network/socket";
+import { useMessaging, type MessagePayload, type ReactionPayload } from "../messaging/MessagingContext";
 import { usePresence } from "../presence/PresenceContext";
 import { TEST_BOT_CONVERSATION_ID } from "../testBot";
 import { useTheme } from "../ThemeContext";
@@ -60,32 +60,6 @@ const VOICE_MESSAGE_LABEL = "🎤 Voice message";
 const IMAGE_MESSAGE_LABEL = "📷 Photo";
 
 type Props = NativeStackScreenProps<MainStackParamList, "Chat">;
-
-type MessagePayload =
-  | { kind: "text"; text: string; replyTo?: { id: string; preview: string } }
-  | { kind: "voice"; audio: string; durationMs: number; waveform: number[]; replyTo?: { id: string; preview: string } }
-  | { kind: "image"; image: string; width: number; height: number; replyTo?: { id: string; preview: string } };
-
-interface ReactionPayload {
-  emoji: string;
-}
-
-interface IncomingServerMessage {
-  id: string;
-  sender_id: string;
-  recipient_id: string;
-  ciphertext: string;
-  nonce: string;
-  created_at: number;
-}
-
-interface IncomingServerReaction {
-  message_id: string;
-  sender_id: string;
-  recipient_id: string;
-  ciphertext: string;
-  nonce: string;
-}
 
 interface ReplyTarget {
   id: string;
@@ -147,18 +121,29 @@ function ChatHeaderTitle({
   const styles = useMemo(() => createStyles(colors), [colors]);
 
   return (
-    <Pressable style={styles.headerTitleRow} onPress={onPress} hitSlop={8}>
-      <View style={[styles.headerAvatar, { backgroundColor: colorForName(name) }]}>
-        <Text style={styles.headerAvatarText}>{initialFor(name)}</Text>
+    <Pressable
+      style={({ pressed }) => [styles.headerTitleRow, pressed && styles.headerTitleRowPressed]}
+      onPress={onPress}
+      hitSlop={8}
+    >
+      <View style={styles.headerAvatarWrap}>
+        <View style={[styles.headerAvatar, { backgroundColor: colorForName(name) }]}>
+          <Text style={styles.headerAvatarText}>{initialFor(name)}</Text>
+        </View>
+        {online ? <View style={styles.headerOnlineDot} /> : null}
       </View>
       <View style={styles.headerTextCol}>
         <Text style={styles.headerName} numberOfLines={1}>
           {name}
         </Text>
         {online ? (
-          <Text style={styles.headerStatus}>Active now</Text>
+          <Text style={styles.headerStatusOnline} numberOfLines={1}>
+            Active now
+          </Text>
         ) : lastSeenAt ? (
-          <Text style={styles.headerStatus}>{formatLastSeen(lastSeenAt)}</Text>
+          <Text style={styles.headerStatus} numberOfLines={1}>
+            {formatLastSeen(lastSeenAt)}
+          </Text>
         ) : null}
       </View>
     </Pressable>
@@ -464,6 +449,11 @@ export default function ChatScreen({ route, navigation }: Props) {
     const name = conversation?.display_name ?? "Chat";
     navigation.setOptions({
       title: name,
+      // setOptions merges into whatever was set before rather than replacing
+      // it wholesale, so headerLeft must be explicitly reset here — otherwise
+      // a stale custom value from an earlier options call (e.g. during a dev
+      // Fast Refresh) keeps overriding the default back chevron indefinitely.
+      headerLeft: undefined,
       headerTitle: isTestBot
         ? undefined
         : () => (
@@ -504,129 +494,17 @@ export default function ChatScreen({ route, navigation }: Props) {
     }, [conversationId, markVisibleMessagesRead])
   );
 
+  // Incoming messages/receipts/reactions are decrypted and persisted globally
+  // by MessagingProvider regardless of which chat is open — this screen just
+  // re-reads from the local DB whenever that happens, and marks messages read
+  // if this conversation happens to be the one currently focused.
+  const { revision } = useMessaging();
+  const isFocused = useIsFocused();
   useEffect(() => {
     if (!conversation || isTestBot) return;
-    const socket = getSocket();
-
-    const onMessage = async (message: IncomingServerMessage) => {
-      if (message.sender_id !== conversationId) return;
-
-      try {
-        const identity = await getOrCreateIdentity();
-        await sodium.ready;
-        const peerPublicKey = sodium.from_base64(conversation.peer_public_key);
-        const decrypted = await decryptMessage(
-          message.ciphertext,
-          message.nonce,
-          peerPublicKey,
-          identity.privateKey
-        );
-        const payload: MessagePayload = JSON.parse(decrypted);
-        const audioUri = payload.kind === "voice" ? writeVoiceMessageBase64(payload.audio, message.id) : null;
-        const imageUri = payload.kind === "image" ? writeImageMessageBase64(payload.image, message.id) : null;
-
-        const row: MessageRow = {
-          id: message.id,
-          conversation_id: conversationId,
-          direction: "incoming",
-          plaintext:
-            payload.kind === "voice" ? VOICE_MESSAGE_LABEL : payload.kind === "image" ? IMAGE_MESSAGE_LABEL : payload.text,
-          sent_at: message.created_at,
-          status: "delivered",
-          delivered_at: message.created_at,
-          read_at: null,
-          reply_to_id: payload.replyTo?.id ?? null,
-          reply_preview: payload.replyTo?.preview ?? null,
-          pinned_at: null,
-          deleted_at: null,
-          reaction_mine: null,
-          reaction_peer: null,
-          kind: payload.kind,
-          audio_uri: audioUri,
-          duration_ms: payload.kind === "voice" ? payload.durationMs : null,
-          waveform: payload.kind === "voice" ? JSON.stringify(payload.waveform) : null,
-          image_uri: imageUri,
-          image_width: payload.kind === "image" ? payload.width : null,
-          image_height: payload.kind === "image" ? payload.height : null,
-        };
-        insertMessage(row);
-        setMessages((prev) => [...prev, row]);
-        getSocket().emit("message:delivered", { id: message.id });
-        markVisibleMessagesRead();
-      } catch (err) {
-        console.warn("[chat] failed to process incoming message", err);
-      }
-    };
-
-    const onDelivered = ({ id, deliveredAt }: { id: string; deliveredAt: number }) => {
-      markMessageDelivered(id, deliveredAt);
-      setMessages((prev) =>
-        prev.map((m) =>
-          m.id === id && (m.status === "pending" || m.status === "sent")
-            ? { ...m, status: "delivered", delivered_at: deliveredAt }
-            : m
-        )
-      );
-    };
-
-    const onRead = ({ id, readAt }: { id: string; readAt: number }) => {
-      markMessageRead(id, readAt);
-      setMessages((prev) => prev.map((m) => (m.id === id ? { ...m, status: "read", read_at: readAt } : m)));
-    };
-
-    const onDeletedRemote = ({ id }: { id: string }) => {
-      const deletedAt = Date.now();
-      markMessageDeletedEverywhere(id, deletedAt);
-      setMessages((prev) =>
-        prev.map((m) =>
-          m.id === id ? { ...m, deleted_at: deletedAt, plaintext: "", reply_preview: null, pinned_at: null } : m
-        )
-      );
-    };
-
-    const onReactionSet = async (reaction: IncomingServerReaction) => {
-      if (reaction.sender_id !== conversationId) return;
-      try {
-        const identity = await getOrCreateIdentity();
-        await sodium.ready;
-        const peerPublicKey = sodium.from_base64(conversation.peer_public_key);
-        const decrypted = await decryptMessage(
-          reaction.ciphertext,
-          reaction.nonce,
-          peerPublicKey,
-          identity.privateKey
-        );
-        const payload: ReactionPayload = JSON.parse(decrypted);
-        setPeerReaction(reaction.message_id, payload.emoji);
-        setMessages((prev) =>
-          prev.map((m) => (m.id === reaction.message_id ? { ...m, reaction_peer: payload.emoji } : m))
-        );
-      } catch (err) {
-        console.warn("[chat] failed to process incoming reaction", err);
-      }
-    };
-
-    const onReactionCleared = ({ messageId, senderId }: { messageId: string; senderId: string }) => {
-      if (senderId !== conversationId) return;
-      setPeerReaction(messageId, null);
-      setMessages((prev) => prev.map((m) => (m.id === messageId ? { ...m, reaction_peer: null } : m)));
-    };
-
-    socket.on("message", onMessage);
-    socket.on("message:delivered", onDelivered);
-    socket.on("message:read", onRead);
-    socket.on("message:deleted", onDeletedRemote);
-    socket.on("reaction:set", onReactionSet);
-    socket.on("reaction:cleared", onReactionCleared);
-    return () => {
-      socket.off("message", onMessage);
-      socket.off("message:delivered", onDelivered);
-      socket.off("message:read", onRead);
-      socket.off("message:deleted", onDeletedRemote);
-      socket.off("reaction:set", onReactionSet);
-      socket.off("reaction:cleared", onReactionCleared);
-    };
-  }, [conversation, conversationId, isTestBot, markVisibleMessagesRead]);
+    setMessages(getMessages(conversationId));
+    if (isFocused) markVisibleMessagesRead();
+  }, [revision, conversation, conversationId, isTestBot, isFocused, markVisibleMessagesRead]);
 
   // Ids of pending sends the user cancelled locally (image uploads, via the
   // bubble's cross button) — the socket ack for these may still arrive after
@@ -1088,6 +966,11 @@ export default function ChatScreen({ route, navigation }: Props) {
         data={listItems}
         keyExtractor={(item) => item.id}
         contentContainerStyle={styles.list}
+        // FlatList's default initialNumToRender (10) only renders from the
+        // start of `data`, which is oldest-first here — with a longer history
+        // that leaves the true latest message unrendered, so scrollToEnd below
+        // lands at the bottom of whatever's rendered so far, not the real end.
+        initialNumToRender={listItems.length || 1}
         onContentSizeChange={() => listRef.current?.scrollToEnd({ animated: true })}
         onScrollToIndexFailed={({ averageItemLength, index }) =>
           listRef.current?.scrollToOffset({ offset: averageItemLength * index, animated: true })
@@ -1204,12 +1087,26 @@ const createStyles = (colors: ThemeColors) =>
     flex: { flex: 1, backgroundColor: colors.background },
     center: { flex: 1, alignItems: "center", justifyContent: "center" },
     missing: { color: colors.textTertiary },
-    headerTitleRow: { flexDirection: "row", alignItems: "center", gap: 8, maxWidth: 220 },
-    headerAvatar: { width: 32, height: 32, borderRadius: 16, alignItems: "center", justifyContent: "center" },
-    headerAvatarText: { fontSize: 13, fontWeight: "700", color: "#fff" },
-    headerTextCol: { flexShrink: 1 },
-    headerName: { fontSize: 16, fontWeight: "600", color: colors.text },
-    headerStatus: { fontSize: 12, color: colors.textSecondary },
+    headerTitleRow: { flexDirection: "row", alignItems: "center", gap: 10 },
+    headerTitleRowPressed: { opacity: 0.6 },
+    headerAvatarWrap: { position: "relative" },
+    headerAvatar: { width: 36, height: 36, borderRadius: 18, alignItems: "center", justifyContent: "center" },
+    headerAvatarText: { fontSize: 14, fontWeight: "700", color: "#fff" },
+    headerOnlineDot: {
+      position: "absolute",
+      bottom: -1,
+      right: -1,
+      width: 11,
+      height: 11,
+      borderRadius: 5.5,
+      backgroundColor: colors.tickRead,
+      borderWidth: 2,
+      borderColor: colors.surface,
+    },
+    headerTextCol: { flexShrink: 1, maxWidth: 175, justifyContent: "center" },
+    headerName: { fontSize: 17, fontWeight: "700", color: colors.text },
+    headerStatus: { fontSize: 12, color: colors.textSecondary, marginTop: 1 },
+    headerStatusOnline: { fontSize: 12, fontWeight: "500", color: colors.tickRead, marginTop: 1 },
     list: { padding: 12 },
     dateSeparator: { alignItems: "center", marginVertical: 10 },
     dateSeparatorText: {

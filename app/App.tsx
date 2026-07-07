@@ -26,6 +26,7 @@ import ActiveCallScreen from "./src/screens/ActiveCallScreen";
 import HeaderAvatarButton from "./src/components/HeaderAvatarButton";
 import HeaderAddButton from "./src/components/HeaderAddButton";
 import { AuthProvider, useAuth } from "./src/auth/AuthContext";
+import { MessagingProvider } from "./src/messaging/MessagingContext";
 import { PresenceProvider } from "./src/presence/PresenceContext";
 import { CallProvider } from "./src/calls/CallContext";
 import { navigationRef } from "./src/navigation/navigationRef";
@@ -188,11 +189,13 @@ export default function App() {
     <SafeAreaProvider>
       <ThemeProvider>
         <AuthProvider>
-          <PresenceProvider>
-            <CallProvider>
-              <ThemedNavigationContainer />
-            </CallProvider>
-          </PresenceProvider>
+          <MessagingProvider>
+            <PresenceProvider>
+              <CallProvider>
+                <ThemedNavigationContainer />
+              </CallProvider>
+            </PresenceProvider>
+          </MessagingProvider>
         </AuthProvider>
       </ThemeProvider>
     </SafeAreaProvider>

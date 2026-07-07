@@ -9,6 +9,7 @@ import { Ionicons } from "@expo/vector-icons";
 import type { MainStackParamList, MainTabParamList } from "../../App";
 import { clearConversation } from "../chat/clearConversation";
 import { getConversationSummaries, type ConversationSummary } from "../db/database";
+import { useMessaging } from "../messaging/MessagingContext";
 import { usePresence } from "../presence/PresenceContext";
 import { ensureTestBotConversation, TEST_BOT_CONVERSATION_ID } from "../testBot";
 import { useTheme } from "../ThemeContext";
@@ -53,12 +54,19 @@ export default function ConversationListScreen({ navigation }: Props) {
   const styles = useMemo(() => createStyles(colors), [colors]);
   const [conversations, setConversations] = useState<ConversationSummary[]>([]);
   const { presence, subscribe } = usePresence();
+  const { revision } = useMessaging();
 
   useFocusEffect(
     useCallback(() => {
       setConversations(getConversationSummaries());
     }, [])
   );
+
+  // Keep the list (previews, unread badges) live while it's mounted, not just
+  // on focus — a message can arrive while the user is sitting on this screen.
+  useEffect(() => {
+    setConversations(getConversationSummaries());
+  }, [revision]);
 
   useEffect(() => {
     if (conversations.length > 0) subscribe(conversations.map((c) => c.id));
