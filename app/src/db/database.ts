@@ -43,6 +43,11 @@ export function initDatabase() {
     );
 
     CREATE INDEX IF NOT EXISTS idx_calls_started_at ON calls(started_at);
+
+    CREATE TABLE IF NOT EXISTS blocked_users (
+      peer_id TEXT PRIMARY KEY NOT NULL,
+      blocked_at INTEGER NOT NULL
+    );
   `);
 
   // status/delivered_at/read_at/reply_* were added after this table already
@@ -269,6 +274,37 @@ export function insertConversation(conversation: ConversationRow): void {
   db.runSync(
     `INSERT INTO conversations (id, peer_public_key, display_name, created_at) VALUES (?, ?, ?, ?)`,
     [conversation.id, conversation.peer_public_key, conversation.display_name, conversation.created_at]
+  );
+}
+
+// Removes the conversation itself along with its messages and call history —
+// unlike clearMessages(), nothing is left behind in the chat list.
+export function deleteConversationRecord(conversationId: string): void {
+  db.withTransactionSync(() => {
+    db.runSync(`DELETE FROM messages WHERE conversation_id = ?`, [conversationId]);
+    db.runSync(`DELETE FROM calls WHERE conversation_id = ?`, [conversationId]);
+    db.runSync(`DELETE FROM conversations WHERE id = ?`, [conversationId]);
+  });
+}
+
+// Blocking is enforced entirely on-device (there's no server-side concept of
+// it): a blocked peer's conversation id is their user id, so this same id is
+// used to drop their incoming messages and to keep them out of contact/add
+// flows going forward.
+export function blockUser(peerId: string): void {
+  db.runSync(`INSERT OR REPLACE INTO blocked_users (peer_id, blocked_at) VALUES (?, ?)`, [
+    peerId,
+    Date.now(),
+  ]);
+}
+
+export function isUserBlocked(peerId: string): boolean {
+  return db.getFirstSync(`SELECT 1 FROM blocked_users WHERE peer_id = ?`, [peerId]) != null;
+}
+
+export function getBlockedUserIds(): Set<string> {
+  return new Set(
+    db.getAllSync<{ peer_id: string }>(`SELECT peer_id FROM blocked_users`).map((row) => row.peer_id)
   );
 }
 

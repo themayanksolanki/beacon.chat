@@ -7,6 +7,7 @@ import { decryptMessage, getOrCreateIdentity } from "../crypto/identity";
 import {
   getConversationById,
   insertMessage,
+  isUserBlocked,
   markMessageDeletedEverywhere,
   markMessageDelivered,
   markMessageRead,
@@ -68,6 +69,7 @@ export function MessagingProvider({ children }: { children: ReactNode }) {
     const bump = () => setRevision((r) => r + 1);
 
     const onMessage = async (message: IncomingServerMessage) => {
+      if (isUserBlocked(message.sender_id)) return;
       const conversation = getConversationById(message.sender_id);
       if (!conversation) return;
 
@@ -133,6 +135,7 @@ export function MessagingProvider({ children }: { children: ReactNode }) {
     };
 
     const onReactionSet = async (reaction: IncomingServerReaction) => {
+      if (isUserBlocked(reaction.sender_id)) return;
       const conversation = getConversationById(reaction.sender_id);
       if (!conversation) return;
       try {

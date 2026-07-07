@@ -24,12 +24,15 @@ import EmojiPicker, { type EmojiType } from "rn-emoji-keyboard";
 
 import type { MainStackParamList } from "../../App";
 import { useVoiceRecorder, type RecordedVoice } from "../audio/useVoiceRecorder";
+import { clearConversation } from "../chat/clearConversation";
+import { deleteConversation } from "../chat/deleteConversation";
 import { persistRecordedVoice, readVoiceMessageBase64 } from "../audio/voiceStorage";
 import ImageMessageBubble from "../components/ImageMessageBubble";
 import MessageActionMenu, { type MessageAction, type MessageMenuAnchor } from "../components/MessageActionMenu";
 import VoiceMessageBubble from "../components/VoiceMessageBubble";
 import { encryptMessage, getOrCreateIdentity } from "../crypto/identity";
 import {
+  blockUser,
   deleteMessage,
   getConversationById,
   getMessages,
@@ -166,6 +169,46 @@ function ChatHeaderCallButtons({ conversationId }: { conversationId: string }) {
   );
 }
 
+function ChatHeaderOptionsButton({
+  onClearChat,
+  onDeleteChat,
+  onBlockUser,
+  onDeleteUser,
+}: {
+  onClearChat: () => void;
+  onDeleteChat: () => void;
+  onBlockUser: () => void;
+  onDeleteUser: () => void;
+}) {
+  const { colors } = useTheme();
+  const buttonRef = useRef<View>(null);
+  const [anchor, setAnchor] = useState<MessageMenuAnchor | null>(null);
+  const [visible, setVisible] = useState(false);
+
+  const actions: MessageAction[] = [
+    { label: "Clear Chat", icon: "brush-outline", destructive: true, onPress: onClearChat },
+    { label: "Delete Chat", icon: "trash-outline", destructive: true, onPress: onDeleteChat },
+    { label: "Block User", icon: "ban-outline", destructive: true, onPress: onBlockUser },
+    { label: "Delete User", icon: "person-remove-outline", destructive: true, onPress: onDeleteUser },
+  ];
+
+  const showOptions = () => {
+    buttonRef.current?.measureInWindow((x, y, width, height) => {
+      setAnchor({ x, y, width, height });
+      setVisible(true);
+    });
+  };
+
+  return (
+    <>
+      <Pressable ref={buttonRef} onPress={showOptions} hitSlop={8} style={{ marginLeft: 18 }}>
+        <Ionicons name="ellipsis-vertical" size={20} color={colors.accent} />
+      </Pressable>
+      <MessageActionMenu visible={visible} anchor={anchor} actions={actions} onClose={() => setVisible(false)} />
+    </>
+  );
+}
+
 type ListItem =
   | { type: "separator"; id: string; label: string }
   | { type: "message"; id: string; message: MessageRow; isGroupEnd: boolean };
@@ -287,12 +330,19 @@ function MessageBubble({
         const actions: MessageAction[] = [
           { label: "Reply", icon: "arrow-undo-outline", onPress: () => onReply(message) },
           { label: "Copy", icon: "copy-outline", onPress: () => onCopy(message) },
-          {
-            label: isPinned ? "Unpin" : "Pin",
-            icon: isPinned ? "pin" : "pin-outline",
-            onPress: () => (isPinned ? onUnpin(message) : onPin(message)),
-          },
         ];
+        if (isOutgoing) {
+          actions.push({
+            label: "Info",
+            icon: "information-circle-outline",
+            onPress: () => showTimingInfo(message),
+          });
+        }
+        actions.push({
+          label: isPinned ? "Unpin" : "Pin",
+          icon: isPinned ? "pin" : "pin-outline",
+          onPress: () => (isPinned ? onUnpin(message) : onPin(message)),
+        });
         if (canDeleteForEveryone) {
           actions.push({
             label: "Delete for everyone",
@@ -380,8 +430,8 @@ function MessageBubble({
           )}
           <Pressable
             style={styles.metaRow}
-            onPress={() => (message.status === "failed" ? onRetry(message) : showTimingInfo(message))}
-            disabled={!isOutgoing || isDeleted}
+            onPress={() => onRetry(message)}
+            disabled={message.status !== "failed"}
           >
             {isPinned ? (
               <Ionicons
@@ -445,6 +495,36 @@ export default function ChatScreen({ route, navigation }: Props) {
 
   const peerPresence = presence[conversationId];
 
+  const onClearChat = useCallback(() => {
+    const name = conversation?.display_name ?? "this contact";
+    Alert.alert("Clear chat", `Delete all messages with ${name}? This can't be undone.`, [
+      { text: "Cancel", style: "cancel" },
+      {
+        text: "Clear",
+        style: "destructive",
+        onPress: () => {
+          clearConversation(conversationId);
+          setMessages([]);
+        },
+      },
+    ]);
+  }, [conversationId, conversation?.display_name]);
+
+  const onDeleteChat = useCallback(() => {
+    deleteConversation(conversationId);
+    navigation.goBack();
+  }, [conversationId, navigation]);
+
+  const onBlockUser = useCallback(() => {
+    blockUser(conversationId);
+  }, [conversationId]);
+
+  const onDeleteUser = useCallback(() => {
+    blockUser(conversationId);
+    deleteConversation(conversationId);
+    navigation.goBack();
+  }, [conversationId, navigation]);
+
   useLayoutEffect(() => {
     const name = conversation?.display_name ?? "Chat";
     navigation.setOptions({
@@ -464,9 +544,31 @@ export default function ChatScreen({ route, navigation }: Props) {
               onPress={() => navigation.navigate("ContactInfo", { conversationId })}
             />
           ),
-      headerRight: isTestBot ? undefined : () => <ChatHeaderCallButtons conversationId={conversationId} />,
+      headerRight: isTestBot
+        ? undefined
+        : () => (
+            <View style={{ flexDirection: "row", alignItems: "center" }}>
+              <ChatHeaderCallButtons conversationId={conversationId} />
+              <ChatHeaderOptionsButton
+                onClearChat={onClearChat}
+                onDeleteChat={onDeleteChat}
+                onBlockUser={onBlockUser}
+                onDeleteUser={onDeleteUser}
+              />
+            </View>
+          ),
     });
-  }, [navigation, conversation?.display_name, isTestBot, peerPresence, conversationId]);
+  }, [
+    navigation,
+    conversation?.display_name,
+    isTestBot,
+    peerPresence,
+    conversationId,
+    onClearChat,
+    onDeleteChat,
+    onBlockUser,
+    onDeleteUser,
+  ]);
 
   const markVisibleMessagesRead = useCallback(() => {
     if (!conversation || isTestBot) return;
@@ -1058,7 +1160,12 @@ export default function ChatScreen({ route, navigation }: Props) {
 
         {draft.trim() ? (
           <Pressable style={styles.sendButton} onPress={onSend}>
-            <Ionicons name="arrow-up" size={20} color="#fff" />
+            <Ionicons
+              name="paper-plane"
+              size={18}
+              color="#fff"
+              style={{ transform: [{ rotate: "45deg" }] }}
+            />
           </Pressable>
         ) : (
           <View

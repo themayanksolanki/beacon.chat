@@ -96,7 +96,15 @@
       "Bash(echo \"started $!\")",
       "Bash(rm -f /tmp/expo_build3.log)",
       "Bash(rm -f /tmp/expo_build4.log)",
-      "Bash(lsof -i :8081 -sTCP:LISTEN)"
+      "Bash(lsof -i :8081 -sTCP:LISTEN)",
+      "Bash(ps -p 5451 -o pid,ppid,command)",
+      "Bash(awk '$3==3987 || $3==5451')",
+      "Bash(mkdir -p /private/tmp/claude-501/-Users-mayanksolanki-Documents-beacon-chat/c5c69fac-12db-4643-81bb-db1eec015f16/scratchpad)",
+      "Bash(open *)",
+      "Bash(kill 3987 3962 3960)",
+      "Bash(kill 7639)",
+      "Bash(awk '$3==9980')",
+      "Bash(kill 9955 9957 9980 10615)"
     ]
   }
 }

@@ -4,6 +4,8 @@ import {
   Alert,
   FlatList,
   Image,
+  KeyboardAvoidingView,
+  Platform,
   Pressable,
   StyleSheet,
   Text,
@@ -22,7 +24,7 @@ import {
   normalize,
   type MatchedContact,
 } from "../contacts/matchContacts";
-import { getConversationByPeerKey, insertConversation } from "../db/database";
+import { getConversationByPeerKey, insertConversation, isUserBlocked } from "../db/database";
 import { useTheme } from "../ThemeContext";
 import { colorForName, initialFor, type ThemeColors } from "../theme";
 
@@ -46,7 +48,7 @@ export default function ContactsScreen({ navigation }: Props) {
   useEffect(() => {
     if (!token || !email) return;
     loadMatchedContacts(token, email)
-      .then(setContacts)
+      .then((list) => setContacts(list.filter((c) => !c.userId || !isUserBlocked(c.userId))))
       .catch((e) =>
         setError(
           e instanceof Error && e.message === "contacts_permission_denied"
@@ -59,6 +61,7 @@ export default function ContactsScreen({ navigation }: Props) {
   const openChat = useCallback(
     (contact: MatchedContact) => {
       if (!contact.publicKey) return;
+      if (contact.userId && isUserBlocked(contact.userId)) return;
       let conversation = getConversationByPeerKey(contact.publicKey);
       if (!conversation) {
         conversation = {
@@ -106,6 +109,10 @@ export default function ContactsScreen({ navigation }: Props) {
     setManualLoading(true);
     try {
       const result = await lookupSingleEmail(token, normalized);
+      if (result.userId && isUserBlocked(result.userId)) {
+        setManualError("You've blocked this user.");
+        return;
+      }
       setManualResult(result);
       setManualEmail("");
     } catch {
@@ -125,10 +132,15 @@ export default function ContactsScreen({ navigation }: Props) {
   }
 
   return (
+    <KeyboardAvoidingView
+      style={styles.flex}
+      behavior={Platform.OS === "ios" ? "padding" : "height"}
+    >
     <FlatList
       data={contacts ?? []}
       keyExtractor={(item) => item.id}
-      contentContainerStyle={contacts && contacts.length === 0 ? styles.center : undefined}
+      contentContainerStyle={styles.listContent}
+      keyboardShouldPersistTaps="handled"
       ListHeaderComponent={
         <View style={styles.addSection}>
           <View style={styles.addRow}>
@@ -184,6 +196,7 @@ export default function ContactsScreen({ navigation }: Props) {
         />
       )}
     />
+    </KeyboardAvoidingView>
   );
 }
 
@@ -237,6 +250,8 @@ function ContactRow({
 
 const createStyles = (colors: ThemeColors) =>
   StyleSheet.create({
+    flex: { flex: 1 },
+    listContent: { flexGrow: 1 },
     center: { flex: 1, alignItems: "center", justifyContent: "center", gap: 8 },
     empty: { color: colors.textTertiary, textAlign: "center", marginTop: 24 },
     error: { color: colors.textSecondary, textAlign: "center", paddingHorizontal: 24 },

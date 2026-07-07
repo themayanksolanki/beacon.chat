@@ -1,5 +1,5 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
-import { Alert, FlatList, Pressable, StyleSheet, Text, View } from "react-native";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { FlatList, Pressable, StyleSheet, Text, View } from "react-native";
 import { useFocusEffect } from "@react-navigation/native";
 import type { BottomTabScreenProps } from "@react-navigation/bottom-tabs";
 import type { CompositeScreenProps } from "@react-navigation/native";
@@ -7,8 +7,9 @@ import type { NativeStackScreenProps } from "@react-navigation/native-stack";
 import { Ionicons } from "@expo/vector-icons";
 
 import type { MainStackParamList, MainTabParamList } from "../../App";
-import { clearConversation } from "../chat/clearConversation";
-import { getConversationSummaries, type ConversationSummary } from "../db/database";
+import { deleteConversation } from "../chat/deleteConversation";
+import MessageActionMenu, { type MessageAction, type MessageMenuAnchor } from "../components/MessageActionMenu";
+import { blockUser, getConversationSummaries, type ConversationSummary } from "../db/database";
 import { useMessaging } from "../messaging/MessagingContext";
 import { usePresence } from "../presence/PresenceContext";
 import { ensureTestBotConversation, TEST_BOT_CONVERSATION_ID } from "../testBot";
@@ -53,6 +54,7 @@ export default function ConversationListScreen({ navigation }: Props) {
   const { colors } = useTheme();
   const styles = useMemo(() => createStyles(colors), [colors]);
   const [conversations, setConversations] = useState<ConversationSummary[]>([]);
+  const [menu, setMenu] = useState<{ anchor: MessageMenuAnchor; actions: MessageAction[] } | null>(null);
   const { presence, subscribe } = usePresence();
   const { revision } = useMessaging();
 
@@ -77,18 +79,37 @@ export default function ConversationListScreen({ navigation }: Props) {
     navigation.navigate("Chat", { conversationId: TEST_BOT_CONVERSATION_ID });
   };
 
-  const confirmClearChat = useCallback((conversationId: string, name: string) => {
-    Alert.alert("Clear chat", `Delete all messages with ${name}? This can't be undone.`, [
-      { text: "Cancel", style: "cancel" },
-      {
-        text: "Clear",
-        style: "destructive",
-        onPress: () => {
-          clearConversation(conversationId);
-          setConversations(getConversationSummaries());
+  const showChatOptions = useCallback((conversationId: string, anchor: MessageMenuAnchor) => {
+    setMenu({
+      anchor,
+      actions: [
+        {
+          label: "Delete Chat",
+          icon: "trash-outline",
+          destructive: true,
+          onPress: () => {
+            deleteConversation(conversationId);
+            setConversations(getConversationSummaries());
+          },
         },
-      },
-    ]);
+        {
+          label: "Block User",
+          icon: "ban-outline",
+          destructive: true,
+          onPress: () => blockUser(conversationId),
+        },
+        {
+          label: "Delete User",
+          icon: "person-remove-outline",
+          destructive: true,
+          onPress: () => {
+            blockUser(conversationId);
+            deleteConversation(conversationId);
+            setConversations(getConversationSummaries());
+          },
+        },
+      ],
+    });
   }, []);
 
   return (
@@ -110,53 +131,89 @@ export default function ConversationListScreen({ navigation }: Props) {
           data={conversations}
           keyExtractor={(item) => item.id}
           contentContainerStyle={styles.list}
-          renderItem={({ item }) => {
-            const name = item.display_name ?? "Unknown";
-            const hasUnread = item.unread_count > 0;
-            const isOnline = presence[item.id]?.online ?? false;
-            return (
-              <Pressable
-                style={({ pressed }) => [styles.card, pressed && styles.cardPressed]}
-                onPress={() => navigation.navigate("Chat", { conversationId: item.id })}
-                onLongPress={() => confirmClearChat(item.id, name)}
-              >
-                <View style={[styles.avatar, { backgroundColor: colorForName(name) }]}>
-                  <Text style={styles.avatarText}>{initialFor(name)}</Text>
-                  {isOnline ? <View style={styles.onlineDot} /> : null}
-                </View>
-                <View style={styles.rowContent}>
-                  <View style={styles.rowTop}>
-                    <Text style={styles.name} numberOfLines={1}>
-                      {name}
-                    </Text>
-                    {item.last_message_at ? (
-                      <Text style={[styles.time, hasUnread && styles.timeUnread]}>
-                        {formatListTimestamp(item.last_message_at)}
-                      </Text>
-                    ) : null}
-                  </View>
-                  <View style={styles.rowBottom}>
-                    <View style={styles.previewRow}>
-                      <PreviewReceiptTick item={item} colors={colors} />
-                      <Text style={[styles.preview, hasUnread && styles.previewUnread]} numberOfLines={1}>
-                        {item.last_message ?? "No messages yet"}
-                      </Text>
-                    </View>
-                    {hasUnread ? (
-                      <View style={styles.badge}>
-                        <Text style={styles.badgeText}>
-                          {item.unread_count > 99 ? "99+" : item.unread_count}
-                        </Text>
-                      </View>
-                    ) : null}
-                  </View>
-                </View>
-              </Pressable>
-            );
-          }}
+          renderItem={({ item }) => (
+            <ConversationRow
+              item={item}
+              isOnline={presence[item.id]?.online ?? false}
+              colors={colors}
+              styles={styles}
+              onPress={() => navigation.navigate("Chat", { conversationId: item.id })}
+              onLongPressAt={(anchor) => showChatOptions(item.id, anchor)}
+            />
+          )}
         />
       )}
+
+      <MessageActionMenu
+        visible={!!menu}
+        anchor={menu?.anchor ?? null}
+        actions={menu?.actions ?? []}
+        onClose={() => setMenu(null)}
+      />
     </View>
+  );
+}
+
+function ConversationRow({
+  item,
+  isOnline,
+  colors,
+  styles,
+  onPress,
+  onLongPressAt,
+}: {
+  item: ConversationSummary;
+  isOnline: boolean;
+  colors: ThemeColors;
+  styles: ReturnType<typeof createStyles>;
+  onPress: () => void;
+  onLongPressAt: (anchor: MessageMenuAnchor) => void;
+}) {
+  const rowRef = useRef<View>(null);
+  const name = item.display_name ?? "Unknown";
+  const hasUnread = item.unread_count > 0;
+
+  return (
+    <Pressable
+      ref={rowRef}
+      style={({ pressed }) => [styles.card, pressed && styles.cardPressed]}
+      onPress={onPress}
+      onLongPress={() => {
+        rowRef.current?.measureInWindow((x, y, width, height) => {
+          onLongPressAt({ x, y, width, height });
+        });
+      }}
+    >
+      <View style={[styles.avatar, { backgroundColor: colorForName(name) }]}>
+        <Text style={styles.avatarText}>{initialFor(name)}</Text>
+        {isOnline ? <View style={styles.onlineDot} /> : null}
+      </View>
+      <View style={styles.rowContent}>
+        <View style={styles.rowTop}>
+          <Text style={styles.name} numberOfLines={1}>
+            {name}
+          </Text>
+          {item.last_message_at ? (
+            <Text style={[styles.time, hasUnread && styles.timeUnread]}>
+              {formatListTimestamp(item.last_message_at)}
+            </Text>
+          ) : null}
+        </View>
+        <View style={styles.rowBottom}>
+          <View style={styles.previewRow}>
+            <PreviewReceiptTick item={item} colors={colors} />
+            <Text style={[styles.preview, hasUnread && styles.previewUnread]} numberOfLines={1}>
+              {item.last_message ?? "No messages yet"}
+            </Text>
+          </View>
+          {hasUnread ? (
+            <View style={styles.badge}>
+              <Text style={styles.badgeText}>{item.unread_count > 99 ? "99+" : item.unread_count}</Text>
+            </View>
+          ) : null}
+        </View>
+      </View>
+    </Pressable>
   );
 }
 
