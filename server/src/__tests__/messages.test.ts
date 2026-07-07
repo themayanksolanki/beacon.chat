@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { db, initDatabase } from "../db";
+import { users } from "../schema";
 import {
   clearReaction,
   getUndeliveredMessages,
@@ -10,9 +11,16 @@ import {
 } from "../messages";
 
 function seedUser(id: string, email: string) {
-  db.prepare(
-    "INSERT INTO users (id, email, public_key, current_session_id, created_at) VALUES (?, ?, ?, ?, ?)"
-  ).run(id, email, `${email}-pubkey`, `${id}-session`, Date.now());
+  db.insert(users)
+    .values({
+      id,
+      email,
+      public_key: `${email}-pubkey`,
+      current_session_id: `${id}-session`,
+      created_at: Date.now(),
+      last_seen_at: null,
+    })
+    .run();
 }
 
 beforeAll(() => {

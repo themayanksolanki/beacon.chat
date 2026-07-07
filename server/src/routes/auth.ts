@@ -1,7 +1,9 @@
 import { Router } from "express";
 import rateLimit, { ipKeyGenerator } from "express-rate-limit";
 import { randomUUID } from "node:crypto";
+import { and, desc, eq, lt } from "drizzle-orm";
 import { db } from "../db";
+import { otpChallenges, users } from "../schema";
 import { requireAuth, signToken, type AuthedRequest } from "../auth";
 import { revokeOtherSessions } from "../socketServer";
 import { generateOtp, hashOtp, otpHashesMatch, MAX_ATTEMPTS, OTP_TTL_MS } from "../otp";
@@ -17,20 +19,8 @@ const otpRequestLimiter = rateLimit({
   keyGenerator: (req) => `${ipKeyGenerator(req.ip ?? "")}:${req.body?.email ?? ""}`,
 });
 
-interface UserRow {
-  id: string;
-  email: string;
-  public_key: string | null;
-  current_session_id: string | null;
-}
-
-interface OtpChallengeRow {
-  id: string;
-  email: string;
-  code_hash: string;
-  expires_at: number;
-  attempts: number;
-}
+type UserRow = typeof users.$inferSelect;
+type OtpChallengeRow = typeof otpChallenges.$inferSelect;
 
 /** Step 1: user submits their email, we mail them a one-time code. */
 authRouter.post("/otp/request", otpRequestLimiter, async (req, res) => {
@@ -43,12 +33,21 @@ authRouter.post("/otp/request", otpRequestLimiter, async (req, res) => {
 
   // Opportunistic cleanup: otherwise every request leaves a row behind
   // forever, since nothing else ever deletes expired challenges.
-  db.prepare("DELETE FROM otp_challenges WHERE email = ? AND expires_at < ?").run(email, Date.now());
+  db.delete(otpChallenges)
+    .where(and(eq(otpChallenges.email, email), lt(otpChallenges.expires_at, Date.now())))
+    .run();
 
   const code = generateOtp();
-  db.prepare(
-    "INSERT INTO otp_challenges (id, email, code_hash, expires_at, attempts, created_at) VALUES (?, ?, ?, ?, 0, ?)"
-  ).run(randomUUID(), email, hashOtp(code, email), Date.now() + OTP_TTL_MS, Date.now());
+  db.insert(otpChallenges)
+    .values({
+      id: randomUUID(),
+      email,
+      code_hash: hashOtp(code, email),
+      expires_at: Date.now() + OTP_TTL_MS,
+      attempts: 0,
+      created_at: Date.now(),
+    })
+    .run();
 
   await sendOtpEmail(email, code);
   res.status(202).json({ ok: true });
@@ -67,11 +66,13 @@ authRouter.post("/otp/verify", async (req, res) => {
     return;
   }
 
-  const challenge = db
-    .prepare<[string], OtpChallengeRow>(
-      "SELECT * FROM otp_challenges WHERE email = ? ORDER BY created_at DESC LIMIT 1"
-    )
-    .get(email);
+  const challenge: OtpChallengeRow | undefined = db
+    .select()
+    .from(otpChallenges)
+    .where(eq(otpChallenges.email, email))
+    .orderBy(desc(otpChallenges.created_at))
+    .limit(1)
+    .get();
 
   if (!challenge || challenge.expires_at < Date.now()) {
     res.status(400).json({ error: "otp_expired_or_not_found" });
@@ -84,12 +85,15 @@ authRouter.post("/otp/verify", async (req, res) => {
   }
 
   if (!otpHashesMatch(challenge.code_hash, hashOtp(code, email))) {
-    db.prepare("UPDATE otp_challenges SET attempts = attempts + 1 WHERE id = ?").run(challenge.id);
+    db.update(otpChallenges)
+      .set({ attempts: challenge.attempts + 1 })
+      .where(eq(otpChallenges.id, challenge.id))
+      .run();
     res.status(401).json({ error: "invalid_code" });
     return;
   }
 
-  db.prepare("DELETE FROM otp_challenges WHERE email = ?").run(email);
+  db.delete(otpChallenges).where(eq(otpChallenges.email, email)).run();
 
   const { token, userId } = await issueSession(email, publicKey);
   res.status(200).json({ token, userId });
@@ -102,20 +106,26 @@ authRouter.post("/otp/verify", async (req, res) => {
  */
 async function issueSession(email: string, publicKey: string): Promise<{ token: string; userId: string }> {
   const sessionId = randomUUID();
-  let user = db.prepare<[string], UserRow>("SELECT * FROM users WHERE email = ?").get(email);
+  let user: UserRow | undefined = db.select().from(users).where(eq(users.email, email)).get();
 
   if (user) {
-    db.prepare("UPDATE users SET public_key = ?, current_session_id = ? WHERE id = ?").run(
-      publicKey,
-      sessionId,
-      user.id
-    );
+    db.update(users)
+      .set({ public_key: publicKey, current_session_id: sessionId })
+      .where(eq(users.id, user.id))
+      .run();
   } else {
     const id = randomUUID();
-    db.prepare(
-      "INSERT INTO users (id, email, public_key, current_session_id, created_at) VALUES (?, ?, ?, ?, ?)"
-    ).run(id, email, publicKey, sessionId, Date.now());
-    user = { id, email, public_key: publicKey, current_session_id: sessionId };
+    db.insert(users)
+      .values({
+        id,
+        email,
+        public_key: publicKey,
+        current_session_id: sessionId,
+        created_at: Date.now(),
+        last_seen_at: null,
+      })
+      .run();
+    user = { id, email, public_key: publicKey, current_session_id: sessionId, created_at: Date.now(), last_seen_at: null };
   }
 
   await revokeOtherSessions(user.id);
@@ -143,14 +153,12 @@ if (process.env.SKIP_OTP === "true") {
 }
 
 authRouter.get("/session", requireAuth, (req: AuthedRequest, res) => {
-  const user = db
-    .prepare<[string], UserRow>("SELECT * FROM users WHERE id = ?")
-    .get(req.user!.userId);
+  const user = db.select().from(users).where(eq(users.id, req.user!.userId)).get();
 
   res.json({ userId: user!.id, email: user!.email });
 });
 
 authRouter.post("/logout", requireAuth, (req: AuthedRequest, res) => {
-  db.prepare("UPDATE users SET current_session_id = NULL WHERE id = ?").run(req.user!.userId);
+  db.update(users).set({ current_session_id: null }).where(eq(users.id, req.user!.userId)).run();
   res.status(204).end();
 });

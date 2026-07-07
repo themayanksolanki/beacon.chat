@@ -1,15 +1,16 @@
+import { eq } from "drizzle-orm";
 import { db } from "./db";
-
-interface UserRow {
-  id: string;
-  last_seen_at: number | null;
-}
+import { users } from "./schema";
 
 export function getLastSeen(userId: string): number | null {
-  const user = db.prepare<[string], UserRow>("SELECT id, last_seen_at FROM users WHERE id = ?").get(userId);
+  const user = db
+    .select({ id: users.id, last_seen_at: users.last_seen_at })
+    .from(users)
+    .where(eq(users.id, userId))
+    .get();
   return user?.last_seen_at ?? null;
 }
 
 export function setLastSeen(userId: string, at: number): void {
-  db.prepare("UPDATE users SET last_seen_at = ? WHERE id = ?").run(at, userId);
+  db.update(users).set({ last_seen_at: at }).where(eq(users.id, userId)).run();
 }

@@ -1,13 +1,17 @@
 import Database from "better-sqlite3";
+import { drizzle } from "drizzle-orm/better-sqlite3";
 import path from "node:path";
+import * as schema from "./schema";
 
 const dbPath = process.env.DATABASE_PATH ?? path.join(__dirname, "..", "beacon.db");
 
-export const db = new Database(dbPath);
-db.pragma("journal_mode = WAL");
+export const sqlite = new Database(dbPath);
+sqlite.pragma("journal_mode = WAL");
+
+export const db = drizzle(sqlite, { schema });
 
 export function initDatabase() {
-  db.exec(`
+  sqlite.exec(`
     -- A user is identified by email. current_session_id holds the id of
     -- the one session allowed to be active at a time: logging in on a new
     -- device overwrites it, which immediately invalidates the old device's
@@ -67,9 +71,9 @@ export function initDatabase() {
 
   // read_at was added after the messages table already shipped; guard the
   // migration for databases created before this column existed.
-  const messageColumns = db.prepare("PRAGMA table_info(messages)").all() as { name: string }[];
+  const messageColumns = sqlite.prepare("PRAGMA table_info(messages)").all() as { name: string }[];
   if (!messageColumns.some((c) => c.name === "read_at")) {
-    db.exec("ALTER TABLE messages ADD COLUMN read_at INTEGER");
+    sqlite.exec("ALTER TABLE messages ADD COLUMN read_at INTEGER");
   }
 
   // email replaces phone_number as the identity column; databases created
@@ -77,9 +81,9 @@ export function initDatabase() {
   // schema. phone_number was declared UNIQUE inline, and SQLite refuses to
   // DROP COLUMN on a column backing a UNIQUE constraint, so removing it
   // requires the classic rebuild-the-table dance rather than a plain ALTER.
-  const userColumns = db.prepare("PRAGMA table_info(users)").all() as { name: string }[];
+  const userColumns = sqlite.prepare("PRAGMA table_info(users)").all() as { name: string }[];
   if (userColumns.some((c) => c.name === "phone_number")) {
-    db.exec(`
+    sqlite.exec(`
       CREATE TABLE users_new (
         id TEXT PRIMARY KEY NOT NULL,
         email TEXT UNIQUE NOT NULL DEFAULT '',
@@ -97,22 +101,22 @@ export function initDatabase() {
   }
 
   // Presence: last_seen_at is set when a user's final socket disconnects.
-  const currentUserColumns = db.prepare("PRAGMA table_info(users)").all() as { name: string }[];
+  const currentUserColumns = sqlite.prepare("PRAGMA table_info(users)").all() as { name: string }[];
   if (!currentUserColumns.some((c) => c.name === "last_seen_at")) {
-    db.exec("ALTER TABLE users ADD COLUMN last_seen_at INTEGER");
+    sqlite.exec("ALTER TABLE users ADD COLUMN last_seen_at INTEGER");
   }
 
-  const otpColumns = db.prepare("PRAGMA table_info(otp_challenges)").all() as { name: string }[];
+  const otpColumns = sqlite.prepare("PRAGMA table_info(otp_challenges)").all() as { name: string }[];
   if (!otpColumns.some((c) => c.name === "email")) {
-    db.exec("ALTER TABLE otp_challenges ADD COLUMN email TEXT");
+    sqlite.exec("ALTER TABLE otp_challenges ADD COLUMN email TEXT");
   }
   if (otpColumns.some((c) => c.name === "phone_number")) {
     // The old phone_number index has to go before the column it indexes can.
-    db.exec("DROP INDEX IF EXISTS idx_otp_phone");
-    db.exec("ALTER TABLE otp_challenges DROP COLUMN phone_number");
+    sqlite.exec("DROP INDEX IF EXISTS idx_otp_phone");
+    sqlite.exec("ALTER TABLE otp_challenges DROP COLUMN phone_number");
   }
 
   // Created after the email column is guaranteed to exist (either from the
   // fresh CREATE TABLE above, or the migration just above this).
-  db.exec("CREATE INDEX IF NOT EXISTS idx_otp_email ON otp_challenges(email, created_at)");
+  sqlite.exec("CREATE INDEX IF NOT EXISTS idx_otp_email ON otp_challenges(email, created_at)");
 }

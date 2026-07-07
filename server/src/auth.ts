@@ -1,6 +1,8 @@
 import jwt from "jsonwebtoken";
+import { eq } from "drizzle-orm";
 import type { Request, Response, NextFunction } from "express";
 import { db } from "./db";
+import { users } from "./schema";
 
 const JWT_SECRET: string = (() => {
   const value = process.env.JWT_SECRET;
@@ -26,11 +28,6 @@ export function verifyToken(token: string): TokenPayload {
   return jwt.verify(token, JWT_SECRET, { algorithms: ["HS256"] }) as unknown as TokenPayload;
 }
 
-interface UserRow {
-  id: string;
-  current_session_id: string | null;
-}
-
 /**
  * A valid JWT signature is not enough: the embedded sessionId must still
  * match the user's current_session_id. Logging in on another device
@@ -39,8 +36,10 @@ interface UserRow {
  */
 export function isSessionActive(payload: TokenPayload): boolean {
   const user = db
-    .prepare<[string], UserRow>("SELECT id, current_session_id FROM users WHERE id = ?")
-    .get(payload.userId);
+    .select({ id: users.id, current_session_id: users.current_session_id })
+    .from(users)
+    .where(eq(users.id, payload.userId))
+    .get();
 
   return user?.current_session_id === payload.sessionId;
 }

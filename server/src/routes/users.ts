@@ -1,23 +1,19 @@
 import { Router } from "express";
+import { and, eq, inArray, isNotNull } from "drizzle-orm";
 import { db } from "../db";
+import { users } from "../schema";
 import { requireAuth, type AuthedRequest } from "../auth";
 import { sendInviteEmail } from "../email";
 import { isMongoConnected, profiles } from "../mongo";
 
 export const usersRouter = Router();
 
-interface UserRow {
-  id: string;
-  email: string;
-  public_key: string | null;
-}
-
 const MAX_LOOKUP_EMAILS = 500;
 const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
 usersRouter.get("/by-email/:email/public-key", requireAuth, (req, res) => {
   const email = String(req.params.email);
-  const user = db.prepare<[string], UserRow>("SELECT * FROM users WHERE email = ?").get(email);
+  const user = db.select().from(users).where(eq(users.email, email)).get();
 
   if (!user || !user.public_key) {
     res.status(404).json({ error: "user not found" });
@@ -48,12 +44,11 @@ usersRouter.post("/lookup", requireAuth, async (req, res) => {
     return;
   }
 
-  const placeholders = unique.map(() => "?").join(",");
   const rows = db
-    .prepare<string[], UserRow>(
-      `SELECT id, email, public_key FROM users WHERE email IN (${placeholders}) AND public_key IS NOT NULL`
-    )
-    .all(...unique);
+    .select({ id: users.id, email: users.email, public_key: users.public_key })
+    .from(users)
+    .where(and(inArray(users.email, unique), isNotNull(users.public_key)))
+    .all();
 
   const profileByUserId = isMongoConnected()
     ? new Map(
@@ -87,9 +82,7 @@ usersRouter.post("/invite", requireAuth, async (req: AuthedRequest, res) => {
     return;
   }
 
-  const inviter = db
-    .prepare<[string], UserRow>("SELECT * FROM users WHERE id = ?")
-    .get(req.user!.userId);
+  const inviter = db.select().from(users).where(eq(users.id, req.user!.userId)).get();
 
   await sendInviteEmail(email, inviter?.email ?? "A Beacon user");
   res.status(202).json({ ok: true });

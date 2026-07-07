@@ -1,14 +1,23 @@
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
+import { eq } from "drizzle-orm";
 import { io as ioClient, Socket as ClientSocket } from "socket.io-client";
 import { createSocketServer, revokeOtherSessions } from "../socketServer";
 import { db, initDatabase } from "../db";
+import { users } from "../schema";
 import { signToken } from "../auth";
 
 function seedUser(id: string, email: string, sessionId: string) {
-  db.prepare(
-    "INSERT INTO users (id, email, public_key, current_session_id, created_at) VALUES (?, ?, ?, ?, ?)"
-  ).run(id, email, `${email}-pubkey`, sessionId, Date.now());
+  db.insert(users)
+    .values({
+      id,
+      email,
+      public_key: `${email}-pubkey`,
+      current_session_id: sessionId,
+      created_at: Date.now(),
+      last_seen_at: null,
+    })
+    .run();
 }
 
 describe("socket relay", () => {
@@ -152,10 +161,7 @@ describe("socket relay", () => {
 
     oldDevice.on("connect", async () => {
       // Simulate what /auth/otp/verify does on a second-device login.
-      db.prepare("UPDATE users SET current_session_id = ? WHERE id = ?").run(
-        "alice-session-2",
-        "alice-id"
-      );
+      db.update(users).set({ current_session_id: "alice-session-2" }).where(eq(users.id, "alice-id")).run();
       await revokeOtherSessions("alice-id");
     });
   });

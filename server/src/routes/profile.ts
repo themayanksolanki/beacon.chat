@@ -1,14 +1,11 @@
 import { Router } from "express";
+import { eq } from "drizzle-orm";
 import { db } from "../db";
+import { users } from "../schema";
 import { requireAuth, type AuthedRequest } from "../auth";
 import { isMongoConnected, profiles } from "../mongo";
 
 export const profileRouter = Router();
-
-interface UserRow {
-  id: string;
-  email: string;
-}
 
 const MAX_NAME_LENGTH = 80;
 // Base64 JPEGs from the profile-photo picker land well under this; it's just a
@@ -43,7 +40,11 @@ profileRouter.put("/", requireAuth, async (req: AuthedRequest, res) => {
     return;
   }
 
-  const user = db.prepare<[string], UserRow>("SELECT id, email FROM users WHERE id = ?").get(req.user!.userId);
+  const user = db
+    .select({ id: users.id, email: users.email })
+    .from(users)
+    .where(eq(users.id, req.user!.userId))
+    .get();
   if (!user) {
     res.status(404).json({ error: "user_not_found" });
     return;

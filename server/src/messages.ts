@@ -1,18 +1,11 @@
+import { and, asc, eq, isNull } from "drizzle-orm";
 import { db } from "./db";
+import { messages, reactions, users } from "./schema";
 
-export interface MessageRow {
-  id: string;
-  sender_id: string;
-  recipient_id: string;
-  ciphertext: string;
-  nonce: string;
-  created_at: number;
-  delivered_at: number | null;
-  read_at: number | null;
-}
+export type MessageRow = typeof messages.$inferSelect;
 
 export function userExists(id: string): boolean {
-  return !!db.prepare("SELECT 1 FROM users WHERE id = ?").get(id);
+  return !!db.select({ id: users.id }).from(users).where(eq(users.id, id)).get();
 }
 
 /**
@@ -39,21 +32,18 @@ export function storeMessage(input: {
     read_at: null,
   };
 
-  
-  db.prepare(
-    `INSERT INTO messages (id, sender_id, recipient_id, ciphertext, nonce, created_at, delivered_at, read_at)
-     VALUES (@id, @sender_id, @recipient_id, @ciphertext, @nonce, @created_at, @delivered_at, @read_at)`
-  ).run(row);
+  db.insert(messages).values(row).run();
 
   return row;
 }
 
 export function getUndeliveredMessages(recipientId: string): MessageRow[] {
   return db
-    .prepare<[string], MessageRow>(
-      "SELECT * FROM messages WHERE recipient_id = ? AND delivered_at IS NULL ORDER BY created_at ASC"
-    )
-    .all(recipientId);
+    .select()
+    .from(messages)
+    .where(and(eq(messages.recipient_id, recipientId), isNull(messages.delivered_at)))
+    .orderBy(asc(messages.created_at))
+    .all();
 }
 
 export type MarkResult =
@@ -68,22 +58,22 @@ export type MarkResult =
  * client for the same reason.
  */
 export function markDelivered(messageId: string, requesterId: string): MarkResult {
-  const message = db.prepare<[string], MessageRow>("SELECT * FROM messages WHERE id = ?").get(messageId);
+  const message = db.select().from(messages).where(eq(messages.id, messageId)).get();
   if (!message) return { ok: false, error: "not_found" };
   if (message.recipient_id !== requesterId) return { ok: false, error: "not_recipient" };
 
   const deliveredAt = Date.now();
-  db.prepare("UPDATE messages SET delivered_at = ? WHERE id = ?").run(deliveredAt, messageId);
+  db.update(messages).set({ delivered_at: deliveredAt }).where(eq(messages.id, messageId)).run();
   return { ok: true, senderId: message.sender_id, at: deliveredAt };
 }
 
 export function markRead(messageId: string, requesterId: string): MarkResult {
-  const message = db.prepare<[string], MessageRow>("SELECT * FROM messages WHERE id = ?").get(messageId);
+  const message = db.select().from(messages).where(eq(messages.id, messageId)).get();
   if (!message) return { ok: false, error: "not_found" };
   if (message.recipient_id !== requesterId) return { ok: false, error: "not_recipient" };
 
   const readAt = Date.now();
-  db.prepare("UPDATE messages SET read_at = ? WHERE id = ?").run(readAt, messageId);
+  db.update(messages).set({ read_at: readAt }).where(eq(messages.id, messageId)).run();
   return { ok: true, senderId: message.sender_id, at: readAt };
 }
 
@@ -99,24 +89,16 @@ export type DeleteForEveryoneResult =
  * a security boundary.
  */
 export function deleteMessageForEveryone(id: string, requesterId: string): DeleteForEveryoneResult {
-  const message = db.prepare<[string], MessageRow>("SELECT * FROM messages WHERE id = ?").get(id);
+  const message = db.select().from(messages).where(eq(messages.id, id)).get();
   if (!message) return { ok: false, error: "not_found" };
   if (message.sender_id !== requesterId) return { ok: false, error: "not_sender" };
   if (Date.now() - message.created_at > DELETE_FOR_EVERYONE_WINDOW_MS) return { ok: false, error: "too_late" };
 
-  db.prepare("DELETE FROM messages WHERE id = ?").run(id);
+  db.delete(messages).where(eq(messages.id, id)).run();
   return { ok: true, message };
 }
 
-export interface ReactionRow {
-  message_id: string;
-  sender_id: string;
-  recipient_id: string;
-  ciphertext: string;
-  nonce: string;
-  created_at: number;
-  delivered_at: number | null;
-}
+export type ReactionRow = typeof reactions.$inferSelect;
 
 /** One reaction per (message, reactor) — reacting again just overwrites the previous emoji. */
 export function setReaction(input: {
@@ -136,35 +118,40 @@ export function setReaction(input: {
     delivered_at: null,
   };
 
-  db.prepare(
-    `INSERT INTO reactions (message_id, sender_id, recipient_id, ciphertext, nonce, created_at, delivered_at)
-     VALUES (@message_id, @sender_id, @recipient_id, @ciphertext, @nonce, @created_at, @delivered_at)
-     ON CONFLICT(message_id, sender_id) DO UPDATE SET
-       ciphertext = excluded.ciphertext,
-       nonce = excluded.nonce,
-       created_at = excluded.created_at,
-       delivered_at = NULL`
-  ).run(row);
+  db.insert(reactions)
+    .values(row)
+    .onConflictDoUpdate({
+      target: [reactions.message_id, reactions.sender_id],
+      set: {
+        ciphertext: row.ciphertext,
+        nonce: row.nonce,
+        created_at: row.created_at,
+        delivered_at: null,
+      },
+    })
+    .run();
 
   return row;
 }
 
 export function clearReaction(messageId: string, senderId: string): void {
-  db.prepare("DELETE FROM reactions WHERE message_id = ? AND sender_id = ?").run(messageId, senderId);
+  db.delete(reactions)
+    .where(and(eq(reactions.message_id, messageId), eq(reactions.sender_id, senderId)))
+    .run();
 }
 
 export function getUndeliveredReactions(recipientId: string): ReactionRow[] {
   return db
-    .prepare<[string], ReactionRow>(
-      "SELECT * FROM reactions WHERE recipient_id = ? AND delivered_at IS NULL ORDER BY created_at ASC"
-    )
-    .all(recipientId);
+    .select()
+    .from(reactions)
+    .where(and(eq(reactions.recipient_id, recipientId), isNull(reactions.delivered_at)))
+    .orderBy(asc(reactions.created_at))
+    .all();
 }
 
 export function markReactionDelivered(messageId: string, senderId: string): void {
-  db.prepare("UPDATE reactions SET delivered_at = ? WHERE message_id = ? AND sender_id = ?").run(
-    Date.now(),
-    messageId,
-    senderId
-  );
+  db.update(reactions)
+    .set({ delivered_at: Date.now() })
+    .where(and(eq(reactions.message_id, messageId), eq(reactions.sender_id, senderId)))
+    .run();
 }
