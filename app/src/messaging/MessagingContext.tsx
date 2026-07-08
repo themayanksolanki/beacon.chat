@@ -16,6 +16,15 @@ import {
 } from "../db/database";
 import { writeImageMessageBase64 } from "../media/imageStorage";
 import { getSocket } from "../network/socket";
+import { navigateToConversation } from "../navigation/navigationRef";
+import {
+  addNotificationTapListener,
+  clearNotificationsForConversation,
+  configureNotificationHandler,
+  consumeLastNotificationResponse,
+  notifyNewMessage,
+  requestNotificationPermissionsAsync,
+} from "../notifications/notificationService";
 
 const VOICE_MESSAGE_LABEL = "🎤 Voice message";
 const IMAGE_MESSAGE_LABEL = "📷 Photo";
@@ -60,11 +69,31 @@ const MessagingContext = createContext<MessagingContextValue>({ revision: 0 });
  * and acked regardless of which screen — if any — is currently open.
  */
 export function MessagingProvider({ children }: { children: ReactNode }) {
-  const { token } = useAuth();
+  const { token, email } = useAuth();
   const [revision, setRevision] = useState(0);
 
   useEffect(() => {
     if (!token) return;
+
+    configureNotificationHandler();
+    void requestNotificationPermissionsAsync();
+
+    const handleTap = ({ conversationId }: { conversationId: string }) => {
+      navigateToConversation(conversationId);
+      void clearNotificationsForConversation(conversationId);
+    };
+
+    // Catches the notification that launched the app (cold start); warm/
+    // background taps are caught by the listener below instead.
+    const coldStartPayload = consumeLastNotificationResponse();
+    if (coldStartPayload) handleTap(coldStartPayload);
+
+    const subscription = addNotificationTapListener(handleTap);
+    return () => subscription.remove();
+  }, [token]);
+
+  useEffect(() => {
+    if (!token || !email) return;
     const socket = getSocket();
     const bump = () => setRevision((r) => r + 1);
 
@@ -74,7 +103,7 @@ export function MessagingProvider({ children }: { children: ReactNode }) {
       if (!conversation) return;
 
       try {
-        const identity = await getOrCreateIdentity();
+        const identity = await getOrCreateIdentity(email);
         await sodium.ready;
         const peerPublicKey = sodium.from_base64(conversation.peer_public_key);
         const decrypted = await decryptMessage(
@@ -114,6 +143,15 @@ export function MessagingProvider({ children }: { children: ReactNode }) {
         insertMessage(row);
         getSocket().emit("message:delivered", { id: message.id });
         bump();
+
+        void notifyNewMessage({
+          conversationId: message.sender_id,
+          senderId: message.sender_id,
+          senderName: conversation.display_name ?? "Unknown",
+          messageId: message.id,
+          messagePreview: row.plaintext,
+          timestamp: message.created_at,
+        });
       } catch (err) {
         console.warn("[messaging] failed to process incoming message", err);
       }
@@ -139,7 +177,7 @@ export function MessagingProvider({ children }: { children: ReactNode }) {
       const conversation = getConversationById(reaction.sender_id);
       if (!conversation) return;
       try {
-        const identity = await getOrCreateIdentity();
+        const identity = await getOrCreateIdentity(email);
         await sodium.ready;
         const peerPublicKey = sodium.from_base64(conversation.peer_public_key);
         const decrypted = await decryptMessage(
@@ -175,7 +213,7 @@ export function MessagingProvider({ children }: { children: ReactNode }) {
       socket.off("reaction:set", onReactionSet);
       socket.off("reaction:cleared", onReactionCleared);
     };
-  }, [token]);
+  }, [token, email]);
 
   return <MessagingContext.Provider value={{ revision }}>{children}</MessagingContext.Provider>;
 }

@@ -105,6 +105,9 @@ export function initDatabase() {
   if (!currentUserColumns.some((c) => c.name === "last_seen_at")) {
     sqlite.exec("ALTER TABLE users ADD COLUMN last_seen_at INTEGER");
   }
+  if (!currentUserColumns.some((c) => c.name === "deletion_requested_at")) {
+    sqlite.exec("ALTER TABLE users ADD COLUMN deletion_requested_at INTEGER");
+  }
 
   const otpColumns = sqlite.prepare("PRAGMA table_info(otp_challenges)").all() as { name: string }[];
   if (!otpColumns.some((c) => c.name === "email")) {

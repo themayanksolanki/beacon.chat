@@ -1,8 +1,43 @@
 import * as SQLite from "expo-sqlite";
+import { sanitizeAccountKey } from "../storage/accountKey";
 
-const db = SQLite.openDatabaseSync("beacon.db");
+let currentAccountKey = "";
+let db = SQLite.openDatabaseSync("beacon.db");
 
-export function initDatabase() {
+// Each signed-in account gets its own local database file. Without this,
+// conversations/messages/calls/blocked_users persisted under one account
+// would still be sitting in the shared db file and would show up as-is for
+// the next account that signs into this device.
+export function initDatabase(accountKey: string) {
+  const key = sanitizeAccountKey(accountKey);
+  if (key !== currentAccountKey) {
+    db.closeSync();
+    db = SQLite.openDatabaseSync(`beacon-${key}.db`);
+    currentAccountKey = key;
+  }
+
+  runMigrations();
+}
+
+// Used when an account is deleted (as opposed to a plain logout, which
+// leaves the local db in place so the same account's history is there if
+// the user signs back in) — permanently removes this account's local
+// conversations/messages/calls/blocked_users from the device.
+export function wipeAccountDatabase(accountKey: string) {
+  const key = sanitizeAccountKey(accountKey);
+  if (key === currentAccountKey) {
+    db.closeSync();
+    currentAccountKey = "";
+    db = SQLite.openDatabaseSync("beacon.db");
+  }
+  try {
+    SQLite.deleteDatabaseSync(`beacon-${key}.db`);
+  } catch {
+    // Nothing to delete (e.g. account was deleted before ever opening a chat).
+  }
+}
+
+function runMigrations() {
   db.execSync(`
     PRAGMA journal_mode = WAL;
 

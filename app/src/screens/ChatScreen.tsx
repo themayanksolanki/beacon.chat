@@ -23,6 +23,7 @@ import { useSafeAreaInsets } from "react-native-safe-area-context";
 import EmojiPicker, { type EmojiType } from "rn-emoji-keyboard";
 
 import type { MainStackParamList } from "../../App";
+import { useAuth } from "../auth/AuthContext";
 import { useVoiceRecorder, type RecordedVoice } from "../audio/useVoiceRecorder";
 import { clearConversation } from "../chat/clearConversation";
 import { deleteConversation } from "../chat/deleteConversation";
@@ -54,6 +55,8 @@ import { deleteImageMessage, persistPickedImage, readImageMessageBase64 } from "
 import { useCall } from "../calls/CallContext";
 import { getSocket } from "../network/socket";
 import { useMessaging, type MessagePayload, type ReactionPayload } from "../messaging/MessagingContext";
+import { setActiveConversationId } from "../notifications/activeChatTracker";
+import { clearNotificationsForConversation } from "../notifications/notificationService";
 import { usePresence } from "../presence/PresenceContext";
 import { TEST_BOT_CONVERSATION_ID } from "../testBot";
 import { useTheme } from "../ThemeContext";
@@ -461,6 +464,7 @@ function MessageBubble({
 
 export default function ChatScreen({ route, navigation }: Props) {
   const { conversationId } = route.params;
+  const { email } = useAuth();
   const conversation = useMemo(() => getConversationById(conversationId), [conversationId]);
   const isTestBot = conversationId === TEST_BOT_CONVERSATION_ID;
   const insets = useSafeAreaInsets();
@@ -596,6 +600,19 @@ export default function ChatScreen({ route, navigation }: Props) {
     }, [conversationId, markVisibleMessagesRead])
   );
 
+  // Notification suppression (see notificationService.ts) keys off this: a
+  // message for whichever conversation is "active" here is treated as
+  // already seen and doesn't produce a notification. Cleared on blur so
+  // backgrounding the app or navigating away doesn't leave a stale chat
+  // marked active.
+  useFocusEffect(
+    useCallback(() => {
+      setActiveConversationId(conversationId);
+      void clearNotificationsForConversation(conversationId);
+      return () => setActiveConversationId(null);
+    }, [conversationId])
+  );
+
   // Incoming messages/receipts/reactions are decrypted and persisted globally
   // by MessagingProvider regardless of which chat is open — this screen just
   // re-reads from the local DB whenever that happens, and marks messages read
@@ -615,9 +632,9 @@ export default function ChatScreen({ route, navigation }: Props) {
 
   const sendPayload = useCallback(
     async (id: string, payload: MessagePayload) => {
-      if (!conversation) return;
+      if (!conversation || !email) return;
       try {
-        const identity = await getOrCreateIdentity();
+        const identity = await getOrCreateIdentity(email);
         await sodium.ready;
         const peerPublicKey = sodium.from_base64(conversation.peer_public_key);
         const { ciphertext, nonce } = await encryptMessage(
@@ -649,7 +666,7 @@ export default function ChatScreen({ route, navigation }: Props) {
         setMessages((prev) => prev.map((m) => (m.id === id ? { ...m, status: "failed" } : m)));
       }
     },
-    [conversation, conversationId]
+    [conversation, conversationId, email]
   );
 
   const sendEncrypted = useCallback(
@@ -970,13 +987,13 @@ export default function ChatScreen({ route, navigation }: Props) {
       setMyReaction(message.id, nextEmoji);
       setMessages((prev) => prev.map((m) => (m.id === message.id ? { ...m, reaction_mine: nextEmoji } : m)));
 
-      if (isTestBot || !conversation) return;
+      if (isTestBot || !conversation || !email) return;
       try {
         if (isClearing) {
           getSocket().emit("reaction:clear", { messageId: message.id, recipientId: conversationId });
           return;
         }
-        const identity = await getOrCreateIdentity();
+        const identity = await getOrCreateIdentity(email);
         await sodium.ready;
         const peerPublicKey = sodium.from_base64(conversation.peer_public_key);
         const payload: ReactionPayload = { emoji };
@@ -990,7 +1007,7 @@ export default function ChatScreen({ route, navigation }: Props) {
         console.warn("[chat] failed to send reaction", err);
       }
     },
-    [conversation, conversationId, isTestBot]
+    [conversation, conversationId, isTestBot, email]
   );
 
   const onDeleteForEveryone = useCallback(

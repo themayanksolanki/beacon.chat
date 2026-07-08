@@ -16,14 +16,16 @@ export interface Identity {
 }
 
 /**
- * Loads the on-device identity keypair, generating and persisting one on
- * first launch. The private key never leaves the device and is never sent
- * to the server.
+ * Loads the given account's on-device identity keypair, generating and
+ * persisting one the first time that account signs into this device. Each
+ * account gets its own keypair so two accounts on one device never share an
+ * identity. The private key never leaves the device and is never sent to
+ * the server.
  */
-export async function getOrCreateIdentity(): Promise<Identity> {
+export async function getOrCreateIdentity(accountKey: string): Promise<Identity> {
   await ensureReady();
 
-  const stored = await loadIdentityKeys();
+  const stored = await loadIdentityKeys(accountKey);
   if (stored) {
     return {
       publicKey: sodium.from_base64(stored.publicKey),
@@ -33,6 +35,7 @@ export async function getOrCreateIdentity(): Promise<Identity> {
 
   const keyPair = sodium.crypto_box_keypair();
   await saveIdentityKeys(
+    accountKey,
     sodium.to_base64(keyPair.publicKey),
     sodium.to_base64(keyPair.privateKey)
   );

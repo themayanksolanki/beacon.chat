@@ -70,6 +70,15 @@ export function logout(token: string) {
   return request<void>("/auth/logout", { method: "POST", token });
 }
 
+// Schedules the account for permanent deletion (see server's
+// ACCOUNT_DELETION_GRACE_MS); logging back in before then cancels it.
+export function requestAccountDeletion(token: string) {
+  return request<{ ok: true; deletionScheduledFor: number }>("/auth/account/delete", {
+    method: "POST",
+    token,
+  });
+}
+
 export interface LookupMatch {
   email: string;
   userId: string;

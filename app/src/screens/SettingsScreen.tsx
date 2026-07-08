@@ -1,5 +1,5 @@
-import { useMemo } from "react";
-import { Image, Pressable, StyleSheet, Text, View } from "react-native";
+import { useCallback, useMemo, useState } from "react";
+import { ActivityIndicator, Alert, Image, Pressable, StyleSheet, Text, View } from "react-native";
 import type { NativeStackScreenProps } from "@react-navigation/native-stack";
 import { Ionicons } from "@expo/vector-icons";
 
@@ -20,7 +20,39 @@ const APPEARANCE_OPTIONS: { value: ThemePreference; label: string }[] = [
 export default function SettingsScreen({ navigation }: Props) {
   const { colors, preference, setPreference } = useTheme();
   const styles = useMemo(() => createStyles(colors), [colors]);
-  const { profile, email, logout } = useAuth();
+  const { profile, email, logout, deleteAccount } = useAuth();
+  const [deleting, setDeleting] = useState(false);
+
+  const confirmDeleteAccount = useCallback(() => {
+    Alert.alert(
+      "Delete account",
+      "Your account and all messages will be permanently deleted in 48 hours. Log back in before then to cancel — after that, this can't be undone.",
+      [
+        { text: "Cancel", style: "cancel" },
+        {
+          text: "Delete account",
+          style: "destructive",
+          onPress: async () => {
+            setDeleting(true);
+            try {
+              await deleteAccount();
+            } catch {
+              setDeleting(false);
+              Alert.alert("Couldn't delete account", "Please check your connection and try again.");
+            }
+          },
+        },
+      ]
+    );
+  }, [deleteAccount]);
+
+  const openAccountMenu = useCallback(() => {
+    Alert.alert("Account", email ?? undefined, [
+      { text: "Cancel", style: "cancel" },
+      { text: "Log out", onPress: () => logout() },
+      { text: "Delete account", style: "destructive", onPress: confirmDeleteAccount },
+    ]);
+  }, [email, logout, confirmDeleteAccount]);
 
   return (
     <View style={styles.container}>
@@ -58,9 +90,16 @@ export default function SettingsScreen({ navigation }: Props) {
       </View>
 
       <View style={styles.section}>
-        <Pressable style={styles.row} onPress={() => logout()}>
-          <Ionicons name="log-out-outline" size={20} color={colors.danger} />
-          <Text style={styles.logout}>Log out</Text>
+        <Pressable style={styles.accountRow} onPress={openAccountMenu} disabled={deleting}>
+          <View style={styles.accountRowLeft}>
+            <Ionicons name="person-circle-outline" size={20} color={colors.text} />
+            <Text style={styles.rowLabel}>Account</Text>
+          </View>
+          {deleting ? (
+            <ActivityIndicator size="small" color={colors.textTertiary} />
+          ) : (
+            <Ionicons name="chevron-forward" size={20} color={colors.textTertiary} />
+          )}
         </Pressable>
       </View>
     </View>
@@ -84,19 +123,24 @@ const createStyles = (colors: ThemeColors) =>
       paddingVertical: 14,
       gap: 12,
     },
-    row: {
-      flexDirection: "row",
-      alignItems: "center",
-      paddingHorizontal: 16,
-      paddingVertical: 14,
-      gap: 10,
-    },
     optionRow: {
       flexDirection: "row",
       alignItems: "center",
       justifyContent: "space-between",
       paddingHorizontal: 16,
       paddingVertical: 14,
+    },
+    accountRow: {
+      flexDirection: "row",
+      alignItems: "center",
+      justifyContent: "space-between",
+      paddingHorizontal: 16,
+      paddingVertical: 14,
+    },
+    accountRowLeft: {
+      flexDirection: "row",
+      alignItems: "center",
+      gap: 10,
     },
     sectionTitle: {
       fontSize: 13,
@@ -113,5 +157,4 @@ const createStyles = (colors: ThemeColors) =>
     info: { flex: 1 },
     name: { fontSize: 16, fontWeight: "600", color: colors.text },
     email: { fontSize: 13, color: colors.textSecondary, marginTop: 2 },
-    logout: { fontSize: 16, color: colors.danger, fontWeight: "500" },
   });

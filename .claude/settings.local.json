@@ -104,7 +104,8 @@
       "Bash(kill 3987 3962 3960)",
       "Bash(kill 7639)",
       "Bash(awk '$3==9980')",
-      "Bash(kill 9955 9957 9980 10615)"
+      "Bash(kill 9955 9957 9980 10615)",
+      "Bash(lsof -iTCP -sTCP:LISTEN -P)"
     ]
   }
 }

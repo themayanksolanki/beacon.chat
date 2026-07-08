@@ -29,7 +29,7 @@ import { AuthProvider, useAuth } from "./src/auth/AuthContext";
 import { MessagingProvider } from "./src/messaging/MessagingContext";
 import { PresenceProvider } from "./src/presence/PresenceContext";
 import { CallProvider } from "./src/calls/CallContext";
-import { navigationRef } from "./src/navigation/navigationRef";
+import { flushPendingNavigation, navigationRef } from "./src/navigation/navigationRef";
 import { ThemeProvider, useTheme } from "./src/ThemeContext";
 
 export type AuthStackParamList = {
@@ -177,7 +177,11 @@ function ThemedNavigationContainer() {
   const { scheme } = useTheme();
 
   return (
-    <NavigationContainer ref={navigationRef} theme={scheme === "dark" ? NavDarkTheme : NavDefaultTheme}>
+    <NavigationContainer
+      ref={navigationRef}
+      onReady={flushPendingNavigation}
+      theme={scheme === "dark" ? NavDarkTheme : NavDefaultTheme}
+    >
       <RootNavigator />
       <StatusBar style={scheme === "dark" ? "light" : "dark"} />
     </NavigationContainer>

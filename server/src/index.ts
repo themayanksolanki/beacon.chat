@@ -4,8 +4,10 @@ import { createApp } from "./app";
 import { createSocketServer } from "./socketServer";
 import { initDatabase } from "./db";
 import { connectMongo } from "./mongo";
+import { startAccountDeletionSweep } from "./accountDeletion";
 
 initDatabase();
+startAccountDeletionSweep();
 
 const app = createApp();
 const httpServer = createServer(app);

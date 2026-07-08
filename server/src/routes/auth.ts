@@ -8,6 +8,7 @@ import { requireAuth, signToken, type AuthedRequest } from "../auth";
 import { revokeOtherSessions } from "../socketServer";
 import { generateOtp, hashOtp, otpHashesMatch, MAX_ATTEMPTS, OTP_TTL_MS } from "../otp";
 import { sendOtpEmail } from "../email";
+import { cancelDeletionIfPending, requestDeletion } from "../accountDeletion";
 
 export const authRouter = Router();
 
@@ -109,6 +110,9 @@ async function issueSession(email: string, publicKey: string): Promise<{ token: 
   let user: UserRow | undefined = db.select().from(users).where(eq(users.email, email)).get();
 
   if (user) {
+    // A successful login cancels any pending account deletion — see
+    // accountDeletion.ts. Harmless no-op if none was pending.
+    cancelDeletionIfPending(user.id);
     db.update(users)
       .set({ public_key: publicKey, current_session_id: sessionId })
       .where(eq(users.id, user.id))
@@ -125,7 +129,15 @@ async function issueSession(email: string, publicKey: string): Promise<{ token: 
         last_seen_at: null,
       })
       .run();
-    user = { id, email, public_key: publicKey, current_session_id: sessionId, created_at: Date.now(), last_seen_at: null };
+    user = {
+      id,
+      email,
+      public_key: publicKey,
+      current_session_id: sessionId,
+      created_at: Date.now(),
+      last_seen_at: null,
+      deletion_requested_at: null,
+    };
   }
 
   await revokeOtherSessions(user.id);
@@ -161,4 +173,16 @@ authRouter.get("/session", requireAuth, (req: AuthedRequest, res) => {
 authRouter.post("/logout", requireAuth, (req: AuthedRequest, res) => {
   db.update(users).set({ current_session_id: null }).where(eq(users.id, req.user!.userId)).run();
   res.status(204).end();
+});
+
+/**
+ * Schedules the account for permanent deletion after ACCOUNT_DELETION_GRACE_MS
+ * and revokes this session immediately (same effect as logout). Logging back
+ * in before the grace period elapses cancels the deletion — see
+ * cancelDeletionIfPending in issueSession above.
+ */
+authRouter.post("/account/delete", requireAuth, async (req: AuthedRequest, res) => {
+  const deletionScheduledFor = requestDeletion(req.user!.userId);
+  await revokeOtherSessions(req.user!.userId);
+  res.status(200).json({ ok: true, deletionScheduledFor });
 });

@@ -11,6 +11,11 @@ export const users = sqliteTable("users", {
   current_session_id: text("current_session_id"),
   created_at: integer("created_at").notNull(),
   last_seen_at: integer("last_seen_at"),
+  // Set when the user requests account deletion; cleared if they log back in
+  // before the grace period elapses (see accountDeletion.ts). A background
+  // sweep permanently purges any account whose deletion was requested more
+  // than ACCOUNT_DELETION_GRACE_MS ago.
+  deletion_requested_at: integer("deletion_requested_at"),
 });
 
 export const otpChallenges = sqliteTable(

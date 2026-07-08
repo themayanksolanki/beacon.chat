@@ -1,27 +1,40 @@
 import * as SecureStore from "expo-secure-store";
 
-const PRIVATE_KEY_ALIAS = "beacon.identity.privateKey";
-const PUBLIC_KEY_ALIAS = "beacon.identity.publicKey";
+import { sanitizeAccountKey } from "./accountKey";
 
 const secureOptions: SecureStore.SecureStoreOptions = {
   keychainAccessible: SecureStore.WHEN_UNLOCKED_THIS_DEVICE_ONLY,
 };
 
-export async function saveIdentityKeys(publicKey: string, privateKey: string) {
-  await SecureStore.setItemAsync(PUBLIC_KEY_ALIAS, publicKey, secureOptions);
-  await SecureStore.setItemAsync(PRIVATE_KEY_ALIAS, privateKey, secureOptions);
+// Keys are namespaced per account so two accounts signed into the same
+// device get distinct keypairs — otherwise they'd share one identity and
+// each could decrypt ciphertext addressed to the other's public key.
+function aliasesFor(accountKey: string) {
+  const key = sanitizeAccountKey(accountKey);
+  return {
+    publicKey: `beacon.identity.${key}.publicKey`,
+    privateKey: `beacon.identity.${key}.privateKey`,
+  };
 }
 
-export async function loadIdentityKeys() {
+export async function saveIdentityKeys(accountKey: string, publicKey: string, privateKey: string) {
+  const alias = aliasesFor(accountKey);
+  await SecureStore.setItemAsync(alias.publicKey, publicKey, secureOptions);
+  await SecureStore.setItemAsync(alias.privateKey, privateKey, secureOptions);
+}
+
+export async function loadIdentityKeys(accountKey: string) {
+  const alias = aliasesFor(accountKey);
   const [publicKey, privateKey] = await Promise.all([
-    SecureStore.getItemAsync(PUBLIC_KEY_ALIAS, secureOptions),
-    SecureStore.getItemAsync(PRIVATE_KEY_ALIAS, secureOptions),
+    SecureStore.getItemAsync(alias.publicKey, secureOptions),
+    SecureStore.getItemAsync(alias.privateKey, secureOptions),
   ]);
   if (!publicKey || !privateKey) return null;
   return { publicKey, privateKey };
 }
 
-export async function clearIdentityKeys() {
-  await SecureStore.deleteItemAsync(PUBLIC_KEY_ALIAS, secureOptions);
-  await SecureStore.deleteItemAsync(PRIVATE_KEY_ALIAS, secureOptions);
+export async function clearIdentityKeys(accountKey: string) {
+  const alias = aliasesFor(accountKey);
+  await SecureStore.deleteItemAsync(alias.publicKey, secureOptions);
+  await SecureStore.deleteItemAsync(alias.privateKey, secureOptions);
 }
