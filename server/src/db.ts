@@ -67,6 +67,33 @@ export function initDatabase() {
 
     CREATE INDEX IF NOT EXISTS idx_reactions_recipient
       ON reactions(recipient_id, delivered_at);
+
+    -- Gates message:send/reaction:set/call:invite: two users may only
+    -- exchange messages or calls once their row here is 'accepted'. One row
+    -- per pair, canonically ordered (user_a_id < user_b_id) — see contacts.ts.
+    CREATE TABLE IF NOT EXISTS contacts (
+      id TEXT PRIMARY KEY NOT NULL,
+      user_a_id TEXT NOT NULL,
+      user_b_id TEXT NOT NULL,
+      status TEXT NOT NULL CHECK (status IN ('pending', 'accepted', 'rejected')),
+      requested_by TEXT NOT NULL,
+      created_at INTEGER NOT NULL,
+      responded_at INTEGER,
+      FOREIGN KEY (user_a_id) REFERENCES users(id),
+      FOREIGN KEY (user_b_id) REFERENCES users(id)
+    );
+
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_contacts_pair ON contacts(user_a_id, user_b_id);
+
+    CREATE TABLE IF NOT EXISTS reports (
+      id TEXT PRIMARY KEY NOT NULL,
+      reporter_id TEXT NOT NULL,
+      reported_id TEXT NOT NULL,
+      reason TEXT,
+      created_at INTEGER NOT NULL,
+      FOREIGN KEY (reporter_id) REFERENCES users(id),
+      FOREIGN KEY (reported_id) REFERENCES users(id)
+    );
   `);
 
   // read_at was added after the messages table already shipped; guard the

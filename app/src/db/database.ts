@@ -116,13 +116,19 @@ function runMigrations() {
     }
   }
 
-  // avatar_url was added after this table already shipped to earlier test
-  // installs — same guard as above, for conversations instead of messages.
+  // avatar_url/status were added after this table already shipped to earlier
+  // test installs — same guard as above, for conversations instead of
+  // messages. status defaults to 'accepted' so every pre-existing
+  // conversation keeps working unchanged (mirrors the server-side backfill
+  // in contacts.ts).
   const existingConversationColumns = new Set(
     db.getAllSync<{ name: string }>(`PRAGMA table_info(conversations)`).map((c) => c.name)
   );
   if (!existingConversationColumns.has("avatar_url")) {
     db.execSync(`ALTER TABLE conversations ADD COLUMN avatar_url TEXT`);
+  }
+  if (!existingConversationColumns.has("status")) {
+    db.execSync(`ALTER TABLE conversations ADD COLUMN status TEXT NOT NULL DEFAULT 'accepted'`);
   }
 }
 
@@ -270,12 +276,20 @@ export function markMessageDeletedEverywhere(id: string, deletedAt: number): voi
   );
 }
 
+// 'accepted' is both the legacy default (conversations that predate this
+// column) and the state after a contact request is accepted. 'declined' is
+// only ever seen on the requester's side — once the recipient decides
+// (accept/decline), their own row is deleted rather than left declined, see
+// contactRequests.ts.
+export type ConversationStatus = "accepted" | "pending_outgoing" | "pending_incoming" | "declined";
+
 export interface ConversationRow {
   id: string;
   peer_public_key: string;
   display_name: string | null;
   avatar_url: string | null;
   created_at: number;
+  status: ConversationStatus;
 }
 
 export function getConversations(): ConversationRow[] {
@@ -322,15 +336,23 @@ export function getConversationById(id: string): ConversationRow | null {
 // existing row before either one inserts.
 export function insertConversation(conversation: ConversationRow): void {
   db.runSync(
-    `INSERT OR IGNORE INTO conversations (id, peer_public_key, display_name, avatar_url, created_at) VALUES (?, ?, ?, ?, ?)`,
+    `INSERT OR IGNORE INTO conversations (id, peer_public_key, display_name, avatar_url, created_at, status) VALUES (?, ?, ?, ?, ?, ?)`,
     [
       conversation.id,
       conversation.peer_public_key,
       conversation.display_name,
       conversation.avatar_url,
       conversation.created_at,
+      conversation.status,
     ]
   );
+}
+
+// Flips a conversation's request-gate state (e.g. their contact request was
+// accepted/declined, or ours was) — see contactRequests.ts and
+// MessagingContext's contact:accepted/contact:declined handlers.
+export function setConversationStatus(id: string, status: ConversationStatus): void {
+  db.runSync(`UPDATE conversations SET status = ? WHERE id = ?`, [status, id]);
 }
 
 // Refreshes a peer's cached name/avatar for an existing conversation (e.g.

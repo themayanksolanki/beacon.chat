@@ -14,6 +14,7 @@ import {
   userExists,
 } from "./messages";
 import { getLastSeen, setLastSeen } from "./presence";
+import { acceptContact, isAcceptedContact, rejectContact, requestContact, type RejectAction } from "./contacts";
 
 interface AuthedSocket extends Socket {
   userId?: string;
@@ -122,6 +123,10 @@ export function createSocketServer(httpServer: HttpServer): Server {
             ack?.({ ok: false, error: "recipient_not_found" });
             return;
           }
+          if (!isAcceptedContact(userId, payload.recipientId)) {
+            ack?.({ ok: false, error: "not_contacts" });
+            return;
+          }
 
           const message = storeMessage({
             id: payload.id,
@@ -187,6 +192,10 @@ export function createSocketServer(httpServer: HttpServer): Server {
         try {
           if (!userExists(payload.recipientId)) {
             ack?.({ ok: false, error: "recipient_not_found" });
+            return;
+          }
+          if (!isAcceptedContact(userId, payload.recipientId)) {
+            ack?.({ ok: false, error: "not_contacts" });
             return;
           }
           const reaction = setReaction({
@@ -260,6 +269,98 @@ export function createSocketServer(httpServer: HttpServer): Server {
       }
     });
 
+    // --- Recording indicators ---
+    // Same pure ephemeral relay pattern as typing above — no server-side state.
+
+    socket.on("recording:start", (payload: { recipientId: string }) => {
+      try {
+        io!.to(payload.recipientId).emit("recording:update", { userId, recording: true });
+      } catch (err) {
+        console.error("[socket] recording:start failed", err);
+      }
+    });
+
+    socket.on("recording:stop", (payload: { recipientId: string }) => {
+      try {
+        io!.to(payload.recipientId).emit("recording:update", { userId, recording: false });
+      } catch (err) {
+        console.error("[socket] recording:stop failed", err);
+      }
+    });
+
+    // --- Contact requests (gate for message:send/reaction:set/call:invite above) ---
+
+    socket.on(
+      "contact:request",
+      (payload: { recipientId: string }, ack?: (response: { ok: true; status: "pending" | "accepted" } | { ok: false; error: string }) => void) => {
+        try {
+          if (payload.recipientId === userId) {
+            ack?.({ ok: false, error: "invalid_recipient" });
+            return;
+          }
+          if (!userExists(payload.recipientId)) {
+            ack?.({ ok: false, error: "recipient_not_found" });
+            return;
+          }
+          const result = requestContact(userId, payload.recipientId);
+          if (result.status === "accepted") {
+            // Mutual: the recipient had already requested us — tell them
+            // their own pending outgoing request just became accepted.
+            io!.to(payload.recipientId).emit("contact:accepted", { peerId: userId });
+          } else {
+            io!.to(payload.recipientId).emit("contact:request", { requesterId: userId });
+          }
+          ack?.({ ok: true, status: result.status });
+        } catch (err) {
+          console.error("[socket] contact:request failed", err);
+          ack?.({ ok: false, error: "internal_error" });
+        }
+      }
+    );
+
+    socket.on(
+      "contact:accept",
+      (payload: { requesterId: string }, ack?: (response: { ok: true } | { ok: false; error: string }) => void) => {
+        try {
+          const result = acceptContact(payload.requesterId, userId);
+          if (!result.ok) {
+            ack?.({ ok: false, error: result.error });
+            return;
+          }
+          io!.to(payload.requesterId).emit("contact:accepted", { peerId: userId });
+          ack?.({ ok: true });
+        } catch (err) {
+          console.error("[socket] contact:accept failed", err);
+          ack?.({ ok: false, error: "internal_error" });
+        }
+      }
+    );
+
+    socket.on(
+      "contact:reject",
+      (
+        payload: { requesterId: string; action: RejectAction; reason?: string },
+        ack?: (response: { ok: true } | { ok: false; error: string }) => void
+      ) => {
+        try {
+          const result = rejectContact(payload.requesterId, userId, payload.action, payload.reason);
+          if (!result.ok) {
+            ack?.({ ok: false, error: result.error });
+            return;
+          }
+          // Block/report stay silent to the requester — only a plain decline
+          // is relayed back, so a report/block never tips off the sender.
+          if (payload.action === "none") {
+            io!.to(payload.requesterId).emit("contact:declined", { peerId: userId });
+          }
+          ack?.({ ok: true });
+        } catch (err) {
+          console.error("[socket] contact:reject failed", err);
+          ack?.({ ok: false, error: "internal_error" });
+        }
+      }
+    );
+
     // --- Calling (WebRTC signaling relay only — no media touches this server) ---
 
     socket.on(
@@ -271,6 +372,10 @@ export function createSocketServer(httpServer: HttpServer): Server {
         try {
           if (!userExists(payload.calleeId)) {
             ack?.({ ok: false, error: "recipient_not_found" });
+            return;
+          }
+          if (!isAcceptedContact(userId, payload.calleeId)) {
+            ack?.({ ok: false, error: "not_contacts" });
             return;
           }
           if (userActiveCall.has(userId) || userActiveCall.has(payload.calleeId)) {

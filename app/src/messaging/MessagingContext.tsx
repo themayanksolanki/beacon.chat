@@ -13,6 +13,7 @@ import {
   markMessageDeletedEverywhere,
   markMessageDelivered,
   markMessageRead,
+  setConversationStatus,
   setPeerReaction,
   updateConversationPeerKey,
   type ConversationRow,
@@ -111,12 +112,17 @@ export function MessagingProvider({ children }: { children: ReactNode }) {
       if (existing) return existing;
       try {
         const peer = await getUserById(token, peerId);
+        // A message/reaction can only arrive here at all if the server's
+        // message:send/reaction:set gate already confirmed an accepted
+        // contact relationship — this path now only fires for local-data-
+        // loss cases (e.g. reinstall), never a genuine stranger.
         const conversation: ConversationRow = {
           id: peer.userId,
           peer_public_key: peer.publicKey,
           display_name: peer.name,
           avatar_url: peer.avatarUrl,
           created_at: Date.now(),
+          status: "accepted",
         };
         insertConversation(conversation);
         return getConversationById(peerId);
@@ -253,12 +259,52 @@ export function MessagingProvider({ children }: { children: ReactNode }) {
       bump();
     };
 
+    // Someone else's contact:request/accept/reject relayed to us — see
+    // socketServer.ts. These mutate the same conversations table as
+    // messages, hence living here rather than a separate context.
+    const onContactRequest = async ({ requesterId }: { requesterId: string }) => {
+      if (isUserBlocked(requesterId)) return;
+      const existing = getConversationById(requesterId);
+      if (existing) {
+        if (existing.status !== "accepted") setConversationStatus(requesterId, "pending_incoming");
+        bump();
+        return;
+      }
+      try {
+        const peer = await getUserById(token, requesterId);
+        insertConversation({
+          id: peer.userId,
+          peer_public_key: peer.publicKey,
+          display_name: peer.name,
+          avatar_url: peer.avatarUrl,
+          created_at: Date.now(),
+          status: "pending_incoming",
+        });
+        bump();
+      } catch (err) {
+        console.warn("[messaging] failed to resolve contact request sender", err);
+      }
+    };
+
+    const onContactAccepted = ({ peerId }: { peerId: string }) => {
+      setConversationStatus(peerId, "accepted");
+      bump();
+    };
+
+    const onContactDeclined = ({ peerId }: { peerId: string }) => {
+      setConversationStatus(peerId, "declined");
+      bump();
+    };
+
     socket.on("message", onMessage);
     socket.on("message:delivered", onDelivered);
     socket.on("message:read", onRead);
     socket.on("message:deleted", onDeletedRemote);
     socket.on("reaction:set", onReactionSet);
     socket.on("reaction:cleared", onReactionCleared);
+    socket.on("contact:request", onContactRequest);
+    socket.on("contact:accepted", onContactAccepted);
+    socket.on("contact:declined", onContactDeclined);
     return () => {
       socket.off("message", onMessage);
       socket.off("message:delivered", onDelivered);
@@ -266,6 +312,9 @@ export function MessagingProvider({ children }: { children: ReactNode }) {
       socket.off("message:deleted", onDeletedRemote);
       socket.off("reaction:set", onReactionSet);
       socket.off("reaction:cleared", onReactionCleared);
+      socket.off("contact:request", onContactRequest);
+      socket.off("contact:accepted", onContactAccepted);
+      socket.off("contact:declined", onContactDeclined);
     };
   }, [token, email]);
 

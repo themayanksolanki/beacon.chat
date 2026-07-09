@@ -16,6 +16,7 @@ export function ensureTestBotConversation() {
       display_name: TEST_BOT_NAME,
       avatar_url: null,
       created_at: Date.now(),
+      status: "accepted",
     });
   }
 }

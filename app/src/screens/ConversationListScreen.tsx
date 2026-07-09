@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { FlatList, Image, Pressable, StyleSheet, Text, View } from "react-native";
+import { Alert, FlatList, Image, Pressable, StyleSheet, Text, View } from "react-native";
 import { useFocusEffect } from "@react-navigation/native";
 import type { BottomTabScreenProps } from "@react-navigation/bottom-tabs";
 import type { CompositeScreenProps } from "@react-navigation/native";
@@ -7,6 +7,7 @@ import type { NativeStackScreenProps } from "@react-navigation/native-stack";
 import { Ionicons } from "@expo/vector-icons";
 
 import type { MainStackParamList, MainTabParamList } from "../../App";
+import { acceptContactRequest, rejectContactRequest } from "../chat/contactRequests";
 import { deleteConversation } from "../chat/deleteConversation";
 import MessageActionMenu, { type MessageAction, type MessageMenuAnchor } from "../components/MessageActionMenu";
 import { blockUser, getConversationSummaries, type ConversationSummary } from "../db/database";
@@ -79,6 +80,40 @@ export default function ConversationListScreen({ navigation }: Props) {
     navigation.navigate("Chat", { conversationId: TEST_BOT_CONVERSATION_ID });
   };
 
+  const handleAccept = useCallback(async (peerId: string) => {
+    const ok = await acceptContactRequest(peerId);
+    if (!ok) Alert.alert("Couldn't accept", "Please try again.");
+    setConversations(getConversationSummaries());
+  }, []);
+
+  const handleReject = useCallback((peerId: string, name: string) => {
+    Alert.alert("Decline this request?", `Choose what to do about ${name}.`, [
+      {
+        text: "Report",
+        style: "destructive",
+        onPress: async () => {
+          await rejectContactRequest(peerId, "report");
+          setConversations(getConversationSummaries());
+        },
+      },
+      {
+        text: "Block",
+        style: "destructive",
+        onPress: async () => {
+          await rejectContactRequest(peerId, "block");
+          setConversations(getConversationSummaries());
+        },
+      },
+      {
+        text: "No action",
+        onPress: async () => {
+          await rejectContactRequest(peerId, "none");
+          setConversations(getConversationSummaries());
+        },
+      },
+    ]);
+  }, []);
+
   const showChatOptions = useCallback((conversationId: string, anchor: MessageMenuAnchor) => {
     setMenu({
       anchor,
@@ -139,6 +174,8 @@ export default function ConversationListScreen({ navigation }: Props) {
               styles={styles}
               onPress={() => navigation.navigate("Chat", { conversationId: item.id })}
               onLongPressAt={(anchor) => showChatOptions(item.id, anchor)}
+              onAccept={() => handleAccept(item.id)}
+              onReject={() => handleReject(item.id, item.display_name ?? "this person")}
             />
           )}
         />
@@ -161,6 +198,8 @@ function ConversationRow({
   styles,
   onPress,
   onLongPressAt,
+  onAccept,
+  onReject,
 }: {
   item: ConversationSummary;
   isOnline: boolean;
@@ -168,6 +207,8 @@ function ConversationRow({
   styles: ReturnType<typeof createStyles>;
   onPress: () => void;
   onLongPressAt: (anchor: MessageMenuAnchor) => void;
+  onAccept: () => void;
+  onReject: () => void;
 }) {
   const rowRef = useRef<View>(null);
   const name = item.display_name ?? "Unknown";
@@ -206,17 +247,51 @@ function ConversationRow({
           ) : null}
         </View>
         <View style={styles.rowBottom}>
-          <View style={styles.previewRow}>
-            <PreviewReceiptTick item={item} colors={colors} />
-            <Text style={[styles.preview, hasUnread && styles.previewUnread]} numberOfLines={1}>
-              {item.last_message ?? "No messages yet"}
+          {item.status === "pending_incoming" ? (
+            <>
+              <Text style={styles.requestLabel} numberOfLines={1}>
+                Wants to message you
+              </Text>
+              <View style={styles.requestActions}>
+                <Pressable
+                  style={[styles.requestButton, styles.requestButtonAccept]}
+                  onPress={onAccept}
+                  hitSlop={6}
+                >
+                  <Ionicons name="checkmark" size={16} color={colors.tickRead} />
+                </Pressable>
+                <Pressable
+                  style={[styles.requestButton, styles.requestButtonReject]}
+                  onPress={onReject}
+                  hitSlop={6}
+                >
+                  <Ionicons name="close" size={16} color={colors.danger} />
+                </Pressable>
+              </View>
+            </>
+          ) : item.status === "pending_outgoing" ? (
+            <Text style={styles.requestLabel} numberOfLines={1}>
+              Request sent
             </Text>
-          </View>
-          {hasUnread ? (
-            <View style={styles.badge}>
-              <Text style={styles.badgeText}>{item.unread_count > 99 ? "99+" : item.unread_count}</Text>
-            </View>
-          ) : null}
+          ) : item.status === "declined" ? (
+            <Text style={styles.requestLabel} numberOfLines={1}>
+              Declined
+            </Text>
+          ) : (
+            <>
+              <View style={styles.previewRow}>
+                <PreviewReceiptTick item={item} colors={colors} />
+                <Text style={[styles.preview, hasUnread && styles.previewUnread]} numberOfLines={1}>
+                  {item.last_message ?? "No messages yet"}
+                </Text>
+              </View>
+              {hasUnread ? (
+                <View style={styles.badge}>
+                  <Text style={styles.badgeText}>{item.unread_count > 99 ? "99+" : item.unread_count}</Text>
+                </View>
+              ) : null}
+            </>
+          )}
         </View>
       </View>
     </Pressable>
@@ -302,4 +377,16 @@ const createStyles = (colors: ThemeColors) =>
       paddingHorizontal: 6,
     },
     badgeText: { color: "#fff", fontSize: 12, fontWeight: "700" },
+    requestLabel: { flex: 1, fontSize: 14, color: colors.textTertiary, fontStyle: "italic" },
+    requestActions: { flexDirection: "row", gap: 8 },
+    requestButton: {
+      width: 28,
+      height: 28,
+      borderRadius: 14,
+      alignItems: "center",
+      justifyContent: "center",
+      borderWidth: 1,
+    },
+    requestButtonAccept: { backgroundColor: colors.tickRead + "22", borderColor: colors.tickRead },
+    requestButtonReject: { backgroundColor: colors.danger + "22", borderColor: colors.danger },
   });

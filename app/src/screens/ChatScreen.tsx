@@ -28,6 +28,7 @@ import { getUserById } from "../api/client";
 import { useAuth } from "../auth/AuthContext";
 import { useVoiceRecorder, type RecordedVoice } from "../audio/useVoiceRecorder";
 import { clearConversation } from "../chat/clearConversation";
+import { acceptContactRequest, rejectContactRequest } from "../chat/contactRequests";
 import { deleteConversation } from "../chat/deleteConversation";
 import { persistRecordedVoice, readVoiceMessageBase64 } from "../audio/voiceStorage";
 import ImageMessageBubble from "../components/ImageMessageBubble";
@@ -86,6 +87,8 @@ const TYPING_STOP_DELAY_MS = 2500;
 // Safety net on the receiving side: clears a stuck "typing…" indicator if a
 // typing:stop never arrives (peer's app crashed, lost network, etc).
 const TYPING_RECEIVE_TIMEOUT_MS = 6000;
+// Same safety net, for the peer-is-recording indicator.
+const RECORDING_RECEIVE_TIMEOUT_MS = 6000;
 
 function truncate(text: string) {
   return text.length > REPLY_PREVIEW_MAX_LENGTH ? `${text.slice(0, REPLY_PREVIEW_MAX_LENGTH)}…` : text;
@@ -128,14 +131,12 @@ function ChatHeaderTitle({
   avatarUrl,
   online,
   lastSeenAt,
-  typing,
   onPress,
 }: {
   name: string;
   avatarUrl: string | null;
   online: boolean;
   lastSeenAt: number | null;
-  typing: boolean;
   onPress: () => void;
 }) {
   const { colors } = useTheme();
@@ -161,11 +162,7 @@ function ChatHeaderTitle({
         <Text style={styles.headerName} numberOfLines={1}>
           {name}
         </Text>
-        {typing ? (
-          <Text style={styles.headerStatusOnline} numberOfLines={1}>
-            typing…
-          </Text>
-        ) : online ? (
+        {online ? (
           <Text style={styles.headerStatusOnline} numberOfLines={1}>
             Active now
           </Text>
@@ -179,18 +176,59 @@ function ChatHeaderTitle({
   );
 }
 
-function ChatHeaderCallButtons({ conversationId }: { conversationId: string }) {
+function ChatHeaderCallButtons({ conversationId, disabled }: { conversationId: string; disabled: boolean }) {
   const { colors } = useTheme();
   const { startCall } = useCall();
+  const iconColor = disabled ? colors.textTertiary : colors.accent;
 
   return (
     <View style={{ flexDirection: "row", gap: 18 }}>
-      <Pressable onPress={() => startCall(conversationId, "audio")} hitSlop={8}>
-        <Ionicons name="call-outline" size={22} color={colors.accent} />
+      <Pressable onPress={() => startCall(conversationId, "audio")} disabled={disabled} hitSlop={8}>
+        <Ionicons name="call-outline" size={22} color={iconColor} />
       </Pressable>
-      <Pressable onPress={() => startCall(conversationId, "video")} hitSlop={8}>
-        <Ionicons name="videocam-outline" size={24} color={colors.accent} />
+      <Pressable onPress={() => startCall(conversationId, "video")} disabled={disabled} hitSlop={8}>
+        <Ionicons name="videocam-outline" size={24} color={iconColor} />
       </Pressable>
+    </View>
+  );
+}
+
+/** Replaces the message composer while a contact request is unresolved — see ConversationStatus. */
+function RequestActionBanner({
+  status,
+  peerName,
+  onAccept,
+  onReject,
+}: {
+  status: "pending_outgoing" | "pending_incoming" | "declined";
+  peerName: string;
+  onAccept: () => void;
+  onReject: () => void;
+}) {
+  const { colors } = useTheme();
+  const styles = useMemo(() => createStyles(colors), [colors]);
+
+  if (status === "pending_incoming") {
+    return (
+      <View style={styles.requestBanner}>
+        <Text style={styles.requestBannerText}>{peerName} wants to message you.</Text>
+        <View style={styles.requestBannerActions}>
+          <Pressable style={[styles.requestBannerButton, styles.requestBannerReject]} onPress={onReject}>
+            <Text style={[styles.requestBannerButtonText, { color: colors.danger }]}>Decline</Text>
+          </Pressable>
+          <Pressable style={[styles.requestBannerButton, styles.requestBannerAccept]} onPress={onAccept}>
+            <Text style={[styles.requestBannerButtonText, { color: "#fff" }]}>Accept</Text>
+          </Pressable>
+        </View>
+      </View>
+    );
+  }
+
+  return (
+    <View style={styles.requestBanner}>
+      <Text style={styles.requestBannerText}>
+        {status === "pending_outgoing" ? "Request sent — waiting for them to accept." : "This request was declined."}
+      </Text>
     </View>
   );
 }
@@ -749,6 +787,23 @@ export default function ChatScreen({ route, navigation }: Props) {
     navigation.goBack();
   }, [conversationId, navigation]);
 
+  const onAcceptRequest = useCallback(async () => {
+    const ok = await acceptContactRequest(conversationId);
+    if (!ok) {
+      Alert.alert("Couldn't accept", "Please try again.");
+      return;
+    }
+    setConversation(getConversationById(conversationId));
+  }, [conversationId]);
+
+  const onRejectRequest = useCallback(() => {
+    Alert.alert("Decline this request?", `Choose what to do about ${conversation?.display_name ?? "this person"}.`, [
+      { text: "Report", style: "destructive", onPress: () => void rejectContactRequest(conversationId, "report").then(() => navigation.goBack()) },
+      { text: "Block", style: "destructive", onPress: () => void rejectContactRequest(conversationId, "block").then(() => navigation.goBack()) },
+      { text: "No action", onPress: () => void rejectContactRequest(conversationId, "none").then(() => navigation.goBack()) },
+    ]);
+  }, [conversationId, conversation?.display_name, navigation]);
+
   useLayoutEffect(() => {
     const name = conversation?.display_name ?? "Chat";
     navigation.setOptions({
@@ -766,7 +821,6 @@ export default function ChatScreen({ route, navigation }: Props) {
               avatarUrl={conversation?.avatar_url ?? null}
               online={peerPresence?.online ?? false}
               lastSeenAt={peerPresence?.lastSeenAt ?? null}
-              typing={peerTyping}
               onPress={() => navigation.navigate("ContactInfo", { conversationId })}
             />
           ),
@@ -774,7 +828,7 @@ export default function ChatScreen({ route, navigation }: Props) {
         ? undefined
         : () => (
             <View style={{ flexDirection: "row", alignItems: "center" }}>
-              <ChatHeaderCallButtons conversationId={conversationId} />
+              <ChatHeaderCallButtons conversationId={conversationId} disabled={conversation?.status !== "accepted"} />
               <ChatHeaderOptionsButton
                 onClearChat={onClearChat}
                 onDeleteChat={onDeleteChat}
@@ -788,9 +842,9 @@ export default function ChatScreen({ route, navigation }: Props) {
     navigation,
     conversation?.display_name,
     conversation?.avatar_url,
+    conversation?.status,
     isTestBot,
     peerPresence,
-    peerTyping,
     conversationId,
     onClearChat,
     onDeleteChat,
@@ -1095,6 +1149,64 @@ export default function ChatScreen({ route, navigation }: Props) {
 
   const voiceRecorder = useVoiceRecorder(onVoiceRecorded);
 
+  // --- Recording indicator (peer is recording a voice note) ---
+  // Mirrors the typing indicator above: pure ephemeral relay, no debounce
+  // needed since voiceRecorder.isRecording is already a clean boolean.
+
+  const [peerRecording, setPeerRecording] = useState(false);
+  const isRecordingActiveRef = useRef(false);
+  const peerRecordingTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const stopRecordingNow = useCallback(() => {
+    if (isRecordingActiveRef.current) {
+      isRecordingActiveRef.current = false;
+      if (!isTestBot) getSocket().emit("recording:stop", { recipientId: conversationId });
+    }
+  }, [conversationId, isTestBot]);
+
+  useEffect(() => {
+    if (isTestBot) return;
+    if (voiceRecorder.isRecording) {
+      if (!isRecordingActiveRef.current) {
+        isRecordingActiveRef.current = true;
+        getSocket().emit("recording:start", { recipientId: conversationId });
+      }
+    } else {
+      stopRecordingNow();
+    }
+  }, [voiceRecorder.isRecording, conversationId, isTestBot, stopRecordingNow]);
+
+  // Stop telling the peer we're recording if this chat loses focus mid-recording.
+  useFocusEffect(
+    useCallback(() => {
+      return () => stopRecordingNow();
+    }, [stopRecordingNow])
+  );
+
+  // Peer's recording:update pushes straight into local state, same pattern
+  // as typing:update above.
+  useEffect(() => {
+    if (isTestBot) return;
+    const socket = getSocket();
+    const onRecordingUpdate = ({ userId, recording }: { userId: string; recording: boolean }) => {
+      if (userId !== conversationId) return;
+      if (peerRecordingTimeoutRef.current) {
+        clearTimeout(peerRecordingTimeoutRef.current);
+        peerRecordingTimeoutRef.current = null;
+      }
+      setPeerRecording(recording);
+      if (recording) {
+        peerRecordingTimeoutRef.current = setTimeout(() => setPeerRecording(false), RECORDING_RECEIVE_TIMEOUT_MS);
+      }
+    };
+    socket.on("recording:update", onRecordingUpdate);
+    return () => {
+      socket.off("recording:update", onRecordingUpdate);
+      if (peerRecordingTimeoutRef.current) clearTimeout(peerRecordingTimeoutRef.current);
+      setPeerRecording(false);
+    };
+  }, [conversationId, isTestBot]);
+
   const sendImage = useCallback(
     async (uri: string, width: number, height: number) => {
       if (!conversation) return;
@@ -1371,6 +1483,22 @@ export default function ChatScreen({ route, navigation }: Props) {
         </View>
       ) : null}
 
+      {peerRecording || peerTyping ? (
+        <View style={styles.peerStatusBar}>
+          <Text style={styles.peerStatusText} numberOfLines={1}>
+            {(conversation?.display_name ?? "Contact") + (peerRecording ? " is recording audio…" : " is typing…")}
+          </Text>
+        </View>
+      ) : null}
+
+      {conversation && conversation.status !== "accepted" ? (
+        <RequestActionBanner
+          status={conversation.status}
+          peerName={conversation.display_name ?? "This contact"}
+          onAccept={onAcceptRequest}
+          onReject={onRejectRequest}
+        />
+      ) : (
       <View style={[styles.inputRow, { paddingBottom: 8 + insets.bottom }]}>
         {voiceRecorder.isRecording ? (
           <Animated.View
@@ -1424,6 +1552,7 @@ export default function ChatScreen({ route, navigation }: Props) {
           </View>
         )}
       </View>
+      )}
 
       <EmojiPicker
         open={emojiPickerOpen}
@@ -1565,6 +1694,13 @@ const createStyles = (colors: ThemeColors) =>
     replyBannerText: { flex: 1, marginRight: 8 },
     replyBannerLabel: { fontSize: 11, color: colors.accent, fontWeight: "600" },
     replyBannerPreview: { fontSize: 13, color: colors.text },
+    peerStatusBar: {
+      paddingHorizontal: 16,
+      paddingTop: 4,
+      paddingBottom: 2,
+      backgroundColor: colors.background,
+    },
+    peerStatusText: { fontSize: 12, fontStyle: "italic", color: colors.textSecondary },
     pinnedBanner: {
       flexDirection: "row",
       alignItems: "center",
@@ -1587,6 +1723,25 @@ const createStyles = (colors: ThemeColors) =>
       borderTopWidth: StyleSheet.hairlineWidth,
       borderTopColor: colors.border,
     },
+    requestBanner: {
+      padding: 14,
+      gap: 10,
+      backgroundColor: colors.surface,
+      borderTopWidth: StyleSheet.hairlineWidth,
+      borderTopColor: colors.border,
+    },
+    requestBannerText: { fontSize: 14, color: colors.textSecondary, textAlign: "center" },
+    requestBannerActions: { flexDirection: "row", gap: 10 },
+    requestBannerButton: {
+      flex: 1,
+      paddingVertical: 10,
+      borderRadius: 12,
+      alignItems: "center",
+      justifyContent: "center",
+    },
+    requestBannerAccept: { backgroundColor: colors.accent },
+    requestBannerReject: { backgroundColor: colors.background, borderWidth: 1, borderColor: colors.border },
+    requestBannerButtonText: { fontSize: 15, fontWeight: "600" },
     emojiButton: {
       width: 40,
       height: 40,

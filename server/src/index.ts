@@ -5,8 +5,10 @@ import { createSocketServer } from "./socketServer";
 import { initDatabase } from "./db";
 import { connectMongo } from "./mongo";
 import { startAccountDeletionSweep } from "./accountDeletion";
+import { backfillAcceptedContactsFromMessages } from "./contacts";
 
 initDatabase();
+backfillAcceptedContactsFromMessages();
 startAccountDeletionSweep();
 
 const app = createApp();

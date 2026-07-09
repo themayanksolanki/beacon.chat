@@ -24,7 +24,8 @@ import {
   normalize,
   type MatchedContact,
 } from "../contacts/matchContacts";
-import { getConversationByPeerKey, insertConversation, isUserBlocked } from "../db/database";
+import { getConversationByPeerKey, insertConversation, isUserBlocked, setConversationStatus } from "../db/database";
+import { getSocket } from "../network/socket";
 import { useTheme } from "../ThemeContext";
 import { colorForName, initialFor, type ThemeColors } from "../theme";
 
@@ -58,24 +59,55 @@ export default function ContactsScreen({ navigation }: Props) {
       );
   }, [token, email]);
 
-  const openChat = useCallback(
+  // Starting a chat with someone new no longer opens it directly — it sends
+  // a contact request and the other side has to accept before messaging (or
+  // calling) is enabled on either end. An existing conversation (already
+  // pending or accepted) is just opened as before; only a brand new contact,
+  // or one who previously declined, goes through contact:request again.
+  const startConversation = useCallback(
     (contact: MatchedContact) => {
-      if (!contact.publicKey) return;
-      if (contact.userId && isUserBlocked(contact.userId)) return;
-      let conversation = getConversationByPeerKey(contact.publicKey);
-      if (!conversation) {
-        conversation = {
-          id: contact.userId!,
-          peer_public_key: contact.publicKey,
-          display_name: contact.name,
-          avatar_url: contact.avatarUrl ?? null,
-          created_at: Date.now(),
-        };
-        insertConversation(conversation);
+      if (!contact.publicKey || !contact.userId || !token) return;
+      if (isUserBlocked(contact.userId)) return;
+      const peerId = contact.userId;
+      const peerPublicKey = contact.publicKey;
+
+      const existing = getConversationByPeerKey(peerPublicKey);
+      if (existing && existing.status !== "declined") {
+        navigation.navigate("Chat", { conversationId: existing.id });
+        return;
       }
-      navigation.navigate("Chat", { conversationId: conversation.id });
+
+      getSocket()
+        .timeout(10000)
+        .emit(
+          "contact:request",
+          { recipientId: peerId },
+          (err: unknown, ack?: { ok: boolean; status?: "pending" | "accepted"; error?: string }) => {
+            if (err || !ack?.ok) {
+              Alert.alert("Couldn't send request", "Please try again later.");
+              return;
+            }
+            const status = ack.status === "accepted" ? "accepted" : "pending_outgoing";
+            if (existing) {
+              setConversationStatus(existing.id, status);
+            } else {
+              insertConversation({
+                id: peerId,
+                peer_public_key: peerPublicKey,
+                display_name: contact.name,
+                avatar_url: contact.avatarUrl ?? null,
+                created_at: Date.now(),
+                status,
+              });
+            }
+            if (status === "pending_outgoing") {
+              Alert.alert("Request sent", `We'll let you know if ${contact.name} accepts.`);
+            }
+            navigation.navigate("Chat", { conversationId: peerId });
+          }
+        );
     },
-    [navigation]
+    [navigation, token]
   );
 
   const invite = useCallback(
@@ -172,7 +204,7 @@ export default function ContactsScreen({ navigation }: Props) {
             <ContactRow
               contact={manualResult}
               inviting={invitingId === manualResult.id}
-              onChat={openChat}
+              onChat={startConversation}
               onInvite={invite}
             />
           ) : null}
@@ -192,7 +224,7 @@ export default function ContactsScreen({ navigation }: Props) {
         <ContactRow
           contact={item}
           inviting={invitingId === item.id}
-          onChat={openChat}
+          onChat={startConversation}
           onInvite={invite}
         />
       )}

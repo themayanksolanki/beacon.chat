@@ -1,4 +1,4 @@
-import { sqliteTable, text, integer, index, primaryKey } from "drizzle-orm/sqlite-core";
+import { sqliteTable, text, integer, index, primaryKey, uniqueIndex } from "drizzle-orm/sqlite-core";
 
 // A user is identified by email. current_session_id holds the id of the one
 // session allowed to be active at a time: logging in on a new device
@@ -71,3 +71,39 @@ export const reactions = sqliteTable(
     index("idx_reactions_recipient").on(table.recipient_id, table.delivered_at),
   ]
 );
+
+// A relationship gate: messaging/calling between two users is only allowed
+// once a row here is 'accepted'. Keyed by a canonical pair — user_a_id is
+// always the lexicographically smaller id — so there's exactly one row per
+// relationship no matter who acts first, which also makes "both sides
+// requested each other" trivial to detect (see contacts.ts).
+export const contacts = sqliteTable(
+  "contacts",
+  {
+    id: text("id").primaryKey(),
+    user_a_id: text("user_a_id")
+      .notNull()
+      .references(() => users.id),
+    user_b_id: text("user_b_id")
+      .notNull()
+      .references(() => users.id),
+    status: text("status").notNull(), // 'pending' | 'accepted' | 'rejected'
+    requested_by: text("requested_by").notNull(),
+    created_at: integer("created_at").notNull(),
+    responded_at: integer("responded_at"),
+  },
+  (table) => [uniqueIndex("idx_contacts_pair").on(table.user_a_id, table.user_b_id)]
+);
+
+// Persisted only — no moderation UI yet, just a record for later review.
+export const reports = sqliteTable("reports", {
+  id: text("id").primaryKey(),
+  reporter_id: text("reporter_id")
+    .notNull()
+    .references(() => users.id),
+  reported_id: text("reported_id")
+    .notNull()
+    .references(() => users.id),
+  reason: text("reason"),
+  created_at: integer("created_at").notNull(),
+});
