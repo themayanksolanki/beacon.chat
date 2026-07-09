@@ -14,6 +14,7 @@ import {
   markMessageDelivered,
   markMessageRead,
   setPeerReaction,
+  updateConversationPeerKey,
   type ConversationRow,
   type MessageRow,
 } from "../db/database";
@@ -114,6 +115,7 @@ export function MessagingProvider({ children }: { children: ReactNode }) {
           id: peer.userId,
           peer_public_key: peer.publicKey,
           display_name: peer.name,
+          avatar_url: peer.avatarUrl,
           created_at: Date.now(),
         };
         insertConversation(conversation);
@@ -121,6 +123,31 @@ export function MessagingProvider({ children }: { children: ReactNode }) {
       } catch (err) {
         console.warn("[messaging] failed to resolve unknown sender", err);
         return null;
+      }
+    };
+
+    // Decrypts a payload from `senderId` using our cached copy of their public
+    // key. If that fails, the cached key is most likely stale (they
+    // reinstalled or re-registered, rotating their identity keypair) rather
+    // than the payload being corrupt — refetch their current key from the
+    // server, persist it, and retry once before giving up. Without this, a
+    // stale cached key means messages/reactions from that sender are silently
+    // dropped forever (caught, logged, never surfaced) until they're
+    // re-added as a contact.
+    const decryptFromPeer = async (
+      senderId: string,
+      cachedPeerPublicKeyB64: string,
+      ciphertext: string,
+      nonce: string,
+      recipientPrivateKey: Uint8Array
+    ): Promise<string> => {
+      try {
+        return await decryptMessage(ciphertext, nonce, sodium.from_base64(cachedPeerPublicKeyB64), recipientPrivateKey);
+      } catch (err) {
+        const peer = await getUserById(token, senderId);
+        if (peer.publicKey === cachedPeerPublicKeyB64) throw err;
+        updateConversationPeerKey(senderId, peer.publicKey);
+        return decryptMessage(ciphertext, nonce, sodium.from_base64(peer.publicKey), recipientPrivateKey);
       }
     };
 
@@ -132,11 +159,11 @@ export function MessagingProvider({ children }: { children: ReactNode }) {
       try {
         const identity = await getOrCreateIdentity(email);
         await sodium.ready;
-        const peerPublicKey = sodium.from_base64(conversation.peer_public_key);
-        const decrypted = await decryptMessage(
+        const decrypted = await decryptFromPeer(
+          message.sender_id,
+          conversation.peer_public_key,
           message.ciphertext,
           message.nonce,
-          peerPublicKey,
           identity.privateKey
         );
         const payload: MessagePayload = JSON.parse(decrypted);
@@ -206,11 +233,11 @@ export function MessagingProvider({ children }: { children: ReactNode }) {
       try {
         const identity = await getOrCreateIdentity(email);
         await sodium.ready;
-        const peerPublicKey = sodium.from_base64(conversation.peer_public_key);
-        const decrypted = await decryptMessage(
+        const decrypted = await decryptFromPeer(
+          reaction.sender_id,
+          conversation.peer_public_key,
           reaction.ciphertext,
           reaction.nonce,
-          peerPublicKey,
           identity.privateKey
         );
         const payload: ReactionPayload = JSON.parse(decrypted);

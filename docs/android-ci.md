@@ -10,8 +10,10 @@ GitHub-native path for a dev/test APK on every change.
 
 ## How it operates
 
-**Triggers**: pull requests, pushes to `main` or `develop`, and manual runs
-(`workflow_dispatch`).
+**Triggers**: pull requests and pushes to `main` or `develop` that touch
+`app/**` or this workflow file itself, plus manual runs
+(`workflow_dispatch`, which always runs regardless of what changed). Backend
+(`server/`)-only changes do not trigger this workflow.
 
 **Why `expo prebuild` runs on every build**: this app is a managed Expo
 project using Continuous Native Generation — `app/android` (and `app/ios`)

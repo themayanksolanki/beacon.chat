@@ -45,6 +45,7 @@ function runMigrations() {
       id TEXT PRIMARY KEY NOT NULL,
       peer_public_key TEXT NOT NULL,
       display_name TEXT,
+      avatar_url TEXT,
       created_at INTEGER NOT NULL
     );
 
@@ -113,6 +114,15 @@ function runMigrations() {
     if (!existingColumns.has(column)) {
       db.execSync(statement);
     }
+  }
+
+  // avatar_url was added after this table already shipped to earlier test
+  // installs — same guard as above, for conversations instead of messages.
+  const existingConversationColumns = new Set(
+    db.getAllSync<{ name: string }>(`PRAGMA table_info(conversations)`).map((c) => c.name)
+  );
+  if (!existingConversationColumns.has("avatar_url")) {
+    db.execSync(`ALTER TABLE conversations ADD COLUMN avatar_url TEXT`);
   }
 }
 
@@ -264,6 +274,7 @@ export interface ConversationRow {
   id: string;
   peer_public_key: string;
   display_name: string | null;
+  avatar_url: string | null;
   created_at: number;
 }
 
@@ -311,9 +322,34 @@ export function getConversationById(id: string): ConversationRow | null {
 // existing row before either one inserts.
 export function insertConversation(conversation: ConversationRow): void {
   db.runSync(
-    `INSERT OR IGNORE INTO conversations (id, peer_public_key, display_name, created_at) VALUES (?, ?, ?, ?)`,
-    [conversation.id, conversation.peer_public_key, conversation.display_name, conversation.created_at]
+    `INSERT OR IGNORE INTO conversations (id, peer_public_key, display_name, avatar_url, created_at) VALUES (?, ?, ?, ?, ?)`,
+    [
+      conversation.id,
+      conversation.peer_public_key,
+      conversation.display_name,
+      conversation.avatar_url,
+      conversation.created_at,
+    ]
   );
+}
+
+// Refreshes a peer's cached name/avatar for an existing conversation (e.g.
+// they updated their profile after the conversation was first created) —
+// insertConversation only ever writes these once, on first contact.
+export function updateConversationProfile(id: string, displayName: string | null, avatarUrl: string | null): void {
+  db.runSync(`UPDATE conversations SET display_name = ?, avatar_url = ? WHERE id = ?`, [
+    displayName,
+    avatarUrl,
+    id,
+  ]);
+}
+
+// Refreshes a peer's cached public key (e.g. they reinstalled or re-registered,
+// rotating their identity keypair) — insertConversation only ever writes this
+// once, on first contact, so a stale local copy silently breaks encrypt/decrypt
+// with them until this is called. See MessagingContext's decrypt-retry path.
+export function updateConversationPeerKey(id: string, peerPublicKey: string): void {
+  db.runSync(`UPDATE conversations SET peer_public_key = ? WHERE id = ?`, [peerPublicKey, id]);
 }
 
 // Removes the conversation itself along with its messages and call history —

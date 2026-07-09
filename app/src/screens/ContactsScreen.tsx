@@ -68,6 +68,7 @@ export default function ContactsScreen({ navigation }: Props) {
           id: contact.userId!,
           peer_public_key: contact.publicKey,
           display_name: contact.name,
+          avatar_url: contact.avatarUrl ?? null,
           created_at: Date.now(),
         };
         insertConversation(conversation);

@@ -5,8 +5,14 @@ name: Android APK Build
 
 on:
   pull_request:
+    paths:
+      - "app/**"
+      - ".github/workflows/android-build.yml"
   push:
     branches: [main, develop]
+    paths:
+      - "app/**"
+      - ".github/workflows/android-build.yml"
   workflow_dispatch: {}
 
 # Cancel superseded PR runs to save CI minutes, but never cancel an

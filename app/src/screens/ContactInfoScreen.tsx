@@ -1,5 +1,5 @@
 import { useMemo } from "react";
-import { Alert, Pressable, StyleSheet, Text, View } from "react-native";
+import { Alert, Image, Pressable, StyleSheet, Text, View } from "react-native";
 import type { NativeStackScreenProps } from "@react-navigation/native-stack";
 import { Ionicons } from "@expo/vector-icons";
 import * as Clipboard from "expo-clipboard";
@@ -62,9 +62,13 @@ export default function ContactInfoScreen({ route, navigation }: Props) {
     <View style={styles.container}>
       <View style={styles.section}>
         <View style={styles.profile}>
-          <View style={[styles.avatar, { backgroundColor: colorForName(name) }]}>
-            <Text style={styles.avatarInitial}>{initialFor(name)}</Text>
-          </View>
+          {conversation.avatar_url ? (
+            <Image source={{ uri: conversation.avatar_url }} style={styles.avatar} />
+          ) : (
+            <View style={[styles.avatar, { backgroundColor: colorForName(name) }]}>
+              <Text style={styles.avatarInitial}>{initialFor(name)}</Text>
+            </View>
+          )}
           <Text style={styles.name}>{name}</Text>
           <Text style={styles.status}>{peerPresence?.online ? "Active now" : "Offline"}</Text>
         </View>

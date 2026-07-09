@@ -3,6 +3,7 @@ import {
   Alert,
   Animated,
   FlatList,
+  Image,
   KeyboardAvoidingView,
   PanResponder,
   Platform,
@@ -23,6 +24,7 @@ import { useSafeAreaInsets } from "react-native-safe-area-context";
 import EmojiPicker, { type EmojiType } from "rn-emoji-keyboard";
 
 import type { MainStackParamList } from "../../App";
+import { getUserById } from "../api/client";
 import { useAuth } from "../auth/AuthContext";
 import { useVoiceRecorder, type RecordedVoice } from "../audio/useVoiceRecorder";
 import { clearConversation } from "../chat/clearConversation";
@@ -49,6 +51,7 @@ import {
   pinMessage,
   setMyReaction,
   unpinMessage,
+  updateConversationPeerKey,
   type CallRow,
   type MessageRow,
 } from "../db/database";
@@ -122,12 +125,14 @@ function formatLastSeen(ts: number): string {
 
 function ChatHeaderTitle({
   name,
+  avatarUrl,
   online,
   lastSeenAt,
   typing,
   onPress,
 }: {
   name: string;
+  avatarUrl: string | null;
   online: boolean;
   lastSeenAt: number | null;
   typing: boolean;
@@ -143,9 +148,13 @@ function ChatHeaderTitle({
       hitSlop={8}
     >
       <View style={styles.headerAvatarWrap}>
-        <View style={[styles.headerAvatar, { backgroundColor: colorForName(name) }]}>
-          <Text style={styles.headerAvatarText}>{initialFor(name)}</Text>
-        </View>
+        {avatarUrl ? (
+          <Image source={{ uri: avatarUrl }} style={styles.headerAvatar} />
+        ) : (
+          <View style={[styles.headerAvatar, { backgroundColor: colorForName(name) }]}>
+            <Text style={styles.headerAvatarText}>{initialFor(name)}</Text>
+          </View>
+        )}
         {online ? <View style={styles.headerOnlineDot} /> : null}
       </View>
       <View style={styles.headerTextCol}>
@@ -556,9 +565,37 @@ function CallBubble({ call, onRedial }: { call: CallRow; onRedial: (call: CallRo
 
 export default function ChatScreen({ route, navigation }: Props) {
   const { conversationId } = route.params;
-  const { email } = useAuth();
-  const conversation = useMemo(() => getConversationById(conversationId), [conversationId]);
+  const { email, token } = useAuth();
+  const [conversation, setConversation] = useState(() => getConversationById(conversationId));
+  useEffect(() => {
+    setConversation(getConversationById(conversationId));
+  }, [conversationId]);
   const isTestBot = conversationId === TEST_BOT_CONVERSATION_ID;
+
+  // Best-effort: refresh the peer's cached public key when opening the chat.
+  // insertConversation only ever writes it once, on first contact — if they
+  // reinstalled or re-registered since (rotating their identity keypair), our
+  // cached copy is stale and every message we send from here would be
+  // encrypted for a key they can no longer decrypt with, with no error on
+  // either end. See MessagingContext's decrypt-retry for the receive-side.
+  useEffect(() => {
+    if (isTestBot || !token) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const peer = await getUserById(token, conversationId);
+        if (cancelled || peer.publicKey === conversation?.peer_public_key) return;
+        updateConversationPeerKey(conversationId, peer.publicKey);
+        setConversation(getConversationById(conversationId));
+      } catch (err) {
+        console.warn("[chat] failed to refresh peer key", err);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- only re-check on (re)opening this conversation, not every conversation-state change
+  }, [conversationId, isTestBot, token]);
   const insets = useSafeAreaInsets();
   const { colors } = useTheme();
   const styles = useMemo(() => createStyles(colors), [colors]);
@@ -726,6 +763,7 @@ export default function ChatScreen({ route, navigation }: Props) {
         : () => (
             <ChatHeaderTitle
               name={name}
+              avatarUrl={conversation?.avatar_url ?? null}
               online={peerPresence?.online ?? false}
               lastSeenAt={peerPresence?.lastSeenAt ?? null}
               typing={peerTyping}
@@ -749,6 +787,7 @@ export default function ChatScreen({ route, navigation }: Props) {
   }, [
     navigation,
     conversation?.display_name,
+    conversation?.avatar_url,
     isTestBot,
     peerPresence,
     peerTyping,

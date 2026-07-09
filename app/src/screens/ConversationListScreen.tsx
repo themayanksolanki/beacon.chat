@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { FlatList, Pressable, StyleSheet, Text, View } from "react-native";
+import { FlatList, Image, Pressable, StyleSheet, Text, View } from "react-native";
 import { useFocusEffect } from "@react-navigation/native";
 import type { BottomTabScreenProps } from "@react-navigation/bottom-tabs";
 import type { CompositeScreenProps } from "@react-navigation/native";
@@ -184,8 +184,14 @@ function ConversationRow({
         });
       }}
     >
-      <View style={[styles.avatar, { backgroundColor: colorForName(name) }]}>
-        <Text style={styles.avatarText}>{initialFor(name)}</Text>
+      <View style={styles.avatar}>
+        {item.avatar_url ? (
+          <Image source={{ uri: item.avatar_url }} style={StyleSheet.absoluteFill} />
+        ) : (
+          <View style={[StyleSheet.absoluteFill, styles.avatarFallback, { backgroundColor: colorForName(name) }]}>
+            <Text style={styles.avatarText}>{initialFor(name)}</Text>
+          </View>
+        )}
         {isOnline ? <View style={styles.onlineDot} /> : null}
       </View>
       <View style={styles.rowContent}>
@@ -263,7 +269,8 @@ const createStyles = (colors: ThemeColors) =>
       elevation: 1,
     },
     cardPressed: { opacity: 0.7 },
-    avatar: { width: 56, height: 56, borderRadius: 28, alignItems: "center", justifyContent: "center" },
+    avatar: { width: 56, height: 56, borderRadius: 28, overflow: "hidden" },
+    avatarFallback: { alignItems: "center", justifyContent: "center" },
     avatarText: { fontSize: 20, fontWeight: "700", color: "#fff" },
     onlineDot: {
       position: "absolute",

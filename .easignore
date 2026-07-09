@@ -1,0 +1,52 @@
+# EAS Build only needs app/ — this repo also contains an unrelated backend
+# (server/) and an empty scratch folder (shared/) that have no business
+# being uploaded to Expo's build servers alongside the client source.
+#
+# IMPORTANT: once this file exists, EAS CLI stops respecting *every*
+# .gitignore in the repo (app/.gitignore, server/.gitignore) and uses only
+# this file instead. So this isn't just "add server/ to the ignore list" —
+# it has to re-declare app/'s own build-hygiene exclusions too, or things
+# app/.gitignore currently keeps out (regenerated native folders, keystores,
+# etc.) would start getting uploaded that weren't before.
+/server
+/shared
+
+# Belt-and-suspenders: server/.env holds real secrets (DB creds, JWT
+# secret, AWS keys) and is already unreachable via the /server exclusion
+# above, but excluding it by name too means it stays covered even if the
+# wholesale /server line is ever removed or narrowed.
+server/.env
+
+# Deliberately NOT excluding app/.env — it only holds public
+# EXPO_PUBLIC_* values (server URL, a dev-only OTP-skip flag) that are
+# meant to be embedded in the client bundle, exactly as app/.gitignore
+# (which doesn't exclude it either) already allows today.
+
+# --- Mirrors app/.gitignore (no longer applied automatically once this
+# file exists) ---
+app/node_modules/
+app/.expo/
+app/dist/
+app/web-build/
+app/expo-env.d.ts
+app/.kotlin/
+app/ios
+app/android
+
+# Native signing/credential files — none exist in the repo today, but keep
+# these out on principle if one is ever added locally for testing.
+*.jks
+*.p8
+*.p12
+*.key
+*.pem
+*.mobileprovision
+
+*.orig.*
+.metro-health-check*
+npm-debug.*
+yarn-debug.*
+yarn-error.*
+.DS_Store
+.env*.local
+*.tsbuildinfo

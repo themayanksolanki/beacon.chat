@@ -14,6 +14,7 @@ export function ensureTestBotConversation() {
       id: TEST_BOT_CONVERSATION_ID,
       peer_public_key: TEST_BOT_CONVERSATION_ID,
       display_name: TEST_BOT_NAME,
+      avatar_url: null,
       created_at: Date.now(),
     });
   }

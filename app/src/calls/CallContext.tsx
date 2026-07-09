@@ -28,6 +28,11 @@ import { dismissCallScreen, navigationRef } from "../navigation/navigationRef";
 
 const ICE_SERVERS = [{ urls: "stun:stun.l.google.com:19302" }, { urls: "stun:stun1.l.google.com:19302" }];
 const RING_TIMEOUT_MS = 45000;
+// Some environments (e.g. Android with a self-managed phone account the user
+// hasn't authorized yet) accept RNCallKeep.startCall() without ever firing
+// didReceiveStartCallAction — this bounds how long we wait for it before
+// falling back to placing the call directly, same as the try/catch below.
+const CALLKEEP_START_TIMEOUT_MS = 4000;
 
 // The concrete signal that the camera/mic hardware is already held by
 // another app or call (WhatsApp, a cellular call, etc.) rather than some
@@ -38,6 +43,24 @@ function isMediaBusyError(err: unknown): boolean {
 }
 
 const MEDIA_BUSY_MESSAGE = "Your camera or microphone is already in use by another call. End that call and try again.";
+
+// getUserMedia failure -> a message the user can actually act on. Without
+// this, any failure that isn't the media-busy case (most commonly denied
+// mic/camera permission on a fresh install) unwound silently: the call
+// screen appeared and vanished with no explanation, and — since the failure
+// happens before the call:invite socket emit — the other party never got so
+// much as a ring, with nothing in the logs to say why.
+function getUserMediaErrorMessage(err: unknown): string {
+  if (isMediaBusyError(err)) return MEDIA_BUSY_MESSAGE;
+  const name = (err as { name?: string } | null | undefined)?.name;
+  if (name === "NotAllowedError" || name === "PermissionDeniedError") {
+    return "Beacon needs camera and microphone access to make calls. Enable it in Settings and try again.";
+  }
+  if (name === "NotFoundError" || name === "DevicesNotFoundError") {
+    return "No camera or microphone was found on this device.";
+  }
+  return "Couldn't start the call. Please try again.";
+}
 
 function safeCallKeep(action: () => void) {
   try {
@@ -331,6 +354,9 @@ export function CallProvider({ children }: { children: ReactNode }) {
             { callId, calleeId: conversationId, kind, sdp: pc.localDescription!.toJSON() },
             (err: unknown, ack?: { ok: true } | { ok: false; error: string }) => {
               if (err || !ack?.ok) {
+                const reason = err ? "no response from the server" : ack && !ack.ok ? ack.error : "unknown error";
+                console.warn("[call] call:invite rejected", reason);
+                Alert.alert("Call failed", reason === "busy" ? "That person is on another call." : "Couldn't reach the other person. Please try again.");
                 logCallOutcome("failed");
                 if (callKeepReadyRef.current) {
                   safeCallKeep(() => RNCallKeep.reportEndCallWithUUID(callId, CK_CONSTANTS.END_CALL_REASONS.FAILED));
@@ -352,7 +378,7 @@ export function CallProvider({ children }: { children: ReactNode }) {
         }, RING_TIMEOUT_MS);
       } catch (err) {
         console.warn("[call] failed to start call", err);
-        if (isMediaBusyError(err)) Alert.alert("Can't start call", MEDIA_BUSY_MESSAGE);
+        Alert.alert("Can't start call", getUserMediaErrorMessage(err));
         logCallOutcome("failed");
         if (callKeepReadyRef.current) {
           safeCallKeep(() => RNCallKeep.reportEndCallWithUUID(callId, CK_CONSTANTS.END_CALL_REASONS.FAILED));
@@ -405,7 +431,14 @@ export function CallProvider({ children }: { children: ReactNode }) {
         console.warn("[call] RNCallKeep.startCall failed, proceeding without it", err);
         pendingOutgoingRef.current = null;
         void performOutgoingCallSetup(callId, conversationId, kind);
+        return;
       }
+      setTimeout(() => {
+        if (pendingOutgoingRef.current?.callId !== callId) return;
+        console.warn("[call] didReceiveStartCallAction never fired, proceeding without CallKeep");
+        pendingOutgoingRef.current = null;
+        void performOutgoingCallSetup(callId, conversationId, kind);
+      }, CALLKEEP_START_TIMEOUT_MS);
     },
     [performOutgoingCallSetup]
   );
@@ -508,7 +541,7 @@ export function CallProvider({ children }: { children: ReactNode }) {
       getSocket().emit("call:answer", { callId: invite.callId, sdp: pc.localDescription!.toJSON() });
     } catch (err) {
       console.warn("[call] failed to accept call", err);
-      if (isMediaBusyError(err)) Alert.alert("Can't answer call", MEDIA_BUSY_MESSAGE);
+      Alert.alert("Can't answer call", getUserMediaErrorMessage(err));
       getSocket().emit("call:end", { callId: invite.callId });
       if (callKeepReadyRef.current) {
         safeCallKeep(() => RNCallKeep.reportEndCallWithUUID(invite.callId, CK_CONSTANTS.END_CALL_REASONS.FAILED));
@@ -621,6 +654,32 @@ export function CallProvider({ children }: { children: ReactNode }) {
     });
     return () => listener.remove();
   }, []);
+
+  // The app's own IncomingCallScreen is the primary answer surface, but on a
+  // locked or backgrounded device the OS's native CallKit/ConnectionService
+  // UI is what's actually on screen — tapping Accept there fires this event
+  // instead of going through our button, so it has to trigger the same flow.
+  useEffect(() => {
+    const listener = RNCallKeep.addEventListener("answerCall", ({ callUUID }) => {
+      if (incomingInviteRef.current?.callId !== callUUID) return;
+      void acceptIncomingCall();
+    });
+    return () => listener.remove();
+  }, [acceptIncomingCall]);
+
+  // Same deal for hanging up/declining from the native UI (lock screen,
+  // system call banner) rather than our own end/decline buttons.
+  useEffect(() => {
+    const listener = RNCallKeep.addEventListener("endCall", ({ callUUID }) => {
+      if (callRef.current?.callId !== callUUID) return;
+      if (phaseRef.current === "incoming-ringing") {
+        rejectIncomingCall();
+      } else if (phaseRef.current !== "idle") {
+        endCall();
+      }
+    });
+    return () => listener.remove();
+  }, [rejectIncomingCall, endCall]);
 
   // The core "gracefully manage camera/mic as system resources become
   // available" behavior: when the OS hands our audio session to another
