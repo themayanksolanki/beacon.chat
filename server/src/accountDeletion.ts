@@ -2,6 +2,7 @@ import { and, eq, isNotNull, lte, or } from "drizzle-orm";
 import { db } from "./db";
 import { messages, reactions, users } from "./schema";
 import { isMongoConnected, profiles } from "./mongo";
+import { deleteAvatarObject } from "./s3";
 
 export const ACCOUNT_DELETION_GRACE_MS = 48 * 60 * 60 * 1000;
 
@@ -46,7 +47,10 @@ export async function purgeExpiredAccounts(): Promise<void> {
     db.delete(messages).where(or(eq(messages.sender_id, id), eq(messages.recipient_id, id))).run();
     db.delete(reactions).where(or(eq(reactions.sender_id, id), eq(reactions.recipient_id, id))).run();
     if (isMongoConnected()) {
-      await profiles().deleteOne({ userId: id });
+      const profile = await profiles().findOneAndDelete({ userId: id });
+      if (profile?.avatarKey) {
+        void deleteAvatarObject(profile.avatarKey);
+      }
     }
     db.delete(users).where(eq(users.id, id)).run();
     console.log(`[accountDeletion] purged account ${id}`);

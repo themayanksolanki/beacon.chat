@@ -1,17 +1,20 @@
 import { createContext, useContext, useEffect, useState, type ReactNode } from "react";
 import sodium from "react-native-libsodium";
 
+import { getUserById } from "../api/client";
 import { useAuth } from "../auth/AuthContext";
 import { writeVoiceMessageBase64 } from "../audio/voiceStorage";
 import { decryptMessage, getOrCreateIdentity } from "../crypto/identity";
 import {
   getConversationById,
+  insertConversation,
   insertMessage,
   isUserBlocked,
   markMessageDeletedEverywhere,
   markMessageDelivered,
   markMessageRead,
   setPeerReaction,
+  type ConversationRow,
   type MessageRow,
 } from "../db/database";
 import { writeImageMessageBase64 } from "../media/imageStorage";
@@ -97,9 +100,33 @@ export function MessagingProvider({ children }: { children: ReactNode }) {
     const socket = getSocket();
     const bump = () => setRevision((r) => r + 1);
 
+    // Messages/reactions only ever carry the sender's id. If we don't have a
+    // local conversation for them yet (they added us before we added them
+    // back), resolve their identity from the server and create one on the
+    // fly instead of dropping the message — see the "silent until I add them
+    // back" bug this fixes.
+    const ensureConversation = async (peerId: string): Promise<ConversationRow | null> => {
+      const existing = getConversationById(peerId);
+      if (existing) return existing;
+      try {
+        const peer = await getUserById(token, peerId);
+        const conversation: ConversationRow = {
+          id: peer.userId,
+          peer_public_key: peer.publicKey,
+          display_name: peer.name,
+          created_at: Date.now(),
+        };
+        insertConversation(conversation);
+        return getConversationById(peerId);
+      } catch (err) {
+        console.warn("[messaging] failed to resolve unknown sender", err);
+        return null;
+      }
+    };
+
     const onMessage = async (message: IncomingServerMessage) => {
       if (isUserBlocked(message.sender_id)) return;
-      const conversation = getConversationById(message.sender_id);
+      const conversation = await ensureConversation(message.sender_id);
       if (!conversation) return;
 
       try {
@@ -174,7 +201,7 @@ export function MessagingProvider({ children }: { children: ReactNode }) {
 
     const onReactionSet = async (reaction: IncomingServerReaction) => {
       if (isUserBlocked(reaction.sender_id)) return;
-      const conversation = getConversationById(reaction.sender_id);
+      const conversation = await ensureConversation(reaction.sender_id);
       if (!conversation) return;
       try {
         const identity = await getOrCreateIdentity(email);

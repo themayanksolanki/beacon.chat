@@ -96,6 +96,19 @@ export async function lookupUsers(token: string, emails: string[]) {
   return matches;
 }
 
+export interface UserLookup {
+  userId: string;
+  email: string;
+  publicKey: string;
+  name: string | null;
+  avatarUrl: string | null;
+}
+
+/** Resolves a bare sender/recipient id to their identity, e.g. to materialize a conversation for an unknown sender. */
+export function getUserById(token: string, userId: string) {
+  return request<UserLookup>(`/users/by-id/${encodeURIComponent(userId)}`, { token });
+}
+
 export function inviteByEmail(token: string, email: string) {
   return request<{ ok: true }>("/users/invite", {
     method: "POST",
@@ -104,10 +117,22 @@ export function inviteByEmail(token: string, email: string) {
   });
 }
 
-export function updateRemoteProfile(token: string, name: string, avatarUrl: string | null) {
+// avatarKey omitted entirely => server leaves the stored avatar untouched
+// (used for a name-only edit); pass null to explicitly clear it.
+export function updateRemoteProfile(token: string, name: string, avatarKey?: string | null) {
   return request<{ ok: true }>("/profile", {
     method: "PUT",
     token,
-    body: JSON.stringify({ name, avatarUrl }),
+    body: JSON.stringify(avatarKey !== undefined ? { name, avatarKey } : { name }),
   });
+}
+
+export interface AvatarUploadTarget {
+  url: string;
+  fields: Record<string, string>;
+  key: string;
+}
+
+export function requestAvatarUploadUrl(token: string) {
+  return request<AvatarUploadTarget>("/profile/avatar/upload-url", { method: "POST", token });
 }

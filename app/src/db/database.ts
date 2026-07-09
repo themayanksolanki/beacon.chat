@@ -305,9 +305,13 @@ export function getConversationById(id: string): ConversationRow | null {
   return db.getFirstSync<ConversationRow>(`SELECT * FROM conversations WHERE id = ?`, [id]);
 }
 
+// OR IGNORE rather than a plain INSERT: callers that materialize a
+// conversation from an incoming message/reaction (see MessagingContext)
+// can race two events from the same brand-new sender, both finding no
+// existing row before either one inserts.
 export function insertConversation(conversation: ConversationRow): void {
   db.runSync(
-    `INSERT INTO conversations (id, peer_public_key, display_name, created_at) VALUES (?, ?, ?, ?)`,
+    `INSERT OR IGNORE INTO conversations (id, peer_public_key, display_name, created_at) VALUES (?, ?, ?, ?)`,
     [conversation.id, conversation.peer_public_key, conversation.display_name, conversation.created_at]
   );
 }
@@ -387,6 +391,15 @@ export function updateCallOutcome(
     endedAt,
     id,
   ]);
+}
+
+// Powers the inline call log shown in the chat itself (interleaved with
+// messages), as opposed to getCallHistory()'s cross-conversation list.
+export function getCallsForConversation(conversationId: string): CallRow[] {
+  return db.getAllSync<CallRow>(
+    `SELECT * FROM calls WHERE conversation_id = ? ORDER BY started_at ASC`,
+    [conversationId]
+  );
 }
 
 export interface CallHistoryEntry extends CallRow {

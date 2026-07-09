@@ -9,9 +9,9 @@ import {
   type ReactNode,
 } from "react";
 import sodium from "react-native-libsodium";
-import * as FileSystem from "expo-file-system/legacy";
 
 import * as api from "../api/client";
+import { prepareAvatarForUpload, uploadAvatarToS3 } from "../api/avatarUpload";
 import { ApiError } from "../api/client";
 import { getOrCreateIdentity } from "../crypto/identity";
 import { initDatabase, wipeAccountDatabase } from "../db/database";
@@ -45,20 +45,33 @@ interface AuthContextValue {
 
 const AuthContext = createContext<AuthContextValue | null>(null);
 
-// The picker/profileStore only deal in local file URIs; the server (and
-// other users' apps) need the image inline, so it's base64-encoded here.
-async function photoUriToDataUrl(photoUri: string): Promise<string> {
-  const base64 = await FileSystem.readAsStringAsync(photoUri, { encoding: "base64" });
-  return `data:image/jpeg;base64,${base64}`;
-}
-
 // Other users need to see this profile, so it's pushed to the server too;
 // failures here are swallowed so a flaky connection can't block onboarding
 // or local profile edits (the local copy is what this device relies on).
-async function pushRemoteProfile(token: string, fullName: string, photoUri: string | null): Promise<void> {
+// photoChanged tells us whether photoUri is a newly-picked photo (needing a
+// fresh S3 upload) or just carried over unchanged from a name-only edit —
+// without it, every save would re-upload and delete-replace the same photo.
+async function pushRemoteProfile(
+  token: string,
+  fullName: string,
+  photoUri: string | null,
+  photoChanged: boolean
+): Promise<void> {
   try {
-    const avatarUrl = photoUri ? await photoUriToDataUrl(photoUri) : null;
-    await api.updateRemoteProfile(token, fullName, avatarUrl);
+    if (!photoChanged) {
+      await api.updateRemoteProfile(token, fullName);
+      return;
+    }
+
+    if (!photoUri) {
+      await api.updateRemoteProfile(token, fullName, null);
+      return;
+    }
+
+    const preparedUri = await prepareAvatarForUpload(photoUri);
+    const target = await api.requestAvatarUploadUrl(token);
+    await uploadAvatarToS3(target, preparedUri);
+    await api.updateRemoteProfile(token, fullName, target.key);
   } catch (err) {
     console.warn("[profile] failed to sync profile to server", err);
   }
@@ -201,7 +214,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       const saved = await saveProfile(email, fullName, photoUri);
       setProfile(saved);
       setStatus("signed-in");
-      if (token) await pushRemoteProfile(token, fullName, photoUri);
+      // Onboarding: never previously synced, so always treat the photo (if any) as new.
+      if (token) await pushRemoteProfile(token, fullName, photoUri, true);
     },
     [email, token]
   );
@@ -209,11 +223,14 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const updateProfile = useCallback(
     async (fullName: string, photoUri: string | null) => {
       if (!email) throw new Error("updateProfile called while signed out");
+      // Captured before saveProfile overwrites local `profile` state, so this
+      // reflects whether the user actually picked a new photo this edit.
+      const photoChanged = photoUri !== profile?.photoUri;
       const saved = await saveProfile(email, fullName, photoUri);
       setProfile(saved);
-      if (token) await pushRemoteProfile(token, fullName, photoUri);
+      if (token) await pushRemoteProfile(token, fullName, photoUri, photoChanged);
     },
-    [email, token]
+    [email, token, profile]
   );
 
   const logout = useCallback(async () => {

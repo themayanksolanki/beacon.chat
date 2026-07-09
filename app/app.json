@@ -17,7 +17,8 @@
         "ITSAppUsesNonExemptEncryption": true,
         "NSAppTransportSecurity": {
           "NSAllowsLocalNetworking": true
-        }
+        },
+        "UIBackgroundModes": ["voip", "audio"]
       }
     },
     "android": {
@@ -33,7 +34,12 @@
         "android.permission.RECORD_AUDIO",
         "android.permission.CAMERA",
         "android.permission.READ_CONTACTS",
-        "android.permission.WRITE_CONTACTS"
+        "android.permission.WRITE_CONTACTS",
+        "android.permission.READ_PHONE_STATE",
+        "android.permission.FOREGROUND_SERVICE",
+        "android.permission.FOREGROUND_SERVICE_MICROPHONE",
+        "android.permission.FOREGROUND_SERVICE_CAMERA",
+        "android.permission.FOREGROUND_SERVICE_PHONE_CALL"
       ]
     },
     "web": {
@@ -43,6 +49,9 @@
       "expo-secure-store",
       "expo-sqlite",
       "./plugins/withDisableScriptSandboxing.js",
+      "./plugins/withCallKeepAndroid.js",
+      "./plugins/withAndroidPip.js",
+      "./plugins/withAndroidReleaseSigning.js",
       [
         "expo-image-picker",
         {

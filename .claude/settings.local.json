@@ -105,7 +105,10 @@
       "Bash(kill 7639)",
       "Bash(awk '$3==9980')",
       "Bash(kill 9955 9957 9980 10615)",
-      "Bash(lsof -iTCP -sTCP:LISTEN -P)"
+      "Bash(lsof -iTCP -sTCP:LISTEN -P)",
+      "Bash(pod update *)",
+      "Bash(echo \"sim exit: $?\")",
+      "Bash(echo \"device exit: $?\")"
     ]
   }
 }

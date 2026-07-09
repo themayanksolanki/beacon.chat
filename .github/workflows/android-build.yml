@@ -1,0 +1,183 @@
+name: Android APK Build
+
+# See docs/android-ci.md for the full write-up: required secrets, how this
+# operates, how to trigger it manually, and how to download the built APKs.
+
+on:
+  pull_request:
+  push:
+    branches: [main, develop]
+  workflow_dispatch: {}
+
+# Cancel superseded PR runs to save CI minutes, but never cancel an
+# in-progress run on main/develop — a rapid second push there shouldn't
+# kill a release build/signing/upload that's already underway.
+concurrency:
+  group: android-build-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+# app/ is a standalone npm project inside this repo (no root package.json /
+# workspaces), so every app-related step runs with this as its cwd.
+defaults:
+  run:
+    working-directory: app
+
+jobs:
+  build:
+    name: Build Android APKs
+    runs-on: ubuntu-latest
+
+    steps:
+      # --- Environment setup -------------------------------------------------
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: zulu
+          java-version: "17"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v4
+
+      # Caches ~/.gradle (dependencies, wrapper, build cache) and manages the
+      # Gradle daemon across the assembleDebug/assembleRelease steps below.
+      # Safe to run before `expo prebuild` generates android/ — its cache key
+      # isn't derived from hashing repo Gradle files (which don't exist yet
+      # on a fresh checkout; see docs/android-ci.md for why that ruled out a
+      # plain actions/cache step).
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v6
+
+      # --- App-level checks ---------------------------------------------------
+      - name: Install project dependencies
+        run: npm ci
+
+      # No-op today (no lint script/config exists yet in app/) but will start
+      # running automatically the moment one is added.
+      - name: Run lint (if configured)
+        run: npm run lint --if-present
+
+      - name: Run unit tests (if available)
+        run: npm run test --if-present -- --ci --watchAll=false
+
+      # --- Native project generation ------------------------------------------
+      # android/ is gitignored (this is a managed Expo / Continuous Native
+      # Generation project) — it must be generated fresh on every run before
+      # any Gradle command can work. Cleaning/recreating the native folder is
+      # prebuild's default behavior (no separate flag needed), which keeps
+      # this correct/idempotent even if this workflow is ever moved to a
+      # persistent runner later. CI=1 disables interactive prompts (the
+      # now-removed --non-interactive flag pointed at this env var instead).
+      - name: Generate native Android project (expo prebuild)
+        env:
+          CI: "1"
+        run: npx expo prebuild --platform android --no-install
+
+      # Fails fast with a clear message if a future Expo/RN template change
+      # ever breaks withAndroidReleaseSigning.js's build.gradle string-append
+      # assumption (e.g. a migration to Kotlin DSL/build.gradle.kts), instead
+      # of surfacing as a confusing Gradle failure deep in assembleRelease.
+      - name: Verify release-signing plugin was applied
+        run: grep -q "BEACON_RELEASE_STORE_FILE" android/app/build.gradle
+
+      - name: Grant execute permission to gradlew
+        run: chmod +x android/gradlew
+
+      # --- Debug build (always) -----------------------------------------------
+      - name: Build Debug APK
+        working-directory: app/android
+        run: ./gradlew assembleDebug
+
+      - name: Upload Debug APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: beacon-debug-apk
+          path: app/android/app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
+          retention-days: 14
+
+      # --- Release build (only when signing secrets are configured) ----------
+      - name: Check release signing secrets
+        id: signing
+        env:
+          KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          KEYSTORE_PW: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PW: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          present=0
+          [ -n "$KEYSTORE_B64" ] && present=$((present + 1))
+          [ -n "$KEYSTORE_PW" ] && present=$((present + 1))
+          [ -n "$KEY_ALIAS" ] && present=$((present + 1))
+          [ -n "$KEY_PW" ] && present=$((present + 1))
+
+          if [ "$present" -eq 4 ]; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          elif [ "$present" -eq 0 ]; then
+            echo "Release signing secrets are not configured — building Debug APK only." >&2
+            echo "available=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "::error::Only $present of 4 required ANDROID_* signing secrets are set. Configure all four (ANDROID_KEYSTORE_BASE64, ANDROID_KEYSTORE_PASSWORD, ANDROID_KEY_ALIAS, ANDROID_KEY_PASSWORD) or none." >&2
+            exit 1
+          fi
+
+      - name: Decode release keystore
+        if: steps.signing.outputs.available == 'true'
+        env:
+          KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+        run: echo "$KEYSTORE_B64" | base64 --decode > "$RUNNER_TEMP/release.keystore"
+
+      - name: Build Release APK (signed)
+        if: steps.signing.outputs.available == 'true'
+        working-directory: app/android
+        env:
+          # Gradle's documented convention for injecting project properties
+          # from the environment, with no properties file ever written to
+          # disk — matches the project.hasProperty('BEACON_RELEASE_STORE_FILE')
+          # check in plugins/withAndroidReleaseSigning.js.
+          ORG_GRADLE_PROJECT_BEACON_RELEASE_STORE_FILE: ${{ runner.temp }}/release.keystore
+          ORG_GRADLE_PROJECT_BEACON_RELEASE_STORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ORG_GRADLE_PROJECT_BEACON_RELEASE_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ORG_GRADLE_PROJECT_BEACON_RELEASE_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: ./gradlew assembleRelease
+
+      - name: Upload Release APK
+        if: steps.signing.outputs.available == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: beacon-release-apk
+          path: app/android/app/build/outputs/apk/release/*.apk
+          if-no-files-found: error
+          retention-days: 14
+
+      # --- Optional: Firebase App Distribution --------------------------------
+      - name: Check Firebase App Distribution credentials
+        id: firebase
+        if: steps.signing.outputs.available == 'true'
+        env:
+          FIREBASE_APP_ID: ${{ secrets.FIREBASE_APP_ID }}
+          FIREBASE_CREDS: ${{ secrets.FIREBASE_SERVICE_CREDENTIALS_JSON }}
+        run: |
+          if [ -n "$FIREBASE_APP_ID" ] && [ -n "$FIREBASE_CREDS" ]; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "available=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Upload Release APK to Firebase App Distribution
+        if: steps.signing.outputs.available == 'true' && steps.firebase.outputs.available == 'true'
+        uses: wzieba/Firebase-Distribution-Github-Action@v1
+        with:
+          appId: ${{ secrets.FIREBASE_APP_ID }}
+          serviceCredentialsFileContent: ${{ secrets.FIREBASE_SERVICE_CREDENTIALS_JSON }}
+          groups: ${{ secrets.FIREBASE_DISTRIBUTION_GROUPS || 'testers' }}
+          file: app/android/app/build/outputs/apk/release/app-release.apk

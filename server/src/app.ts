@@ -13,8 +13,9 @@ export function createApp() {
 
   app.use(helmet());
   app.use(cors());
-  // Default 100kb is too small for base64-encoded avatar photos.
-  app.use(express.json({ limit: "5mb" }));
+  // Avatar photos go direct-to-S3 via presigned upload, not through JSON
+  // bodies, so the default 100kb limit just needs a little headroom.
+  app.use(express.json({ limit: "256kb" }));
   app.use(rateLimit({ windowMs: 60_000, max: 100 }));
 
   app.get("/health", (_req, res) => {

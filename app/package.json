@@ -25,6 +25,7 @@
     "expo-status-bar": "~57.0.0",
     "react": "19.2.3",
     "react-native": "0.86.0",
+    "react-native-callkeep": "^4.3.16",
     "react-native-incall-manager": "^4.2.1",
     "react-native-libsodium": "^1.7.0",
     "react-native-safe-area-context": "~5.7.0",
@@ -70,7 +71,9 @@
         "exclude": [
           "react-native-incall-manager",
           "react-native-libsodium",
-          "react-native-webrtc"
+          "react-native-webrtc",
+          "react-native-callkeep",
+          "expo-call-pip"
         ]
       }
     }

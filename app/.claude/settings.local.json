@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "allow": [
+      "Skill(run)",
+      "Bash(npx eas *)",
+      "Bash(xcrun simctl *)",
+      "Bash(mkdir -p /private/tmp/claude-501/-Users-mayanksolanki-Documents-beacon-chat-app/2320a819-68d1-490c-bcb9-5f06be2aba02/scratchpad)",
+      "Bash(xcrun devicectl *)",
+      "Bash(networksetup -getairportnetwork en0)",
+      "Bash(ipconfig getifaddr *)",
+      "Bash(npx expo *)",
+      "Bash(npx expo-doctor *)",
+      "Read(//Users/mayanksolanki/Documents/beacon.chat/server/**)",
+      "Bash(grep -rniE \"avatar|profile.*upload|upload.*profile|presign\" --include=\"*.ts\" -l src)"
+    ]
+  }
+}

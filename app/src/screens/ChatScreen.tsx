@@ -35,6 +35,7 @@ import { encryptMessage, getOrCreateIdentity } from "../crypto/identity";
 import {
   blockUser,
   deleteMessage,
+  getCallsForConversation,
   getConversationById,
   getMessages,
   getUnreadIncomingMessages,
@@ -48,6 +49,7 @@ import {
   pinMessage,
   setMyReaction,
   unpinMessage,
+  type CallRow,
   type MessageRow,
 } from "../db/database";
 import { compressImage } from "../media/imageCompression";
@@ -75,6 +77,12 @@ interface ReplyTarget {
 const REPLY_PREVIEW_MAX_LENGTH = 80;
 const SEND_TIMEOUT_MS = 15000;
 const DELETE_FOR_EVERYONE_WINDOW_MS = 2 * 60 * 60 * 1000;
+// How long to wait after the last keystroke before telling the peer we
+// stopped typing.
+const TYPING_STOP_DELAY_MS = 2500;
+// Safety net on the receiving side: clears a stuck "typing…" indicator if a
+// typing:stop never arrives (peer's app crashed, lost network, etc).
+const TYPING_RECEIVE_TIMEOUT_MS = 6000;
 
 function truncate(text: string) {
   return text.length > REPLY_PREVIEW_MAX_LENGTH ? `${text.slice(0, REPLY_PREVIEW_MAX_LENGTH)}…` : text;
@@ -116,11 +124,13 @@ function ChatHeaderTitle({
   name,
   online,
   lastSeenAt,
+  typing,
   onPress,
 }: {
   name: string;
   online: boolean;
   lastSeenAt: number | null;
+  typing: boolean;
   onPress: () => void;
 }) {
   const { colors } = useTheme();
@@ -142,7 +152,11 @@ function ChatHeaderTitle({
         <Text style={styles.headerName} numberOfLines={1}>
           {name}
         </Text>
-        {online ? (
+        {typing ? (
+          <Text style={styles.headerStatusOnline} numberOfLines={1}>
+            typing…
+          </Text>
+        ) : online ? (
           <Text style={styles.headerStatusOnline} numberOfLines={1}>
             Active now
           </Text>
@@ -214,28 +228,56 @@ function ChatHeaderOptionsButton({
 
 type ListItem =
   | { type: "separator"; id: string; label: string }
-  | { type: "message"; id: string; message: MessageRow; isGroupEnd: boolean };
+  | { type: "message"; id: string; message: MessageRow; isGroupEnd: boolean }
+  | { type: "call"; id: string; call: CallRow };
+
+type ChatEntry =
+  | { kind: "message"; ts: number; message: MessageRow }
+  | { kind: "call"; ts: number; call: CallRow };
 
 /**
  * Consecutive messages from the same side are visually grouped (tighter
- * spacing, tail corner only on the last one) — a day boundary or a change
- * in direction always ends a group.
+ * spacing, tail corner only on the last one) — a day boundary, a call log
+ * entry, or a change in direction always ends a group.
  */
-function buildListItems(messages: MessageRow[]): ListItem[] {
+function buildListItems(entries: ChatEntry[]): ListItem[] {
   const items: ListItem[] = [];
   let lastLabel: string | null = null;
-  for (let i = 0; i < messages.length; i++) {
-    const message = messages[i];
-    const label = dayLabel(message.sent_at);
+  for (let i = 0; i < entries.length; i++) {
+    const entry = entries[i];
+    const label = dayLabel(entry.ts);
     if (label !== lastLabel) {
-      items.push({ type: "separator", id: `sep-${message.id}`, label });
+      items.push({ type: "separator", id: `sep-${entry.kind}-${i}`, label });
       lastLabel = label;
     }
-    const next = messages[i + 1];
-    const isGroupEnd = !next || next.direction !== message.direction || dayLabel(next.sent_at) !== label;
-    items.push({ type: "message", id: message.id, message, isGroupEnd });
+    if (entry.kind === "call") {
+      items.push({ type: "call", id: entry.call.id, call: entry.call });
+      continue;
+    }
+    const next = entries[i + 1];
+    const isGroupEnd =
+      !next ||
+      next.kind !== "message" ||
+      next.message.direction !== entry.message.direction ||
+      dayLabel(next.ts) !== label;
+    items.push({ type: "message", id: entry.message.id, message: entry.message, isGroupEnd });
   }
   return items;
+}
+
+function formatCallDuration(call: CallRow): string | null {
+  if (call.status !== "completed" || !call.answered_at || !call.ended_at) return null;
+  const totalSeconds = Math.max(0, Math.round((call.ended_at - call.answered_at) / 1000));
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  return `${minutes}:${seconds.toString().padStart(2, "0")}`;
+}
+
+function callStatusLabel(call: CallRow): string {
+  if (call.status === "missed") return call.direction === "incoming" ? "Missed call" : "No answer";
+  if (call.status === "declined") return "Declined";
+  if (call.status === "failed") return "Call failed";
+  return formatCallDuration(call) ?? "Call ended";
 }
 
 function showTimingInfo(message: MessageRow) {
@@ -462,6 +504,56 @@ function MessageBubble({
   );
 }
 
+function CallBubble({ call, onRedial }: { call: CallRow; onRedial: (call: CallRow) => void }) {
+  const { colors } = useTheme();
+  const styles = useMemo(() => createStyles(colors), [colors]);
+  const isOutgoing = call.direction === "outgoing";
+  const isMissedLike = call.status === "missed" || call.status === "declined" || call.status === "failed";
+
+  return (
+    <View style={[styles.bubbleRowSpaced, { alignSelf: isOutgoing ? "flex-end" : "flex-start" }]}>
+      <Pressable
+        style={[styles.callBubble, isOutgoing ? styles.outgoing : styles.incoming]}
+        onPress={() => onRedial(call)}
+      >
+        <View style={[styles.callBubbleIcon, isOutgoing ? styles.callBubbleIconOutgoing : styles.callBubbleIconIncoming]}>
+          <Ionicons
+            name={call.kind === "video" ? "videocam" : "call"}
+            size={16}
+            color={isOutgoing ? "#fff" : colors.accent}
+          />
+        </View>
+        <View style={styles.callBubbleText}>
+          <View style={styles.callBubbleLabelRow}>
+            <Ionicons
+              name={isOutgoing ? "arrow-up-outline" : "arrow-down-outline"}
+              size={12}
+              color={
+                isMissedLike
+                  ? colors.danger
+                  : isOutgoing
+                    ? "rgba(255,255,255,0.8)"
+                    : colors.textSecondary
+              }
+            />
+            <Text style={[isOutgoing ? styles.outgoingText : styles.incomingText, styles.callBubbleLabel]}>
+              {call.kind === "video" ? "Video call" : "Audio call"}
+            </Text>
+          </View>
+          <Text
+            style={[
+              isOutgoing ? styles.metaTextOutgoing : styles.metaTextIncoming,
+              isMissedLike && (isOutgoing ? styles.callMetaMissedOutgoing : styles.callMetaMissedIncoming),
+            ]}
+          >
+            {callStatusLabel(call)} · {formatTime(call.started_at)}
+          </Text>
+        </View>
+      </Pressable>
+    </View>
+  );
+}
+
 export default function ChatScreen({ route, navigation }: Props) {
   const { conversationId } = route.params;
   const { email } = useAuth();
@@ -472,6 +564,7 @@ export default function ChatScreen({ route, navigation }: Props) {
   const styles = useMemo(() => createStyles(colors), [colors]);
 
   const [messages, setMessages] = useState<MessageRow[]>(() => getMessages(conversationId));
+  const [calls, setCalls] = useState<CallRow[]>(() => getCallsForConversation(conversationId));
   const [draft, setDraft] = useState("");
   const [replyingTo, setReplyingTo] = useState<ReplyTarget | null>(null);
   const [emojiPickerOpen, setEmojiPickerOpen] = useState(false);
@@ -482,8 +575,30 @@ export default function ChatScreen({ route, navigation }: Props) {
   } | null>(null);
   const listRef = useRef<FlatList<ListItem>>(null);
   const readSentRef = useRef<Set<string>>(new Set());
-  const listItems = useMemo(() => buildListItems(messages), [messages]);
+  const listItems = useMemo(() => {
+    const entries: ChatEntry[] = [
+      ...messages.map((message) => ({ kind: "message" as const, ts: message.sent_at, message })),
+      ...calls.map((call) => ({ kind: "call" as const, ts: call.started_at, call })),
+    ].sort((a, b) => a.ts - b.ts);
+    return buildListItems(entries);
+  }, [messages, calls]);
   const pinnedMessage = useMemo(() => messages.find((m) => m.pinned_at) ?? null, [messages]);
+
+  const { startCall, phase: callPhase } = useCall();
+  const onRedial = useCallback(
+    (call: CallRow) => {
+      if (!isTestBot) void startCall(conversationId, call.kind);
+    },
+    [conversationId, isTestBot, startCall]
+  );
+
+  // Calls are logged by CallContext outside of this screen's lifecycle (it
+  // navigates to ActiveCall/IncomingCall while the call is in progress), so
+  // re-read whenever a call just wrapped up (phase back to idle) in addition
+  // to the normal focus-driven refresh below.
+  useEffect(() => {
+    if (callPhase === "idle") setCalls(getCallsForConversation(conversationId));
+  }, [callPhase, conversationId]);
 
   const openMenu = useCallback(
     (message: MessageRow, actions: MessageAction[], anchor: MessageMenuAnchor) => {
@@ -498,6 +613,74 @@ export default function ChatScreen({ route, navigation }: Props) {
   }, [conversationId, isTestBot, subscribe]);
 
   const peerPresence = presence[conversationId];
+
+  // --- Typing indicator ---
+
+  const [peerTyping, setPeerTyping] = useState(false);
+  const typingStopTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const isTypingActiveRef = useRef(false);
+  const peerTypingTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // Tells the peer we stopped typing, if we'd previously told them we
+  // started. Idempotent, so every "stop" call site (inactivity timeout,
+  // message sent, input cleared, leaving the screen) can call it freely.
+  const stopTypingNow = useCallback(() => {
+    if (typingStopTimeoutRef.current) {
+      clearTimeout(typingStopTimeoutRef.current);
+      typingStopTimeoutRef.current = null;
+    }
+    if (isTypingActiveRef.current) {
+      isTypingActiveRef.current = false;
+      if (!isTestBot) getSocket().emit("typing:stop", { recipientId: conversationId });
+    }
+  }, [conversationId, isTestBot]);
+
+  // Debounces our own typing:start/stop emits: fires "start" once per burst
+  // of typing, then "stop" after TYPING_STOP_DELAY_MS of no further
+  // keystrokes (reset on every call), rather than one event per keystroke.
+  const handleDraftChange = useCallback(
+    (text: string) => {
+      setDraft(text);
+      if (isTestBot) return;
+
+      if (!text.trim()) {
+        stopTypingNow();
+        return;
+      }
+
+      if (!isTypingActiveRef.current) {
+        isTypingActiveRef.current = true;
+        getSocket().emit("typing:start", { recipientId: conversationId });
+      }
+      if (typingStopTimeoutRef.current) clearTimeout(typingStopTimeoutRef.current);
+      typingStopTimeoutRef.current = setTimeout(stopTypingNow, TYPING_STOP_DELAY_MS);
+    },
+    [conversationId, isTestBot, stopTypingNow]
+  );
+
+  // Peer's typing:update pushes straight into local state — this is a
+  // live UI signal only, never written to the message DB/history.
+  useEffect(() => {
+    if (isTestBot) return;
+    const socket = getSocket();
+    const onTypingUpdate = ({ userId, typing }: { userId: string; typing: boolean }) => {
+      if (userId !== conversationId) return;
+      if (peerTypingTimeoutRef.current) {
+        clearTimeout(peerTypingTimeoutRef.current);
+        peerTypingTimeoutRef.current = null;
+      }
+      setPeerTyping(typing);
+      if (typing) {
+        peerTypingTimeoutRef.current = setTimeout(() => setPeerTyping(false), TYPING_RECEIVE_TIMEOUT_MS);
+      }
+    };
+    socket.on("typing:update", onTypingUpdate);
+    return () => {
+      socket.off("typing:update", onTypingUpdate);
+      if (peerTypingTimeoutRef.current) clearTimeout(peerTypingTimeoutRef.current);
+      setPeerTyping(false);
+    };
+  }, [conversationId, isTestBot]);
 
   const onClearChat = useCallback(() => {
     const name = conversation?.display_name ?? "this contact";
@@ -545,6 +728,7 @@ export default function ChatScreen({ route, navigation }: Props) {
               name={name}
               online={peerPresence?.online ?? false}
               lastSeenAt={peerPresence?.lastSeenAt ?? null}
+              typing={peerTyping}
               onPress={() => navigation.navigate("ContactInfo", { conversationId })}
             />
           ),
@@ -567,6 +751,7 @@ export default function ChatScreen({ route, navigation }: Props) {
     conversation?.display_name,
     isTestBot,
     peerPresence,
+    peerTyping,
     conversationId,
     onClearChat,
     onDeleteChat,
@@ -596,6 +781,7 @@ export default function ChatScreen({ route, navigation }: Props) {
   useFocusEffect(
     useCallback(() => {
       setMessages(getMessages(conversationId));
+      setCalls(getCallsForConversation(conversationId));
       markVisibleMessagesRead();
     }, [conversationId, markVisibleMessagesRead])
   );
@@ -609,8 +795,11 @@ export default function ChatScreen({ route, navigation }: Props) {
     useCallback(() => {
       setActiveConversationId(conversationId);
       void clearNotificationsForConversation(conversationId);
-      return () => setActiveConversationId(null);
-    }, [conversationId])
+      return () => {
+        setActiveConversationId(null);
+        stopTypingNow();
+      };
+    }, [conversationId, stopTypingNow])
   );
 
   // Incoming messages/receipts/reactions are decrypted and persisted globally
@@ -740,6 +929,7 @@ export default function ChatScreen({ route, navigation }: Props) {
     const text = draft.trim();
     if (!text || !conversation) return;
     setDraft("");
+    stopTypingNow();
     const activeReply = replyingTo;
     setReplyingTo(null);
 
@@ -817,7 +1007,7 @@ export default function ChatScreen({ route, navigation }: Props) {
     }
 
     void sendEncrypted(id, text, activeReply);
-  }, [draft, conversation, conversationId, isTestBot, replyingTo, sendEncrypted]);
+  }, [draft, conversation, conversationId, isTestBot, replyingTo, sendEncrypted, stopTypingNow]);
 
   const onVoiceRecorded = useCallback(
     async ({ uri, durationMs, waveform }: RecordedVoice) => {
@@ -1099,6 +1289,8 @@ export default function ChatScreen({ route, navigation }: Props) {
             <View style={styles.dateSeparator}>
               <Text style={styles.dateSeparatorText}>{item.label}</Text>
             </View>
+          ) : item.type === "call" ? (
+            <CallBubble call={item.call} onRedial={onRedial} />
           ) : (
             <MessageBubble
               message={item.message}
@@ -1167,7 +1359,7 @@ export default function ChatScreen({ route, navigation }: Props) {
             <TextInput
               style={styles.input}
               value={draft}
-              onChangeText={setDraft}
+              onChangeText={handleDraftChange}
               placeholder="Message"
               placeholderTextColor={colors.textTertiary}
               multiline
@@ -1197,7 +1389,7 @@ export default function ChatScreen({ route, navigation }: Props) {
       <EmojiPicker
         open={emojiPickerOpen}
         onClose={() => setEmojiPickerOpen(false)}
-        onEmojiSelected={(emoji: EmojiType) => setDraft((prev) => prev + emoji.emoji)}
+        onEmojiSelected={(emoji: EmojiType) => handleDraftChange(draft + emoji.emoji)}
         enableSearchBar
         enableRecentlyUsed
         categoryPosition="floating"
@@ -1245,6 +1437,34 @@ const createStyles = (colors: ThemeColors) =>
     bubbleRowSpaced: { marginBottom: 10 },
     bubbleRowTight: { marginBottom: 2 },
     bubbleRowReacted: { marginBottom: 18 },
+    callBubble: {
+      maxWidth: "80%",
+      flexDirection: "row",
+      alignItems: "center",
+      gap: 10,
+      borderRadius: 20,
+      paddingHorizontal: 12,
+      paddingVertical: 10,
+      shadowColor: "#000",
+      shadowOffset: { width: 0, height: 1 },
+      shadowOpacity: 0.06,
+      shadowRadius: 2,
+      elevation: 1,
+    },
+    callBubbleIcon: {
+      width: 30,
+      height: 30,
+      borderRadius: 15,
+      alignItems: "center",
+      justifyContent: "center",
+    },
+    callBubbleIconOutgoing: { backgroundColor: "rgba(255,255,255,0.2)" },
+    callBubbleIconIncoming: { backgroundColor: colors.accentSoft },
+    callBubbleText: { gap: 2 },
+    callBubbleLabelRow: { flexDirection: "row", alignItems: "center", gap: 5 },
+    callBubbleLabel: { fontSize: 15 },
+    callMetaMissedOutgoing: { color: "rgba(255,214,214,0.95)" },
+    callMetaMissedIncoming: { color: colors.danger },
     bubble: {
       maxWidth: "80%",
       borderRadius: 20,

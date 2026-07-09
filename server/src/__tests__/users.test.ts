@@ -38,6 +38,34 @@ describe("GET /users/by-email/:email/public-key", () => {
   });
 });
 
+describe("GET /users/by-id/:id", () => {
+  it("requires auth and resolves a user's identity by id", async () => {
+    const app = createApp();
+    const email = "frank@example.com";
+
+    await request(app).post("/auth/otp/request").send({ email });
+    const verifyRes = await request(app)
+      .post("/auth/otp/verify")
+      .send({ email, code: lastOtpCode(), publicKey: "frank-pubkey" });
+    const { token, userId } = verifyRes.body;
+
+    const unauthed = await request(app).get(`/users/by-id/${userId}`);
+    expect(unauthed.status).toBe(401);
+
+    const authed = await request(app)
+      .get(`/users/by-id/${userId}`)
+      .set("Authorization", `Bearer ${token}`);
+
+    expect(authed.status).toBe(200);
+    expect(authed.body).toMatchObject({ userId, email, publicKey: "frank-pubkey" });
+
+    const missing = await request(app)
+      .get("/users/by-id/does-not-exist")
+      .set("Authorization", `Bearer ${token}`);
+    expect(missing.status).toBe(404);
+  });
+});
+
 describe("POST /users/invite", () => {
   it("requires auth and sends an invite email", async () => {
     const app = createApp();

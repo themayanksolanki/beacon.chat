@@ -4,7 +4,7 @@ import { db } from "../db";
 import { users } from "../schema";
 import { requireAuth, type AuthedRequest } from "../auth";
 import { sendInviteEmail } from "../email";
-import { isMongoConnected, profiles } from "../mongo";
+import { isMongoConnected, profiles, resolveAvatarUrl } from "../mongo";
 
 export const usersRouter = Router();
 
@@ -21,6 +21,32 @@ usersRouter.get("/by-email/:email/public-key", requireAuth, (req, res) => {
   }
 
   res.json({ userId: user.id, publicKey: user.public_key });
+});
+
+/**
+ * Resolves a bare user id to their identity/profile. Used by the client to
+ * materialize a local conversation for a sender it has no prior relationship
+ * with (e.g. someone who added you by email before you added them back) —
+ * incoming messages/reactions only carry the sender's id, not their email.
+ */
+usersRouter.get("/by-id/:id", requireAuth, async (req, res) => {
+  const id = String(req.params.id);
+  const user = db.select().from(users).where(eq(users.id, id)).get();
+
+  if (!user || !user.public_key) {
+    res.status(404).json({ error: "user not found" });
+    return;
+  }
+
+  const profile = isMongoConnected() ? await profiles().findOne({ userId: id }) : null;
+
+  res.json({
+    userId: user.id,
+    email: user.email,
+    publicKey: user.public_key,
+    name: profile?.name ?? null,
+    avatarUrl: profile ? resolveAvatarUrl(profile) : null,
+  });
 });
 
 /**
@@ -67,7 +93,7 @@ usersRouter.post("/lookup", requireAuth, async (req, res) => {
         userId: r.id,
         publicKey: r.public_key,
         name: profile?.name ?? null,
-        avatarUrl: profile?.avatarUrl ?? null,
+        avatarUrl: profile ? resolveAvatarUrl(profile) : null,
       };
     }),
   });

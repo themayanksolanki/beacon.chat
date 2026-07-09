@@ -8,10 +8,11 @@ import {
   useState,
   type ReactNode,
 } from "react";
-import { Vibration } from "react-native";
+import { Alert, Platform, Vibration } from "react-native";
 import { StackActions } from "@react-navigation/native";
 import * as Crypto from "expo-crypto";
 import InCallManager from "react-native-incall-manager";
+import RNCallKeep, { CONSTANTS as CK_CONSTANTS } from "react-native-callkeep";
 import {
   mediaDevices,
   MediaStream,
@@ -27,6 +28,24 @@ import { dismissCallScreen, navigationRef } from "../navigation/navigationRef";
 
 const ICE_SERVERS = [{ urls: "stun:stun.l.google.com:19302" }, { urls: "stun:stun1.l.google.com:19302" }];
 const RING_TIMEOUT_MS = 45000;
+
+// The concrete signal that the camera/mic hardware is already held by
+// another app or call (WhatsApp, a cellular call, etc.) rather than some
+// other getUserMedia failure (permission denied, no such device, ...).
+function isMediaBusyError(err: unknown): boolean {
+  const name = (err as { name?: string } | null | undefined)?.name;
+  return name === "NotReadableError" || name === "TrackStartError";
+}
+
+const MEDIA_BUSY_MESSAGE = "Your camera or microphone is already in use by another call. End that call and try again.";
+
+function safeCallKeep(action: () => void) {
+  try {
+    action();
+  } catch (err) {
+    console.warn("[call] CallKeep action failed", err);
+  }
+}
 
 export type CallPhase =
   | "idle"
@@ -59,6 +78,10 @@ interface CallContextValue {
   isSpeakerOn: boolean;
   isCameraOff: boolean;
   callDurationSec: number;
+  // True while the OS has taken the audio session away from this call for
+  // another one (e.g. a cellular call rang mid-call) — the local mic/camera
+  // are paused for the duration, see the didDeactivateAudioSession listener.
+  isSystemInterrupted: boolean;
   startCall: (conversationId: string, kind: CallKind) => Promise<void>;
   acceptIncomingCall: () => Promise<void>;
   rejectIncomingCall: () => void;
@@ -82,6 +105,7 @@ export function CallProvider({ children }: { children: ReactNode }) {
   const [isSpeakerOn, setIsSpeakerOn] = useState(false);
   const [isCameraOff, setIsCameraOff] = useState(false);
   const [callDurationSec, setCallDurationSec] = useState(0);
+  const [isSystemInterrupted, setIsSystemInterrupted] = useState(false);
 
   const peerConnectionRef = useRef<RTCPeerConnection | null>(null);
   const localStreamRef = useRef<MediaStream | null>(null);
@@ -95,6 +119,19 @@ export function CallProvider({ children }: { children: ReactNode }) {
   const connectedAtRef = useRef<number | null>(null);
   const callRef = useRef<CallInfo | null>(null);
   const phaseRef = useRef<CallPhase>("idle");
+  // Whether CallKit (iOS) / self-managed ConnectionService (Android) is up.
+  // Setup fails on simulators, Expo Go, and some older Android builds — every
+  // CallKeep call site is gated on this so those environments fall back to
+  // the pre-CallKeep behavior instead of throwing.
+  const callKeepReadyRef = useRef(false);
+  const isSystemInterruptedRef = useRef(false);
+  const wasMutedBeforeInterruptionRef = useRef(false);
+  const wasCameraOffBeforeInterruptionRef = useRef(false);
+  // Set right before RNCallKeep.startCall() for an outgoing call; the actual
+  // getUserMedia/offer/signaling work is deferred into the
+  // didReceiveStartCallAction listener, which is when CallKit/ConnectionService
+  // has actually accepted the call attempt (see performOutgoingCallSetup).
+  const pendingOutgoingRef = useRef<{ callId: string; conversationId: string; kind: CallKind } | null>(null);
 
   useEffect(() => {
     callRef.current = call;
@@ -102,6 +139,56 @@ export function CallProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     phaseRef.current = phase;
   }, [phase]);
+  useEffect(() => {
+    isSystemInterruptedRef.current = isSystemInterrupted;
+  }, [isSystemInterrupted]);
+
+  // One-time setup so every subsequent call is registered with CallKit
+  // (iOS) / Telecom's self-managed ConnectionService (Android) — this is
+  // what lets the OS arbitrate against a simultaneous cellular call or
+  // another CallKit-integrated VoIP app instead of both apps fighting over
+  // the mic/audio route. Deliberately not gated on `token`: registering the
+  // phone account shouldn't depend on being signed in, and must happen
+  // before any call (including one arriving right after sign-in) can use it.
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        await RNCallKeep.setup({
+          ios: {
+            appName: "Beacon",
+            supportsVideo: true,
+            includesCallsInRecents: false,
+          },
+          android: {
+            alertTitle: "Phone account required",
+            alertDescription: "Beacon needs access to your phone accounts to manage calls and avoid conflicts with other calls.",
+            cancelButton: "Cancel",
+            okButton: "OK",
+            selfManaged: true,
+            additionalPermissions: [],
+            foregroundService: {
+              channelId: "com.beaconchat.app.calls",
+              channelName: "Beacon calls",
+              notificationTitle: "Beacon call in progress",
+            },
+          },
+        });
+        if (cancelled) return;
+        if (Platform.OS === "android") RNCallKeep.setAvailable(true);
+        callKeepReadyRef.current = true;
+      } catch (err) {
+        // Expected on simulators/Expo Go and devices without a Telecom
+        // stack that supports self-managed connections — calls still work
+        // via the app's own UI, just without OS-level call-waiting
+        // arbitration against other apps.
+        console.warn("[call] CallKeep unavailable, falling back to app-only call handling", err);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   const clearRingTimeout = useCallback(() => {
     if (ringTimeoutRef.current) {
@@ -198,7 +285,11 @@ export function CallProvider({ children }: { children: ReactNode }) {
       events.addEventListener("connectionstatechange", () => {
         if (pc.connectionState === "failed" || pc.connectionState === "closed") {
           if (phaseRef.current !== "idle") {
+            const endedCallId = callRef.current?.callId;
             logCallOutcome(phaseRef.current === "connected" ? "completed" : "failed");
+            if (callKeepReadyRef.current && endedCallId) {
+              safeCallKeep(() => RNCallKeep.reportEndCallWithUUID(endedCallId, CK_CONSTANTS.END_CALL_REASONS.FAILED));
+            }
             dismissCallScreen();
             cleanup();
           }
@@ -209,6 +300,68 @@ export function CallProvider({ children }: { children: ReactNode }) {
       return pc;
     },
     [cleanup, logCallOutcome]
+  );
+
+  // The actual media acquisition + signaling for an outgoing call — split
+  // out of startCall() so it can run either immediately (CallKeep
+  // unavailable) or deferred until didReceiveStartCallAction fires (CallKeep
+  // available), which is the point CallKit/ConnectionService has accepted
+  // the call attempt rather than rejecting it for an OS-level reason.
+  const performOutgoingCallSetup = useCallback(
+    async (callId: string, conversationId: string, kind: CallKind) => {
+      try {
+        const localStream = await mediaDevices.getUserMedia({
+          audio: true,
+          video: kind === "video" ? { facingMode: "user" } : false,
+        });
+        localStreamRef.current = localStream;
+        setLocalStreamURL(localStream.toURL());
+        InCallManager.start({ media: kind === "video" ? "video" : "audio" });
+
+        const pc = createPeerConnection(callId);
+        localStream.getTracks().forEach((track) => pc.addTrack(track, localStream));
+
+        const offer = await pc.createOffer();
+        await pc.setLocalDescription(offer);
+
+        getSocket()
+          .timeout(15000)
+          .emit(
+            "call:invite",
+            { callId, calleeId: conversationId, kind, sdp: pc.localDescription!.toJSON() },
+            (err: unknown, ack?: { ok: true } | { ok: false; error: string }) => {
+              if (err || !ack?.ok) {
+                logCallOutcome("failed");
+                if (callKeepReadyRef.current) {
+                  safeCallKeep(() => RNCallKeep.reportEndCallWithUUID(callId, CK_CONSTANTS.END_CALL_REASONS.FAILED));
+                }
+                dismissCallScreen();
+                cleanup();
+              }
+            }
+          );
+
+        ringTimeoutRef.current = setTimeout(() => {
+          if (phaseRef.current === "outgoing-ringing") {
+            getSocket().emit("call:end", { callId });
+            if (callKeepReadyRef.current) safeCallKeep(() => RNCallKeep.endCall(callId));
+            logCallOutcome("missed");
+            dismissCallScreen();
+            cleanup();
+          }
+        }, RING_TIMEOUT_MS);
+      } catch (err) {
+        console.warn("[call] failed to start call", err);
+        if (isMediaBusyError(err)) Alert.alert("Can't start call", MEDIA_BUSY_MESSAGE);
+        logCallOutcome("failed");
+        if (callKeepReadyRef.current) {
+          safeCallKeep(() => RNCallKeep.reportEndCallWithUUID(callId, CK_CONSTANTS.END_CALL_REASONS.FAILED));
+        }
+        dismissCallScreen();
+        cleanup();
+      }
+    },
+    [cleanup, createPeerConnection, logCallOutcome]
   );
 
   const startCall = useCallback(
@@ -240,52 +393,35 @@ export function CallProvider({ children }: { children: ReactNode }) {
         ended_at: null,
       });
 
+      if (!callKeepReadyRef.current) {
+        void performOutgoingCallSetup(callId, conversationId, kind);
+        return;
+      }
+
+      pendingOutgoingRef.current = { callId, conversationId, kind };
       try {
-        const localStream = await mediaDevices.getUserMedia({
-          audio: true,
-          video: kind === "video" ? { facingMode: "user" } : false,
-        });
-        localStreamRef.current = localStream;
-        setLocalStreamURL(localStream.toURL());
-        InCallManager.start({ media: kind === "video" ? "video" : "audio" });
-
-        const pc = createPeerConnection(callId);
-        localStream.getTracks().forEach((track) => pc.addTrack(track, localStream));
-
-        const offer = await pc.createOffer();
-        await pc.setLocalDescription(offer);
-
-        getSocket()
-          .timeout(15000)
-          .emit(
-            "call:invite",
-            { callId, calleeId: conversationId, kind, sdp: pc.localDescription!.toJSON() },
-            (err: unknown, ack?: { ok: true } | { ok: false; error: string }) => {
-              if (err || !ack?.ok) {
-                logCallOutcome("failed");
-                dismissCallScreen();
-                cleanup();
-              }
-            }
-          );
-
-        ringTimeoutRef.current = setTimeout(() => {
-          if (phaseRef.current === "outgoing-ringing") {
-            getSocket().emit("call:end", { callId });
-            logCallOutcome("missed");
-            dismissCallScreen();
-            cleanup();
-          }
-        }, RING_TIMEOUT_MS);
+        RNCallKeep.startCall(callId, conversationId, info.peerName, "generic", kind === "video");
       } catch (err) {
-        console.warn("[call] failed to start call", err);
-        logCallOutcome("failed");
-        dismissCallScreen();
-        cleanup();
+        console.warn("[call] RNCallKeep.startCall failed, proceeding without it", err);
+        pendingOutgoingRef.current = null;
+        void performOutgoingCallSetup(callId, conversationId, kind);
       }
     },
-    [cleanup, createPeerConnection, logCallOutcome]
+    [performOutgoingCallSetup]
   );
+
+  // CallKit/ConnectionService's contract: the actual call setup work has to
+  // happen from within this handler, once the OS has accepted the call
+  // attempt (rather than immediately after requesting it).
+  useEffect(() => {
+    const listener = RNCallKeep.addEventListener("didReceiveStartCallAction", ({ callUUID }) => {
+      const pending = pendingOutgoingRef.current;
+      if (!pending || !callUUID || pending.callId !== callUUID) return;
+      pendingOutgoingRef.current = null;
+      void performOutgoingCallSetup(pending.callId, pending.conversationId, pending.kind);
+    });
+    return () => listener.remove();
+  }, [performOutgoingCallSetup]);
 
   const handleInvite = useCallback((payload: IncomingInvite) => {
     if (phaseRef.current !== "idle") return; // server already prevents this via busy tracking, belt & suspenders
@@ -315,9 +451,22 @@ export function CallProvider({ children }: { children: ReactNode }) {
       ended_at: null,
     });
 
+    // Registers the call with CallKit/ConnectionService so the OS is aware
+    // of it — this is what makes a simultaneous cellular call (or another
+    // CallKit-integrated VoIP app) show proper call-waiting behavior instead
+    // of both apps silently fighting over the mic. The app's own
+    // IncomingCallScreen (navigated to above) stays the primary accept/
+    // decline surface.
+    if (callKeepReadyRef.current) {
+      safeCallKeep(() =>
+        RNCallKeep.displayIncomingCall(payload.callId, payload.callerId, info.peerName, "generic", payload.kind === "video")
+      );
+    }
+
     ringTimeoutRef.current = setTimeout(() => {
       if (phaseRef.current === "incoming-ringing") {
         getSocket().emit("call:reject", { callId: payload.callId });
+        if (callKeepReadyRef.current) safeCallKeep(() => RNCallKeep.rejectCall(payload.callId));
         logCallOutcome("missed");
         dismissCallScreen();
         cleanup();
@@ -334,6 +483,8 @@ export function CallProvider({ children }: { children: ReactNode }) {
     if (navigationRef.isReady()) {
       navigationRef.dispatch(StackActions.replace("ActiveCall"));
     }
+
+    if (callKeepReadyRef.current) safeCallKeep(() => RNCallKeep.answerIncomingCall(invite.callId));
 
     try {
       const localStream = await mediaDevices.getUserMedia({
@@ -357,7 +508,11 @@ export function CallProvider({ children }: { children: ReactNode }) {
       getSocket().emit("call:answer", { callId: invite.callId, sdp: pc.localDescription!.toJSON() });
     } catch (err) {
       console.warn("[call] failed to accept call", err);
+      if (isMediaBusyError(err)) Alert.alert("Can't answer call", MEDIA_BUSY_MESSAGE);
       getSocket().emit("call:end", { callId: invite.callId });
+      if (callKeepReadyRef.current) {
+        safeCallKeep(() => RNCallKeep.reportEndCallWithUUID(invite.callId, CK_CONSTANTS.END_CALL_REASONS.FAILED));
+      }
       logCallOutcome("failed");
       dismissCallScreen();
       cleanup();
@@ -368,6 +523,7 @@ export function CallProvider({ children }: { children: ReactNode }) {
     const invite = incomingInviteRef.current;
     if (!invite) return;
     getSocket().emit("call:reject", { callId: invite.callId });
+    if (callKeepReadyRef.current) safeCallKeep(() => RNCallKeep.rejectCall(invite.callId));
     logCallOutcome("declined");
     dismissCallScreen();
     cleanup();
@@ -377,6 +533,7 @@ export function CallProvider({ children }: { children: ReactNode }) {
     const info = callRef.current;
     if (!info) return;
     getSocket().emit("call:end", { callId: info.callId });
+    if (callKeepReadyRef.current) safeCallKeep(() => RNCallKeep.endCall(info.callId));
     logCallOutcome(phaseRef.current === "connected" ? "completed" : "missed");
     dismissCallScreen();
     cleanup();
@@ -422,6 +579,16 @@ export function CallProvider({ children }: { children: ReactNode }) {
       const status: CallStatus =
         payload.reason === "rejected" ? "declined" : phaseRef.current === "connected" ? "completed" : "missed";
       logCallOutcome(status);
+      if (callKeepReadyRef.current) {
+        safeCallKeep(() =>
+          RNCallKeep.reportEndCallWithUUID(
+            payload.callId,
+            payload.reason === "rejected"
+              ? CK_CONSTANTS.END_CALL_REASONS.DECLINED_ELSEWHERE
+              : CK_CONSTANTS.END_CALL_REASONS.REMOTE_ENDED
+          )
+        );
+      }
       dismissCallScreen();
       cleanup();
     },
@@ -443,11 +610,71 @@ export function CallProvider({ children }: { children: ReactNode }) {
     };
   }, [token, handleInvite, handleAnswer, handleRemoteIceCandidate, handleRemoteEnd]);
 
+  // Mirrors the system's own mute button (car Bluetooth, CallKit's lock
+  // screen card) back into our WebRTC track/UI state.
+  useEffect(() => {
+    const listener = RNCallKeep.addEventListener("didPerformSetMutedCallAction", ({ muted, callUUID }) => {
+      if (callRef.current?.callId !== callUUID) return;
+      const track = localStreamRef.current?.getAudioTracks()[0];
+      if (track) track.enabled = !muted;
+      setIsMuted(muted);
+    });
+    return () => listener.remove();
+  }, []);
+
+  // The core "gracefully manage camera/mic as system resources become
+  // available" behavior: when the OS hands our audio session to another
+  // call (e.g. a cellular call rings mid-Beacon-call), pause our local
+  // tracks rather than let them silently lose the hardware; resume them
+  // (respecting whatever the user had manually muted/camera-off'd going in)
+  // once the OS hands the session back.
+  useEffect(() => {
+    const onDeactivated = () => {
+      if (phaseRef.current !== "connected") return;
+      const audioTrack = localStreamRef.current?.getAudioTracks()[0];
+      const videoTrack = localStreamRef.current?.getVideoTracks()[0];
+      wasMutedBeforeInterruptionRef.current = audioTrack ? !audioTrack.enabled : false;
+      wasCameraOffBeforeInterruptionRef.current = videoTrack ? !videoTrack.enabled : false;
+      if (audioTrack) audioTrack.enabled = false;
+      if (videoTrack) videoTrack.enabled = false;
+      setIsSystemInterrupted(true);
+    };
+
+    const onActivated = () => {
+      // Also fires on the initial activation for a normal call (outgoing
+      // once CallKit connects it, incoming once answered) — only meaningful
+      // here as a *resume* signal, so ignore it unless we were actually
+      // mid-interruption.
+      if (!isSystemInterruptedRef.current) return;
+      const audioTrack = localStreamRef.current?.getAudioTracks()[0];
+      const videoTrack = localStreamRef.current?.getVideoTracks()[0];
+      if (audioTrack && !wasMutedBeforeInterruptionRef.current) audioTrack.enabled = true;
+      if (videoTrack && !wasCameraOffBeforeInterruptionRef.current) videoTrack.enabled = true;
+      setIsSystemInterrupted(false);
+    };
+
+    const deactivatedListener = RNCallKeep.addEventListener("didDeactivateAudioSession", onDeactivated);
+    const activatedListener = RNCallKeep.addEventListener("didActivateAudioSession", onActivated);
+    return () => {
+      deactivatedListener.remove();
+      activatedListener.remove();
+    };
+  }, []);
+
   const toggleMute = useCallback(() => {
     const track = localStreamRef.current?.getAudioTracks()[0];
     if (!track) return;
     track.enabled = !track.enabled;
-    setIsMuted(!track.enabled);
+    const nowMuted = !track.enabled;
+    setIsMuted(nowMuted);
+    // Android's self-managed ConnectionService has no equivalent JS setter
+    // for this (see index.d.ts) — the local track flip above is all that
+    // platform needs. iOS's CallKit UI/hardware buttons (car Bluetooth, the
+    // lock-screen call card) need to be told explicitly or they'll disagree
+    // with our in-app mute button.
+    if (callKeepReadyRef.current && Platform.OS === "ios" && callRef.current) {
+      safeCallKeep(() => RNCallKeep.setMutedCall(callRef.current!.callId, nowMuted));
+    }
   }, []);
 
   const toggleSpeaker = useCallback(() => {
@@ -481,6 +708,7 @@ export function CallProvider({ children }: { children: ReactNode }) {
       isSpeakerOn,
       isCameraOff,
       callDurationSec,
+      isSystemInterrupted,
       startCall,
       acceptIncomingCall,
       rejectIncomingCall,
@@ -499,6 +727,7 @@ export function CallProvider({ children }: { children: ReactNode }) {
       isSpeakerOn,
       isCameraOff,
       callDurationSec,
+      isSystemInterrupted,
       startCall,
       acceptIncomingCall,
       rejectIncomingCall,

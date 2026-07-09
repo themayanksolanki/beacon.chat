@@ -237,6 +237,29 @@ export function createSocketServer(httpServer: HttpServer): Server {
       }
     );
 
+    // --- Typing indicators ---
+    // Pure ephemeral relay, like the ICE candidates below: never persisted,
+    // and the server holds no state on who's typing to whom. A dropped
+    // connection just means the recipient's own client-side timeout clears
+    // the indicator (see ChatScreen) instead of the server having to notice
+    // the disconnect and emit an explicit stop on the sender's behalf.
+
+    socket.on("typing:start", (payload: { recipientId: string }) => {
+      try {
+        io!.to(payload.recipientId).emit("typing:update", { userId, typing: true });
+      } catch (err) {
+        console.error("[socket] typing:start failed", err);
+      }
+    });
+
+    socket.on("typing:stop", (payload: { recipientId: string }) => {
+      try {
+        io!.to(payload.recipientId).emit("typing:update", { userId, typing: false });
+      } catch (err) {
+        console.error("[socket] typing:stop failed", err);
+      }
+    });
+
     // --- Calling (WebRTC signaling relay only — no media touches this server) ---
 
     socket.on(
