@@ -61,7 +61,9 @@
           "microphonePermission": "Beacon needs microphone access for voice and video calls."
         }
       ],
-      "expo-notifications"
+      "expo-notifications",
+      "expo-font",
+      "expo-asset"
     ],
     "extra": {
       "eas": {
