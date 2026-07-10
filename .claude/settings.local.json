@@ -112,7 +112,15 @@
       "Bash(brew install *)",
       "Bash(mkdir -p /Users/mayanksolanki/Documents/beacon.chat/app/keystore)",
       "Bash(/opt/homebrew/opt/openjdk/bin/keytool -genkeypair -v -keystore /Users/mayanksolanki/Documents/beacon.chat/app/keystore/beacon-release.keystore -alias beacon-release -keyalg RSA -keysize 2048 -validity 10000 -storepass beacon123 -keypass beacon123 -dname 'CN=Beacon, OU=Beacon, O=Beacon, L=Unknown, ST=Unknown, C=US')",
-      "Bash(echo \"EXIT: $?\")"
+      "Bash(echo \"EXIT: $?\")",
+      "Bash(adb devices *)",
+      "Bash(emulator -list-avds)",
+      "Bash(xargs -I{} echo {})",
+      "Bash(xargs cat)",
+      "Read(//Users/mayanksolanki/Library/Android/**)",
+      "Read(//Applications/**)",
+      "Read(//Users/mayanksolanki/Library/**)",
+      "Bash(java -version)"
     ]
   }
 }
