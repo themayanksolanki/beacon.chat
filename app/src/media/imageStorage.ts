@@ -25,6 +25,15 @@ export function writeImageMessageBase64(base64: string, messageId: string): stri
   return destination.uri;
 }
 
+/** Writes decrypted image bytes (downloaded from S3 via the new attachment pipeline) to permanent storage. */
+export function writeImageMessageBytes(bytes: Uint8Array, messageId: string): string {
+  const destination = new File(imageDirectory(), `${messageId}.jpg`);
+  if (destination.exists) destination.delete();
+  destination.create({ overwrite: true });
+  destination.write(bytes);
+  return destination.uri;
+}
+
 export function readImageMessageBase64(uri: string): string {
   return new File(uri).base64Sync();
 }

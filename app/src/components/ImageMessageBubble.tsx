@@ -1,5 +1,5 @@
 import { useMemo } from "react";
-import { ActivityIndicator, Image, Pressable, StyleSheet, View } from "react-native";
+import { ActivityIndicator, Image, Pressable, StyleSheet, Text, View } from "react-native";
 import { Ionicons } from "@expo/vector-icons";
 
 import { useTheme } from "../ThemeContext";
@@ -14,11 +14,21 @@ interface Props {
   width: number;
   height: number;
   isSending: boolean;
+  /** Fraction 0..1 of an in-flight S3 upload; renders as "NN%" over the spinner. Omit for the legacy inline-send path, which has no incremental progress to report. */
+  uploadProgress?: number;
   onCancelSend?: () => void;
   onPress?: () => void;
 }
 
-export default function ImageMessageBubble({ imageUri, width, height, isSending, onCancelSend, onPress }: Props) {
+export default function ImageMessageBubble({
+  imageUri,
+  width,
+  height,
+  isSending,
+  uploadProgress,
+  onCancelSend,
+  onPress,
+}: Props) {
   const { colors } = useTheme();
   const styles = useMemo(() => createStyles(colors), [colors]);
 
@@ -48,6 +58,9 @@ export default function ImageMessageBubble({ imageUri, width, height, isSending,
       {isSending ? (
         <View style={styles.overlay}>
           <ActivityIndicator color="#fff" />
+          {uploadProgress != null ? (
+            <Text style={styles.progressText}>{Math.round(uploadProgress * 100)}%</Text>
+          ) : null}
           {onCancelSend ? (
             <Pressable style={styles.cancelButton} onPress={onCancelSend} hitSlop={8}>
               <Ionicons name="close" size={16} color="#fff" />
@@ -74,6 +87,7 @@ const createStyles = (colors: ThemeColors) =>
       alignItems: "center",
       justifyContent: "center",
     },
+    progressText: { color: "#fff", fontSize: 12, fontWeight: "700", marginTop: 6 },
     cancelButton: {
       position: "absolute",
       top: 6,

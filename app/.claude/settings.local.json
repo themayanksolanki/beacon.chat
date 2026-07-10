@@ -11,7 +11,10 @@
       "Bash(npx expo *)",
       "Bash(npx expo-doctor *)",
       "Read(//Users/mayanksolanki/Documents/beacon.chat/server/**)",
-      "Bash(grep -rniE \"avatar|profile.*upload|upload.*profile|presign\" --include=\"*.ts\" -l src)"
+      "Bash(grep -rniE \"avatar|profile.*upload|upload.*profile|presign\" --include=\"*.ts\" -l src)",
+      "Bash(tee /private/tmp/claude-501/-Users-mayanksolanki-Documents-beacon-chat-app/9c1920f4-c39d-4efb-adec-3ea509ff3db3/scratchpad/expo_run_ios.log)",
+      "Read(//Users/mayanksolanki/Library/Logs/DiagnosticReports/**)",
+      "Read(//Users/mayanksolanki/Documents/beacon.chat/**)"
     ]
   }
 }

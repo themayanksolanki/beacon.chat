@@ -102,6 +102,8 @@ export interface UserLookup {
   publicKey: string;
   name: string | null;
   avatarUrl: string | null;
+  contactNumber: string | null;
+  createdAt: number;
 }
 
 /** Resolves a bare sender/recipient id to their identity, e.g. to materialize a conversation for an unknown sender. */
@@ -161,4 +163,22 @@ export interface AvatarUploadTarget {
 
 export function requestAvatarUploadUrl(token: string) {
   return request<AvatarUploadTarget>("/profile/avatar/upload-url", { method: "POST", token });
+}
+
+export type ChatMediaKind = "image" | "video" | "file";
+
+export interface ChatMediaUploadTarget {
+  url: string;
+  fields: Record<string, string>;
+  key: string;
+  publicUrl: string;
+  maxBytes: number;
+}
+
+export function requestChatMediaUploadUrl(token: string, messageId: string, kind: ChatMediaKind) {
+  return request<ChatMediaUploadTarget>("/media/chat/upload-url", {
+    method: "POST",
+    token,
+    body: JSON.stringify({ messageId, kind }),
+  });
 }

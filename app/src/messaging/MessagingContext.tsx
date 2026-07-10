@@ -19,6 +19,7 @@ import {
   type ConversationRow,
   type MessageRow,
 } from "../db/database";
+import { fetchAndStoreChatMedia } from "../media/chatMediaDownload";
 import { writeImageMessageBase64 } from "../media/imageStorage";
 import { getSocket } from "../network/socket";
 import { navigateToConversation } from "../navigation/navigationRef";
@@ -34,12 +35,56 @@ import {
 const VOICE_MESSAGE_LABEL = "🎤 Voice message";
 const IMAGE_MESSAGE_LABEL = "📷 Photo";
 const GIF_MESSAGE_LABEL = "🎞️ GIF";
+const VIDEO_MESSAGE_LABEL = "🎬 Video";
 
+interface ReplyRef {
+  id: string;
+  preview: string;
+}
+
+// image has two wire shapes, disambiguated by `transport`: legacy inline
+// (base64 embedded directly, same as voice) for messages sent before the S3
+// attachment pipeline existed, vs. the new S3-backed shape (also used by
+// video/file, always S3 — too big to ever go inline). `transport?: undefined`
+// on the legacy variant lets payload.transport be checked directly to
+// distinguish the two without a separate type guard.
 export type MessagePayload =
-  | { kind: "text"; text: string; replyTo?: { id: string; preview: string } }
-  | { kind: "voice"; audio: string; durationMs: number; waveform: number[]; replyTo?: { id: string; preview: string } }
-  | { kind: "image"; image: string; width: number; height: number; replyTo?: { id: string; preview: string } }
-  | { kind: "gif"; url: string; width: number; height: number; replyTo?: { id: string; preview: string } };
+  | { kind: "text"; text: string; replyTo?: ReplyRef }
+  | { kind: "voice"; audio: string; durationMs: number; waveform: number[]; replyTo?: ReplyRef }
+  | { kind: "image"; transport?: undefined; image: string; width: number; height: number; replyTo?: ReplyRef }
+  | {
+      kind: "image";
+      transport: "s3";
+      url: string;
+      keyB64: string;
+      nonceB64: string;
+      width: number;
+      height: number;
+      size: number;
+      replyTo?: ReplyRef;
+    }
+  | { kind: "gif"; url: string; width: number; height: number; replyTo?: ReplyRef }
+  | {
+      kind: "video";
+      url: string;
+      keyB64: string;
+      nonceB64: string;
+      width: number;
+      height: number;
+      durationMs: number;
+      size: number;
+      replyTo?: ReplyRef;
+    }
+  | {
+      kind: "file";
+      url: string;
+      keyB64: string;
+      nonceB64: string;
+      name: string;
+      mime: string;
+      size: number;
+      replyTo?: ReplyRef;
+    };
 
 export interface ReactionPayload {
   emoji: string;
@@ -125,6 +170,7 @@ export function MessagingProvider({ children }: { children: ReactNode }) {
           avatar_url: peer.avatarUrl,
           created_at: Date.now(),
           status: "accepted",
+          contact_number: peer.contactNumber,
         };
         insertConversation(conversation);
         return getConversationById(peerId);
@@ -175,8 +221,22 @@ export function MessagingProvider({ children }: { children: ReactNode }) {
           identity.privateKey
         );
         const payload: MessagePayload = JSON.parse(decrypted);
+
+        // Legacy inline images (pre-S3-attachment-pipeline) still arrive as
+        // base64 embedded directly in the payload, same as voice.
+        const isLegacyInlineImage = payload.kind === "image" && payload.transport !== "s3";
         const audioUri = payload.kind === "voice" ? writeVoiceMessageBase64(payload.audio, message.id) : null;
-        const imageUri = payload.kind === "image" ? writeImageMessageBase64(payload.image, message.id) : null;
+        const imageUri =
+          payload.kind === "image" && isLegacyInlineImage ? writeImageMessageBase64(payload.image, message.id) : null;
+
+        // S3-backed kinds (image sent via the new attachment pipeline, video,
+        // file) don't carry their bytes in this payload at all — just the S3
+        // reference and the symmetric key/nonce to decrypt it (see
+        // crypto/fileCrypto.ts). Video defaults to 'idle' (tap-to-download,
+        // given files can be up to 100MB) while image/file auto-download
+        // below, same as legacy inline images did automatically.
+        const isS3Media =
+          payload.kind === "video" || payload.kind === "file" || (payload.kind === "image" && payload.transport === "s3");
 
         const row: MessageRow = {
           id: message.id,
@@ -189,7 +249,11 @@ export function MessagingProvider({ children }: { children: ReactNode }) {
                 ? IMAGE_MESSAGE_LABEL
                 : payload.kind === "gif"
                   ? GIF_MESSAGE_LABEL
-                  : payload.text,
+                  : payload.kind === "video"
+                    ? VIDEO_MESSAGE_LABEL
+                    : payload.kind === "file"
+                      ? `📎 ${payload.name}`
+                      : payload.text,
           sent_at: message.created_at,
           status: "delivered",
           delivered_at: message.created_at,
@@ -212,10 +276,34 @@ export function MessagingProvider({ children }: { children: ReactNode }) {
           gif_url: payload.kind === "gif" ? payload.url : null,
           gif_width: payload.kind === "gif" ? payload.width : null,
           gif_height: payload.kind === "gif" ? payload.height : null,
+          video_uri: null,
+          video_width: payload.kind === "video" ? payload.width : null,
+          video_height: payload.kind === "video" ? payload.height : null,
+          video_duration_ms: payload.kind === "video" ? payload.durationMs : null,
+          video_size: payload.kind === "video" ? payload.size : null,
+          file_uri: null,
+          file_name: payload.kind === "file" ? payload.name : null,
+          file_mime: payload.kind === "file" ? payload.mime : null,
+          file_size: payload.kind === "file" ? payload.size : null,
+          media_url: isS3Media ? payload.url : null,
+          media_key: isS3Media ? payload.keyB64 : null,
+          media_nonce: isS3Media ? payload.nonceB64 : null,
+          media_status: payload.kind === "video" ? "idle" : isS3Media ? "downloading" : "ready",
         };
         insertMessage(row);
         getSocket().emit("message:delivered", { id: message.id });
         bump();
+
+        // Fire-and-forget: image/file auto-download+decrypt in the
+        // background (parity with legacy inline images' automatic local
+        // write above); video stays 'idle' until the user taps to download
+        // (see ChatScreen), given it can be far larger. Either way, bump()
+        // again once the local file lands so mounted screens re-read it.
+        if ((payload.kind === "image" && payload.transport === "s3") || payload.kind === "file") {
+          void fetchAndStoreChatMedia(row)
+            .then(bump)
+            .catch(() => bump());
+        }
 
         void notifyNewMessage({
           conversationId: message.sender_id,
@@ -292,6 +380,7 @@ export function MessagingProvider({ children }: { children: ReactNode }) {
           avatar_url: peer.avatarUrl,
           created_at: Date.now(),
           status: "pending_incoming",
+          contact_number: peer.contactNumber,
         });
         bump();
       } catch (err) {

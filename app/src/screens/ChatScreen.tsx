@@ -3,7 +3,7 @@ import {
   Alert,
   Animated,
   FlatList,
-  Image,
+  Keyboard,
   KeyboardAvoidingView,
   PanResponder,
   Platform,
@@ -13,30 +13,33 @@ import {
   TextInput,
   View,
 } from "react-native";
-import { Ionicons } from "@expo/vector-icons";
+import { Ionicons, MaterialCommunityIcons } from "@expo/vector-icons";
 import * as Clipboard from "expo-clipboard";
 import * as Crypto from "expo-crypto";
+import * as DocumentPicker from "expo-document-picker";
 import * as ImagePicker from "expo-image-picker";
 import sodium from "react-native-libsodium";
 import { useFocusEffect, useIsFocused } from "@react-navigation/native";
 import type { NativeStackScreenProps } from "@react-navigation/native-stack";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
-import EmojiPicker, { type EmojiType } from "rn-emoji-keyboard";
+import { type EmojiType } from "rn-emoji-keyboard";
 
 import type { MainStackParamList } from "../../App";
 import { getUserById } from "../api/client";
 import { useAuth } from "../auth/AuthContext";
 import { useVoiceRecorder, type RecordedVoice } from "../audio/useVoiceRecorder";
-import { clearConversation } from "../chat/clearConversation";
 import { acceptContactRequest, rejectContactRequest } from "../chat/contactRequests";
-import { deleteConversation } from "../chat/deleteConversation";
 import { persistRecordedVoice, readVoiceMessageBase64 } from "../audio/voiceStorage";
+import AttachmentSheet from "../components/AttachmentSheet";
+import Avatar from "../components/Avatar";
+import FileMessageBubble from "../components/FileMessageBubble";
+import EmojiGifTray from "../components/EmojiGifTray";
 import ImageMessageBubble from "../components/ImageMessageBubble";
 import MessageActionMenu, { type MessageAction, type MessageMenuAnchor } from "../components/MessageActionMenu";
+import VideoMessageBubble from "../components/VideoMessageBubble";
 import VoiceMessageBubble from "../components/VoiceMessageBubble";
 import { encryptMessage, getOrCreateIdentity } from "../crypto/identity";
 import {
-  blockUser,
   deleteMessage,
   getCallsForConversation,
   getConversationById,
@@ -50,15 +53,28 @@ import {
   markMessageRead,
   markMessageSent,
   pinMessage,
+  setMessageMediaStatus,
   setMyReaction,
   unpinMessage,
   updateConversationPeerKey,
+  updateConversationProfile,
   type CallRow,
   type MessageRow,
 } from "../db/database";
+import {
+  ChatMediaTooLargeError,
+  ChatMediaUploadUnavailableError,
+  deletePendingChatMediaCiphertext,
+  encryptFileForUpload,
+  maxBytesForChatMediaKind,
+  uploadChatMedia,
+} from "../media/chatMediaUpload";
+import { fetchAndStoreChatMedia } from "../media/chatMediaDownload";
 import { compressImage } from "../media/imageCompression";
 import { deleteImageMessage, persistPickedImage, readImageMessageBase64 } from "../media/imageStorage";
-import { isGifPickerAvailable, pickGif } from "../media/gifPicker";
+import { deleteFileMessage, persistPickedFile, readFileMessageBase64 } from "../media/fileStorage";
+import { deleteVideoMessage, persistPickedVideo, readVideoMessageBase64 } from "../media/videoStorage";
+import { type PickedGif } from "../media/gifPicker";
 import {
   base64FromRemoteUrl,
   isDownloadAvailable,
@@ -71,13 +87,40 @@ import { useMessaging, type MessagePayload, type ReactionPayload } from "../mess
 import { setActiveConversationId } from "../notifications/activeChatTracker";
 import { clearNotificationsForConversation } from "../notifications/notificationService";
 import { usePresence } from "../presence/PresenceContext";
-import { TEST_BOT_CONVERSATION_ID } from "../testBot";
+import { cleanupExpiredTestBotMessages, TEST_BOT_CONVERSATION_ID } from "../testBot";
+import { generateTestBotReply } from "../testBotAi";
 import { useTheme } from "../ThemeContext";
 import { colorForName, initialFor, type ThemeColors } from "../theme";
 
 const VOICE_MESSAGE_LABEL = "🎤 Voice message";
 const IMAGE_MESSAGE_LABEL = "📷 Photo";
 const GIF_MESSAGE_LABEL = "🎞️ GIF";
+const VIDEO_MESSAGE_LABEL = "🎬 Video";
+
+// Kinds sent through the S3 encrypt-then-upload pipeline (see
+// media/chatMediaUpload.ts) — image via camera/attachment-menu, video, and
+// generic file attachments. Voice notes and legacy inline images are not
+// included; they keep sending as base64 embedded in the encrypted payload.
+type AttachmentKind = "image" | "video" | "file";
+
+// Spread into MessageRow literals for kinds that never touch video/file/S3
+// media (text, voice, gif, legacy inline images) so those columns don't have
+// to be repeated null-by-null at every construction site.
+const NO_MEDIA_FIELDS = {
+  video_uri: null,
+  video_width: null,
+  video_height: null,
+  video_duration_ms: null,
+  video_size: null,
+  file_uri: null,
+  file_name: null,
+  file_mime: null,
+  file_size: null,
+  media_url: null,
+  media_key: null,
+  media_nonce: null,
+  media_status: "ready",
+} as const;
 
 type Props = NativeStackScreenProps<MainStackParamList, "Chat">;
 
@@ -98,8 +141,17 @@ const TYPING_RECEIVE_TIMEOUT_MS = 6000;
 // Same safety net, for the peer-is-recording indicator.
 const RECORDING_RECEIVE_TIMEOUT_MS = 6000;
 
+// text.slice cuts by UTF-16 code unit, which can land inside a surrogate
+// pair — most emoji outside the BMP (😀, 🎉, ...) are two code units — and
+// corrupt the preview into a lone surrogate that renders as a broken glyph.
+// Array.from splits by code point instead, so a cut always falls between
+// whole characters (long ZWJ sequences like family/flag emoji can still be
+// split into their constituent parts, but each part still renders validly).
 function truncate(text: string) {
-  return text.length > REPLY_PREVIEW_MAX_LENGTH ? `${text.slice(0, REPLY_PREVIEW_MAX_LENGTH)}…` : text;
+  const chars = Array.from(text);
+  return chars.length > REPLY_PREVIEW_MAX_LENGTH
+    ? `${chars.slice(0, REPLY_PREVIEW_MAX_LENGTH).join("")}…`
+    : text;
 }
 
 function formatTime(ts: number) {
@@ -156,16 +208,7 @@ function ChatHeaderTitle({
       onPress={onPress}
       hitSlop={8}
     >
-      <View style={styles.headerAvatarWrap}>
-        {avatarUrl ? (
-          <Image source={{ uri: avatarUrl }} style={styles.headerAvatar} />
-        ) : (
-          <View style={[styles.headerAvatar, { backgroundColor: colorForName(name) }]}>
-            <Text style={styles.headerAvatarText}>{initialFor(name)}</Text>
-          </View>
-        )}
-        {online ? <View style={styles.headerOnlineDot} /> : null}
-      </View>
+      <Avatar name={name} avatarUrl={avatarUrl} size={36} onlineDot={online} />
       <View style={styles.headerTextCol}>
         <Text style={styles.headerName} numberOfLines={1}>
           {name}
@@ -205,11 +248,13 @@ function ChatHeaderCallButtons({ conversationId, disabled }: { conversationId: s
 function RequestActionBanner({
   status,
   peerName,
+  peerAvatarUrl,
   onAccept,
   onReject,
 }: {
   status: "pending_outgoing" | "pending_incoming" | "declined";
   peerName: string;
+  peerAvatarUrl: string | null;
   onAccept: () => void;
   onReject: () => void;
 }) {
@@ -219,7 +264,12 @@ function RequestActionBanner({
   if (status === "pending_incoming") {
     return (
       <View style={styles.requestBanner}>
-        <Text style={styles.requestBannerText}>{peerName} wants to message you.</Text>
+        <View style={styles.requestBannerPeerRow}>
+          <Avatar name={peerName} avatarUrl={peerAvatarUrl} size={40} />
+          <Text style={[styles.requestBannerText, styles.requestBannerPeerText]}>
+            {peerName} wants to message you.
+          </Text>
+        </View>
         <View style={styles.requestBannerActions}>
           <Pressable style={[styles.requestBannerButton, styles.requestBannerReject]} onPress={onReject}>
             <Text style={[styles.requestBannerButtonText, { color: colors.danger }]}>Decline</Text>
@@ -238,46 +288,6 @@ function RequestActionBanner({
         {status === "pending_outgoing" ? "Request sent — waiting for them to accept." : "This request was declined."}
       </Text>
     </View>
-  );
-}
-
-function ChatHeaderOptionsButton({
-  onClearChat,
-  onDeleteChat,
-  onBlockUser,
-  onDeleteUser,
-}: {
-  onClearChat: () => void;
-  onDeleteChat: () => void;
-  onBlockUser: () => void;
-  onDeleteUser: () => void;
-}) {
-  const { colors } = useTheme();
-  const buttonRef = useRef<View>(null);
-  const [anchor, setAnchor] = useState<MessageMenuAnchor | null>(null);
-  const [visible, setVisible] = useState(false);
-
-  const actions: MessageAction[] = [
-    { label: "Clear Chat", icon: "brush-outline", destructive: true, onPress: onClearChat },
-    { label: "Delete Chat", icon: "trash-outline", destructive: true, onPress: onDeleteChat },
-    { label: "Block User", icon: "ban-outline", destructive: true, onPress: onBlockUser },
-    { label: "Delete User", icon: "person-remove-outline", destructive: true, onPress: onDeleteUser },
-  ];
-
-  const showOptions = () => {
-    buttonRef.current?.measureInWindow((x, y, width, height) => {
-      setAnchor({ x, y, width, height });
-      setVisible(true);
-    });
-  };
-
-  return (
-    <>
-      <Pressable ref={buttonRef} onPress={showOptions} hitSlop={8} style={{ marginLeft: 18 }}>
-        <Ionicons name="ellipsis-vertical" size={20} color={colors.accent} />
-      </Pressable>
-      <MessageActionMenu visible={visible} anchor={anchor} actions={actions} onClose={() => setVisible(false)} />
-    </>
   );
 }
 
@@ -372,6 +382,9 @@ interface MessageBubbleProps {
   onOpenMenu: (message: MessageRow, actions: MessageAction[], anchor: MessageMenuAnchor) => void;
   onCancelSend: (message: MessageRow) => void;
   onSaveMedia: (message: MessageRow) => void;
+  onDownload: (message: MessageRow) => void;
+  /** Fraction 0..1 of an in-flight attachment upload for this message, if any. */
+  uploadProgress?: number;
 }
 
 function MessageBubble({
@@ -387,6 +400,8 @@ function MessageBubble({
   onOpenMenu,
   onCancelSend,
   onSaveMedia,
+  onDownload,
+  uploadProgress,
 }: MessageBubbleProps) {
   const { colors } = useTheme();
   const styles = useMemo(() => createStyles(colors), [colors]);
@@ -528,6 +543,7 @@ function MessageBubble({
                   width={message.image_width ?? 0}
                   height={message.image_height ?? 0}
                   isSending={isOutgoing && message.status === "pending"}
+                  uploadProgress={isOutgoing ? uploadProgress : undefined}
                   onCancelSend={
                     isOutgoing && message.status === "pending" ? () => onCancelSend(message) : undefined
                   }
@@ -549,6 +565,33 @@ function MessageBubble({
                       with how photos render) doesn't. */}
                   <Text style={styles.gifAttribution}>GIPHY</Text>
                 </View>
+              ) : message.kind === "video" ? (
+                <VideoMessageBubble
+                  videoUri={message.video_uri}
+                  width={message.video_width ?? 0}
+                  height={message.video_height ?? 0}
+                  durationMs={message.video_duration_ms ?? 0}
+                  sizeBytes={message.file_size}
+                  mediaStatus={message.media_status}
+                  isSending={isOutgoing && message.status === "pending"}
+                  uploadProgress={isOutgoing ? uploadProgress : undefined}
+                  onDownload={!isOutgoing ? () => onDownload(message) : undefined}
+                  onCancelSend={
+                    isOutgoing && message.status === "pending" ? () => onCancelSend(message) : undefined
+                  }
+                />
+              ) : message.kind === "file" ? (
+                <FileMessageBubble
+                  fileName={message.file_name ?? "File"}
+                  mime={message.file_mime}
+                  sizeBytes={message.file_size}
+                  isLocal={!!message.file_uri}
+                  mediaStatus={message.media_status}
+                  isSending={isOutgoing && message.status === "pending"}
+                  isOutgoing={isOutgoing}
+                  uploadProgress={isOutgoing ? uploadProgress : undefined}
+                  onDownload={!isOutgoing ? () => onDownload(message) : undefined}
+                />
               ) : (
                 <Text style={isOutgoing ? styles.outgoingText : styles.incomingText}>{message.plaintext}</Text>
               )}
@@ -557,7 +600,7 @@ function MessageBubble({
           <Pressable
             style={styles.metaRow}
             onPress={() => onRetry(message)}
-            disabled={message.status !== "failed"}
+            disabled={message.status !== "failed" && message.media_status !== "download_failed"}
           >
             {isPinned ? (
               <Ionicons
@@ -567,7 +610,11 @@ function MessageBubble({
               />
             ) : null}
             <Text style={isOutgoing ? styles.metaTextOutgoing : styles.metaTextIncoming}>
-              {message.status === "failed" ? "Not sent · tap to retry" : formatTime(message.sent_at)}
+              {message.status === "failed"
+                ? "Not sent · tap to retry"
+                : message.media_status === "download_failed"
+                  ? "Couldn't load · tap to retry"
+                  : formatTime(message.sent_at)}
             </Text>
             {isOutgoing ? <StatusTicks status={message.status} /> : null}
           </Pressable>
@@ -644,23 +691,33 @@ export default function ChatScreen({ route, navigation }: Props) {
   }, [conversationId]);
   const isTestBot = conversationId === TEST_BOT_CONVERSATION_ID;
 
-  // Best-effort: refresh the peer's cached public key when opening the chat.
-  // insertConversation only ever writes it once, on first contact — if they
-  // reinstalled or re-registered since (rotating their identity keypair), our
-  // cached copy is stale and every message we send from here would be
-  // encrypted for a key they can no longer decrypt with, with no error on
-  // either end. See MessagingContext's decrypt-retry for the receive-side.
+  // Best-effort: refresh the peer's cached public key and profile (name,
+  // avatar, contact number) when opening the chat. insertConversation only
+  // ever writes these once, on first contact — if the peer reinstalled or
+  // re-registered since (rotating their identity keypair), our cached key is
+  // stale and every message we send from here would be encrypted for a key
+  // they can no longer decrypt with, with no error on either end. Likewise a
+  // profile edit on their end (new photo, new name) would otherwise never
+  // reach this device's header/conversation list. See MessagingContext's
+  // decrypt-retry for the receive-side of the key case.
   useEffect(() => {
     if (isTestBot || !token) return;
     let cancelled = false;
     (async () => {
       try {
         const peer = await getUserById(token, conversationId);
-        if (cancelled || peer.publicKey === conversation?.peer_public_key) return;
-        updateConversationPeerKey(conversationId, peer.publicKey);
-        setConversation(getConversationById(conversationId));
+        if (cancelled) return;
+        const current = getConversationById(conversationId);
+        const keyChanged = peer.publicKey !== current?.peer_public_key;
+        const profileChanged =
+          peer.name !== current?.display_name ||
+          peer.avatarUrl !== current?.avatar_url ||
+          peer.contactNumber !== current?.contact_number;
+        if (keyChanged) updateConversationPeerKey(conversationId, peer.publicKey);
+        if (profileChanged) updateConversationProfile(conversationId, peer.name, peer.avatarUrl, peer.contactNumber);
+        if (keyChanged || profileChanged) setConversation(getConversationById(conversationId));
       } catch (err) {
-        console.warn("[chat] failed to refresh peer key", err);
+        console.warn("[chat] failed to refresh peer key/profile", err);
       }
     })();
     return () => {
@@ -676,7 +733,17 @@ export default function ChatScreen({ route, navigation }: Props) {
   const [calls, setCalls] = useState<CallRow[]>(() => getCallsForConversation(conversationId));
   const [draft, setDraft] = useState("");
   const [replyingTo, setReplyingTo] = useState<ReplyTarget | null>(null);
-  const [emojiPickerOpen, setEmojiPickerOpen] = useState(false);
+  const [attachmentSheetOpen, setAttachmentSheetOpen] = useState(false);
+  const [attachmentAnchor, setAttachmentAnchor] = useState<MessageMenuAnchor | null>(null);
+  const attachmentButtonRef = useRef<View>(null);
+  // Single combined emoji/GIF tray (see EmojiGifTray) in place of the
+  // keyboard — replaces what used to be two separate pieces of state for a
+  // dedicated emoji picker and a dedicated GIF tray.
+  const [pickerOpen, setPickerOpen] = useState(false);
+  // Sized to the last-measured real keyboard height so the tray occupies the
+  // same footprint a keyboard would — falls back to a sane default before
+  // the keyboard has ever been shown this session.
+  const [keyboardHeight, setKeyboardHeight] = useState(320);
   const [menu, setMenu] = useState<{
     message: MessageRow;
     actions: MessageAction[];
@@ -684,6 +751,21 @@ export default function ChatScreen({ route, navigation }: Props) {
   } | null>(null);
   const listRef = useRef<FlatList<ListItem>>(null);
   const readSentRef = useRef<Set<string>>(new Set());
+
+  // scrollToEnd below is normally driven by onContentSizeChange, but opening
+  // the keyboard shrinks the visible viewport without changing content size
+  // at all, so that handler never fires — the latest messages (and the
+  // composer under them) can end up hidden behind the keyboard until the
+  // user manually scrolls. Nudge the list back to the bottom whenever the
+  // keyboard opens to cover that gap on both platforms.
+  useEffect(() => {
+    const event = Platform.OS === "ios" ? "keyboardWillShow" : "keyboardDidShow";
+    const sub = Keyboard.addListener(event, (e) => {
+      listRef.current?.scrollToEnd({ animated: true });
+      setKeyboardHeight(e.endCoordinates.height);
+    });
+    return () => sub.remove();
+  }, []);
   const listItems = useMemo(() => {
     const entries: ChatEntry[] = [
       ...messages.map((message) => ({ kind: "message" as const, ts: message.sent_at, message })),
@@ -791,36 +873,6 @@ export default function ChatScreen({ route, navigation }: Props) {
     };
   }, [conversationId, isTestBot]);
 
-  const onClearChat = useCallback(() => {
-    const name = conversation?.display_name ?? "this contact";
-    Alert.alert("Clear chat", `Delete all messages with ${name}? This can't be undone.`, [
-      { text: "Cancel", style: "cancel" },
-      {
-        text: "Clear",
-        style: "destructive",
-        onPress: () => {
-          clearConversation(conversationId);
-          setMessages([]);
-        },
-      },
-    ]);
-  }, [conversationId, conversation?.display_name]);
-
-  const onDeleteChat = useCallback(() => {
-    deleteConversation(conversationId);
-    navigation.goBack();
-  }, [conversationId, navigation]);
-
-  const onBlockUser = useCallback(() => {
-    blockUser(conversationId);
-  }, [conversationId]);
-
-  const onDeleteUser = useCallback(() => {
-    blockUser(conversationId);
-    deleteConversation(conversationId);
-    navigation.goBack();
-  }, [conversationId, navigation]);
-
   const onAcceptRequest = useCallback(async () => {
     const ok = await acceptContactRequest(conversationId);
     if (!ok) {
@@ -842,6 +894,11 @@ export default function ChatScreen({ route, navigation }: Props) {
     const name = conversation?.display_name ?? "Chat";
     navigation.setOptions({
       title: name,
+      // iOS defaults headerTitleAlign to "center", which centers our custom
+      // (avatar + name) title in the whole space between headerLeft and
+      // headerRight rather than placing it right after the back button —
+      // that's what reads as a gap between them. Force it flush-left instead.
+      headerTitleAlign: "left",
       // setOptions merges into whatever was set before rather than replacing
       // it wholesale, so headerLeft must be explicitly reset here — otherwise
       // a stale custom value from an earlier options call (e.g. during a dev
@@ -861,15 +918,7 @@ export default function ChatScreen({ route, navigation }: Props) {
       headerRight: isTestBot
         ? undefined
         : () => (
-            <View style={{ flexDirection: "row", alignItems: "center" }}>
-              <ChatHeaderCallButtons conversationId={conversationId} disabled={conversation?.status !== "accepted"} />
-              <ChatHeaderOptionsButton
-                onClearChat={onClearChat}
-                onDeleteChat={onDeleteChat}
-                onBlockUser={onBlockUser}
-                onDeleteUser={onDeleteUser}
-              />
-            </View>
+            <ChatHeaderCallButtons conversationId={conversationId} disabled={conversation?.status !== "accepted"} />
           ),
     });
   }, [
@@ -880,10 +929,6 @@ export default function ChatScreen({ route, navigation }: Props) {
     isTestBot,
     peerPresence,
     conversationId,
-    onClearChat,
-    onDeleteChat,
-    onBlockUser,
-    onDeleteUser,
   ]);
 
   const markVisibleMessagesRead = useCallback(() => {
@@ -907,10 +952,11 @@ export default function ChatScreen({ route, navigation }: Props) {
 
   useFocusEffect(
     useCallback(() => {
+      if (isTestBot) cleanupExpiredTestBotMessages();
       setMessages(getMessages(conversationId));
       setCalls(getCallsForConversation(conversationId));
       markVisibleMessagesRead();
-    }, [conversationId, markVisibleMessagesRead])
+    }, [conversationId, isTestBot, markVisibleMessagesRead])
   );
 
   // Notification suppression (see notificationService.ts) keys off this: a
@@ -1003,38 +1049,169 @@ export default function ChatScreen({ route, navigation }: Props) {
     [sendPayload]
   );
 
-  const sendImageEncrypted = useCallback(
-    (id: string, imageUri: string, width: number, height: number, replyTo: ReplyTarget | null) =>
-      sendPayload(id, {
-        kind: "image",
-        image: readImageMessageBase64(imageUri),
-        width,
-        height,
-        replyTo: replyTo ?? undefined,
-      }),
-    [sendPayload]
-  );
-
   const sendGifEncrypted = useCallback(
     (id: string, url: string, width: number, height: number, replyTo: ReplyTarget | null) =>
       sendPayload(id, { kind: "gif", url, width, height, replyTo: replyTo ?? undefined }),
     [sendPayload]
   );
 
+  // Fraction 0..1 per in-flight attachment upload, keyed by message id — read
+  // by the message bubbles to render a percentage over the sending spinner.
+  const [uploadProgressById, setUploadProgressById] = useState<Record<string, number>>({});
+
+  const clearUploadProgress = useCallback((id: string) => {
+    setUploadProgressById((prev) => {
+      if (!(id in prev)) return prev;
+      const next = { ...prev };
+      delete next[id];
+      return next;
+    });
+  }, []);
+
+  // Encrypts+uploads an already-persisted local attachment to S3, then sends
+  // the S3 reference (+ the file's decryption key/nonce) through the normal
+  // E2E-encrypted message channel — see crypto/fileCrypto.ts and
+  // media/chatMediaUpload.ts for why this preserves the app's E2E guarantee.
+  // Used both for a fresh send (via sendAttachment below) and for retrying an
+  // upload that previously failed (see onRetry), from the same local file.
+  const uploadThenSend = useCallback(
+    async (
+      id: string,
+      plaintextUri: string,
+      kind: AttachmentKind,
+      meta: { width?: number; height?: number; durationMs?: number; name?: string; mime?: string },
+      replyTo: ReplyTarget | null
+    ) => {
+      if (!token) return;
+      try {
+        const prepared = await encryptFileForUpload(plaintextUri, id, maxBytesForChatMediaKind(kind));
+        const { publicUrl } = await uploadChatMedia(token, id, kind, prepared, (fraction) => {
+          setUploadProgressById((prev) => ({ ...prev, [id]: fraction }));
+        });
+        clearUploadProgress(id);
+        setMessageMediaStatus(id, "ready");
+
+        if (kind === "image") {
+          void sendPayload(id, {
+            kind: "image",
+            transport: "s3",
+            url: publicUrl,
+            keyB64: prepared.keyB64,
+            nonceB64: prepared.nonceB64,
+            width: meta.width ?? 0,
+            height: meta.height ?? 0,
+            size: prepared.plaintextSize,
+            replyTo: replyTo ?? undefined,
+          });
+        } else if (kind === "video") {
+          void sendPayload(id, {
+            kind: "video",
+            url: publicUrl,
+            keyB64: prepared.keyB64,
+            nonceB64: prepared.nonceB64,
+            width: meta.width ?? 0,
+            height: meta.height ?? 0,
+            durationMs: meta.durationMs ?? 0,
+            size: prepared.plaintextSize,
+            replyTo: replyTo ?? undefined,
+          });
+        } else {
+          void sendPayload(id, {
+            kind: "file",
+            url: publicUrl,
+            keyB64: prepared.keyB64,
+            nonceB64: prepared.nonceB64,
+            name: meta.name ?? "file",
+            mime: meta.mime ?? "application/octet-stream",
+            size: prepared.plaintextSize,
+            replyTo: replyTo ?? undefined,
+          });
+        }
+      } catch (err) {
+        clearUploadProgress(id);
+        console.warn("[chat] failed to upload attachment", err);
+        setMessageMediaStatus(id, "upload_failed");
+        markMessageFailed(id);
+        setMessages((prev) =>
+          prev.map((m) => (m.id === id ? { ...m, status: "failed", media_status: "upload_failed" } : m))
+        );
+        if (err instanceof ChatMediaTooLargeError) {
+          Alert.alert("File too large", err.message);
+        } else if (err instanceof ChatMediaUploadUnavailableError) {
+          Alert.alert("Uploads unavailable", "Media uploads aren't available right now. Please try again later.");
+        }
+        // Any other failure (network blip, etc.) surfaces via the existing
+        // "Not sent · tap to retry" affordance, same as a failed text send.
+      }
+    },
+    [token, sendPayload, clearUploadProgress]
+  );
+
   const onCancelSend = useCallback((message: MessageRow) => {
     cancelledSendIdsRef.current.add(message.id);
     deleteMessage(message.id);
     setMessages((prev) => prev.filter((m) => m.id !== message.id));
+    clearUploadProgress(message.id);
+    deletePendingChatMediaCiphertext(message.id);
     if (message.image_uri) deleteImageMessage(message.image_uri);
-  }, []);
+    if (message.video_uri) deleteVideoMessage(message.video_uri);
+    if (message.file_uri) deleteFileMessage(message.file_uri);
+  }, [clearUploadProgress]);
+
+  // Shared by onRetry (a previously-failed download) and the video/file
+  // bubbles' tap-to-download affordance (a fresh, never-attempted download —
+  // video never auto-downloads, given files can be up to 100MB).
+  const downloadMedia = useCallback(
+    (message: MessageRow) => {
+      setMessages((prev) => prev.map((m) => (m.id === message.id ? { ...m, media_status: "downloading" } : m)));
+      void fetchAndStoreChatMedia(message)
+        .then(() => setMessages(getMessages(conversationId)))
+        .catch(() => setMessages(getMessages(conversationId)));
+    },
+    [conversationId]
+  );
 
   const onRetry = useCallback(
     (message: MessageRow) => {
-      markMessagePending(message.id);
-      setMessages((prev) => prev.map((m) => (m.id === message.id ? { ...m, status: "pending" } : m)));
       const replyTo = message.reply_to_id
         ? { id: message.reply_to_id, preview: message.reply_preview ?? "" }
         : null;
+
+      // A failed attachment upload: re-run encrypt+upload from the same
+      // local plaintext copy (already on disk from the original send), no
+      // re-pick required.
+      if (message.media_status === "upload_failed") {
+        const localUri = message.image_uri ?? message.video_uri ?? message.file_uri;
+        if (!localUri) return;
+        markMessagePending(message.id);
+        setMessageMediaStatus(message.id, "uploading");
+        setMessages((prev) =>
+          prev.map((m) => (m.id === message.id ? { ...m, status: "pending", media_status: "uploading" } : m))
+        );
+        void uploadThenSend(
+          message.id,
+          localUri,
+          message.kind as AttachmentKind,
+          {
+            width: message.image_width ?? message.video_width ?? undefined,
+            height: message.image_height ?? message.video_height ?? undefined,
+            durationMs: message.video_duration_ms ?? undefined,
+            name: message.file_name ?? undefined,
+            mime: message.file_mime ?? undefined,
+          },
+          replyTo
+        );
+        return;
+      }
+
+      // A failed download of a peer's S3-backed attachment.
+      if (message.media_status === "download_failed") {
+        downloadMedia(message);
+        return;
+      }
+
+      markMessagePending(message.id);
+      setMessages((prev) => prev.map((m) => (m.id === message.id ? { ...m, status: "pending" } : m)));
       if (message.kind === "gif" && message.gif_url) {
         void sendGifEncrypted(message.id, message.gif_url, message.gif_width ?? 0, message.gif_height ?? 0, replyTo);
       } else if (message.kind === "voice" && message.audio_uri) {
@@ -1045,19 +1222,22 @@ export default function ChatScreen({ route, navigation }: Props) {
           message.waveform ? JSON.parse(message.waveform) : [],
           replyTo
         );
-      } else if (message.kind === "image" && message.image_uri) {
-        void sendImageEncrypted(
-          message.id,
-          message.image_uri,
-          message.image_width ?? 0,
-          message.image_height ?? 0,
-          replyTo
-        );
+      } else if (message.kind === "image" && message.image_uri && !message.media_url) {
+        // Legacy inline-base64 image (pre-S3-attachment-pipeline, no
+        // media_url) — re-embed the still-local plaintext directly in the
+        // encrypted payload, same shape it was originally sent in.
+        void sendPayload(message.id, {
+          kind: "image",
+          image: readImageMessageBase64(message.image_uri),
+          width: message.image_width ?? 0,
+          height: message.image_height ?? 0,
+          replyTo: replyTo ?? undefined,
+        });
       } else {
         void sendEncrypted(message.id, message.plaintext, replyTo);
       }
     },
-    [sendEncrypted, sendVoiceEncrypted, sendImageEncrypted, sendGifEncrypted]
+    [sendEncrypted, sendVoiceEncrypted, sendGifEncrypted, sendPayload, uploadThenSend, downloadMedia]
   );
 
   const onSend = useCallback(async () => {
@@ -1094,6 +1274,7 @@ export default function ChatScreen({ route, navigation }: Props) {
       gif_url: null,
       gif_width: null,
       gif_height: null,
+      ...NO_MEDIA_FIELDS,
     };
     insertMessage(outgoing);
     setMessages((prev) => [...prev, outgoing]);
@@ -1115,34 +1296,40 @@ export default function ChatScreen({ route, navigation }: Props) {
         markMessageRead(id, readAt);
         setMessages((prev) => prev.map((m) => (m.id === id ? { ...m, status: "read", read_at: readAt } : m)));
 
-        const reply: MessageRow = {
-          id: Crypto.randomUUID(),
-          conversation_id: conversationId,
-          direction: "incoming",
-          plaintext: `Echo: ${text}`,
-          sent_at: Date.now(),
-          status: "delivered",
-          delivered_at: Date.now(),
-          read_at: null,
-          reply_to_id: null,
-          reply_preview: null,
-          pinned_at: null,
-          deleted_at: null,
-          reaction_mine: null,
-          reaction_peer: null,
-          kind: "text",
-          audio_uri: null,
-          duration_ms: null,
-          waveform: null,
-          image_uri: null,
-          image_width: null,
-          image_height: null,
-          gif_url: null,
-          gif_width: null,
-          gif_height: null,
-        };
-        insertMessage(reply);
-        setMessages((prev) => [...prev, reply]);
+        void (async () => {
+          const replyText = await generateTestBotReply(text, getMessages(conversationId));
+
+          const reply: MessageRow = {
+            id: Crypto.randomUUID(),
+            conversation_id: conversationId,
+            direction: "incoming",
+            plaintext: replyText,
+            sent_at: Date.now(),
+            status: "delivered",
+            delivered_at: Date.now(),
+            read_at: null,
+            reply_to_id: null,
+            reply_preview: null,
+            pinned_at: null,
+            deleted_at: null,
+            reaction_mine: null,
+            reaction_peer: null,
+            kind: "text",
+            audio_uri: null,
+            duration_ms: null,
+            waveform: null,
+            image_uri: null,
+            image_width: null,
+            image_height: null,
+            gif_url: null,
+            gif_width: null,
+            gif_height: null,
+            ...NO_MEDIA_FIELDS,
+          };
+          insertMessage(reply);
+          cleanupExpiredTestBotMessages();
+          setMessages(getMessages(conversationId));
+        })();
       }, 700);
       return;
     }
@@ -1183,6 +1370,7 @@ export default function ChatScreen({ route, navigation }: Props) {
         gif_url: null,
         gif_width: null,
         gif_height: null,
+        ...NO_MEDIA_FIELDS,
       };
       insertMessage(outgoing);
       setMessages((prev) => [...prev, outgoing]);
@@ -1258,22 +1446,43 @@ export default function ChatScreen({ route, navigation }: Props) {
     };
   }, [conversationId, isTestBot]);
 
-  const sendImage = useCallback(
-    async (uri: string, width: number, height: number) => {
+  // Persists the picked/captured source locally (compressing images first,
+  // same as before), inserts an optimistic 'uploading' row for immediate
+  // preview, then hands off to uploadThenSend. Shared by the camera button
+  // and the attachment menu's Images/Video/Audio options.
+  const sendAttachment = useCallback(
+    async (
+      sourceUri: string,
+      kind: AttachmentKind,
+      meta: { width?: number; height?: number; durationMs?: number; name?: string; mime?: string }
+    ) => {
       if (!conversation) return;
       const activeReply = replyingTo;
       setReplyingTo(null);
 
       const id = Crypto.randomUUID();
       try {
-        const compressed = await compressImage(uri, width, height);
-        const persistedUri = await persistPickedImage(compressed.uri, id);
+        let plaintextUri: string;
+        let width = meta.width ?? 0;
+        let height = meta.height ?? 0;
+
+        if (kind === "image") {
+          const compressed = await compressImage(sourceUri, width, height);
+          plaintextUri = await persistPickedImage(compressed.uri, id);
+          width = compressed.width;
+          height = compressed.height;
+        } else if (kind === "video") {
+          plaintextUri = await persistPickedVideo(sourceUri, id);
+        } else {
+          plaintextUri = await persistPickedFile(sourceUri, id, meta.name ?? "file");
+        }
 
         const outgoing: MessageRow = {
           id,
           conversation_id: conversationId,
           direction: "outgoing",
-          plaintext: IMAGE_MESSAGE_LABEL,
+          plaintext:
+            kind === "image" ? IMAGE_MESSAGE_LABEL : kind === "video" ? VIDEO_MESSAGE_LABEL : `📎 ${meta.name ?? "file"}`,
           sent_at: Date.now(),
           status: "pending",
           delivered_at: null,
@@ -1284,73 +1493,121 @@ export default function ChatScreen({ route, navigation }: Props) {
           deleted_at: null,
           reaction_mine: null,
           reaction_peer: null,
-          kind: "image",
+          kind,
           audio_uri: null,
           duration_ms: null,
           waveform: null,
-          image_uri: persistedUri,
-          image_width: compressed.width,
-          image_height: compressed.height,
+          image_uri: kind === "image" ? plaintextUri : null,
+          image_width: kind === "image" ? width : null,
+          image_height: kind === "image" ? height : null,
           gif_url: null,
           gif_width: null,
           gif_height: null,
+          video_uri: kind === "video" ? plaintextUri : null,
+          video_width: kind === "video" ? width : null,
+          video_height: kind === "video" ? height : null,
+          video_duration_ms: kind === "video" ? (meta.durationMs ?? null) : null,
+          // Sender already has the local plaintext copy (video_uri, above),
+          // so the tap-to-download size hint doesn't apply to their own
+          // bubble — this is only ever populated on the receive side.
+          video_size: null,
+          file_uri: kind === "file" ? plaintextUri : null,
+          file_name: kind === "file" ? (meta.name ?? null) : null,
+          file_mime: kind === "file" ? (meta.mime ?? null) : null,
+          file_size: null,
+          media_url: null,
+          media_key: null,
+          media_nonce: null,
+          media_status: "uploading",
         };
         insertMessage(outgoing);
         setMessages((prev) => [...prev, outgoing]);
 
         if (isTestBot) {
           markMessageSent(id);
-          setMessages((prev) => prev.map((m) => (m.id === id ? { ...m, status: "sent" } : m)));
+          setMessageMediaStatus(id, "ready");
+          setMessages((prev) => prev.map((m) => (m.id === id ? { ...m, status: "sent", media_status: "ready" } : m)));
           return;
         }
 
-        void sendImageEncrypted(id, persistedUri, compressed.width, compressed.height, activeReply);
+        void uploadThenSend(
+          id,
+          plaintextUri,
+          kind,
+          { width, height, durationMs: meta.durationMs, name: meta.name, mime: meta.mime },
+          activeReply
+        );
       } catch (err) {
-        console.warn("[chat] failed to prepare image for sending", err);
-        Alert.alert("Couldn't send photo", "Please try again.");
+        console.warn("[chat] failed to prepare attachment for sending", err);
+        const title = kind === "image" ? "Couldn't send photo" : kind === "video" ? "Couldn't send video" : "Couldn't send file";
+        Alert.alert(title, "Please try again.");
       }
     },
-    [conversation, conversationId, isTestBot, replyingTo, sendImageEncrypted]
+    [conversation, conversationId, isTestBot, replyingTo, uploadThenSend]
   );
 
-  const pickImage = useCallback(
-    async (source: "camera" | "library") => {
+  // The camera button now only ever launches the device camera (no gallery
+  // chooser) — picking from the gallery lives in the "+" attachment menu.
+  const pickImageFromCamera = useCallback(async () => {
+    if (!conversation) return;
+    const permission = await ImagePicker.requestCameraPermissionsAsync();
+    if (!permission.granted) {
+      Alert.alert("Camera access needed", "Enable access in Settings to share photos.");
+      return;
+    }
+
+    const result = await ImagePicker.launchCameraAsync({ mediaTypes: ["images"], quality: 0.9 });
+    if (result.canceled || !result.assets[0]) return;
+    const asset = result.assets[0];
+    await sendAttachment(asset.uri, "image", { width: asset.width, height: asset.height });
+  }, [conversation, sendAttachment]);
+
+  // "+" attachment menu: Images/Video pick from the gallery via
+  // expo-image-picker (already a dependency, and already supports video
+  // selection via mediaTypes); Audio picks an arbitrary file via
+  // expo-document-picker, since expo-image-picker can't select audio files.
+  const pickAndSendAttachment = useCallback(
+    async (kind: "image" | "video" | "file") => {
       if (!conversation) return;
-      const permission =
-        source === "camera"
-          ? await ImagePicker.requestCameraPermissionsAsync()
-          : await ImagePicker.requestMediaLibraryPermissionsAsync();
-      if (!permission.granted) {
-        Alert.alert(
-          source === "camera" ? "Camera access needed" : "Photo access needed",
-          "Enable access in Settings to share photos."
-        );
+
+      if (kind === "file") {
+        const result = await DocumentPicker.getDocumentAsync({ type: "audio/*" });
+        if (result.canceled || !result.assets[0]) return;
+        const asset = result.assets[0];
+        await sendAttachment(asset.uri, "file", {
+          name: asset.name,
+          mime: asset.mimeType ?? "application/octet-stream",
+        });
         return;
       }
 
-      const result =
-        source === "camera"
-          ? await ImagePicker.launchCameraAsync({ mediaTypes: ["images"], quality: 0.9 })
-          : await ImagePicker.launchImageLibraryAsync({ mediaTypes: ["images"], quality: 0.9 });
-
+      const permission = await ImagePicker.requestMediaLibraryPermissionsAsync();
+      if (!permission.granted) {
+        Alert.alert("Photo access needed", "Enable access in Settings to share media.");
+        return;
+      }
+      const result = await ImagePicker.launchImageLibraryAsync({
+        mediaTypes: kind === "image" ? ["images"] : ["videos"],
+        quality: 0.9,
+      });
       if (result.canceled || !result.assets[0]) return;
       const asset = result.assets[0];
-      await sendImage(asset.uri, asset.width, asset.height);
+      if (kind === "image") {
+        await sendAttachment(asset.uri, "image", { width: asset.width, height: asset.height });
+      } else {
+        await sendAttachment(asset.uri, "video", {
+          width: asset.width,
+          height: asset.height,
+          durationMs: asset.duration ?? undefined,
+        });
+      }
     },
-    [conversation, sendImage]
+    [conversation, sendAttachment]
   );
 
-  const showImageSourceOptions = useCallback(() => {
-    Alert.alert("Send Photo", undefined, [
-      { text: "Take Photo", onPress: () => void pickImage("camera") },
-      { text: "Choose from Library", onPress: () => void pickImage("library") },
-      { text: "Cancel", style: "cancel" },
-    ]);
-  }, [pickImage]);
-
-  // Unlike sendImage, there's no compression/local-persistence step — the
-  // GIF already lives permanently on GIPHY's CDN, so the picked url is the
-  // final payload as soon as it's picked.
+  // Unlike sendAttachment, there's no compression/local-persistence/upload
+  // step — the GIF already lives permanently on GIPHY's CDN, so the picked
+  // url is the final payload as soon as it's picked.
   const sendGif = useCallback(
     (url: string, width: number, height: number) => {
       if (!conversation) return;
@@ -1383,6 +1640,7 @@ export default function ChatScreen({ route, navigation }: Props) {
         gif_url: url,
         gif_width: width,
         gif_height: height,
+        ...NO_MEDIA_FIELDS,
       };
       insertMessage(outgoing);
       setMessages((prev) => [...prev, outgoing]);
@@ -1398,20 +1656,32 @@ export default function ChatScreen({ route, navigation }: Props) {
     [conversation, conversationId, isTestBot, replyingTo, sendGifEncrypted]
   );
 
-  const pickAndSendGif = useCallback(async () => {
-    if (!conversation) return;
-    if (!isGifPickerAvailable()) {
-      Alert.alert("GIFs unavailable", "The GIF picker isn't configured for this build.");
+  // Toggles the combined emoji/GIF tray in place of the keyboard (see
+  // EmojiGifTray) rather than opening a full-screen native dialog. Always
+  // opens back onto the emoji tab; the tray itself owns which tab is active.
+  const togglePicker = useCallback(() => {
+    if (pickerOpen) {
+      setPickerOpen(false);
       return;
     }
-    try {
-      const picked = await pickGif();
-      if (picked) sendGif(picked.url, picked.width, picked.height);
-    } catch (err) {
-      console.warn("[chat] failed to pick gif", err);
-      Alert.alert("Couldn't open GIF picker", "Please try again.");
-    }
-  }, [conversation, sendGif]);
+    Keyboard.dismiss();
+    setPickerOpen(true);
+  }, [pickerOpen]);
+
+  const handleEmojiSelected = useCallback(
+    (emoji: EmojiType) => {
+      handleDraftChange(draft + emoji.emoji);
+    },
+    [draft, handleDraftChange]
+  );
+
+  const handleGifSelected = useCallback(
+    (gif: PickedGif) => {
+      sendGif(gif.url, gif.width, gif.height);
+      setPickerOpen(false);
+    },
+    [sendGif]
+  );
 
   const onCopy = useCallback((message: MessageRow) => {
     Clipboard.setStringAsync(message.plaintext);
@@ -1434,6 +1704,14 @@ export default function ChatScreen({ route, navigation }: Props) {
         category = "Photos";
         mimeType = "image/gif";
         base64 = await base64FromRemoteUrl(message.gif_url);
+      } else if (message.kind === "video" && message.video_uri) {
+        category = "Video";
+        mimeType = "video/mp4";
+        base64 = readVideoMessageBase64(message.video_uri);
+      } else if (message.kind === "file" && message.file_uri) {
+        category = "Documents";
+        mimeType = message.file_mime ?? "application/octet-stream";
+        base64 = readFileMessageBase64(message.file_uri);
       } else {
         return;
       }
@@ -1557,7 +1835,12 @@ export default function ChatScreen({ route, navigation }: Props) {
   return (
     <KeyboardAvoidingView
       style={styles.flex}
-      behavior={Platform.OS === "ios" ? "padding" : undefined}
+      // "padding" on Android too: with edge-to-edge display (default since
+      // Expo SDK 54 / RN 0.86), the OS's adjustResize window-resize this used
+      // to lean on for Android no longer reliably shrinks the layout when the
+      // keyboard opens, which left the input row covered. Explicitly padding
+      // for the keyboard height works on both platforms regardless of that.
+      behavior="padding"
       keyboardVerticalOffset={Platform.OS === "ios" ? 90 : 0}
     >
       {pinnedMessage ? (
@@ -1610,6 +1893,8 @@ export default function ChatScreen({ route, navigation }: Props) {
               onOpenMenu={openMenu}
               onCancelSend={onCancelSend}
               onSaveMedia={onSaveMedia}
+              onDownload={downloadMedia}
+              uploadProgress={uploadProgressById[item.message.id]}
             />
           )
         }
@@ -1650,6 +1935,7 @@ export default function ChatScreen({ route, navigation }: Props) {
         <RequestActionBanner
           status={conversation.status}
           peerName={conversation.display_name ?? "This contact"}
+          peerAvatarUrl={conversation.avatar_url}
           onAccept={onAcceptRequest}
           onReject={onRejectRequest}
         />
@@ -1672,23 +1958,49 @@ export default function ChatScreen({ route, navigation }: Props) {
           </Animated.View>
         ) : (
           <>
-            <Pressable style={styles.emojiButton} onPress={() => setEmojiPickerOpen(true)} hitSlop={8}>
-              <Ionicons name="happy-outline" size={24} color={colors.textSecondary} />
+            <Pressable
+              ref={attachmentButtonRef}
+              style={styles.emojiButton}
+              onPress={() => {
+                // Measured fresh on every tap (rather than once on mount) so
+                // the card lands directly above the button regardless of
+                // whether the keyboard is currently open or closed — either
+                // state can shift where this button actually sits on screen.
+                attachmentButtonRef.current?.measureInWindow((x, y, width, height) => {
+                  setAttachmentAnchor({ x, y, width, height });
+                  setAttachmentSheetOpen(true);
+                });
+              }}
+              hitSlop={8}
+            >
+              <Ionicons name="add-outline" size={24} color={colors.textSecondary} />
             </Pressable>
-            <Pressable style={styles.emojiButton} onPress={showImageSourceOptions} hitSlop={8}>
-              <Ionicons name="camera-outline" size={24} color={colors.textSecondary} />
+            <Pressable style={styles.emojiButton} onPress={() => void pickImageFromCamera()} hitSlop={8}>
+              <Ionicons name="camera-outline" size={22} color={colors.textSecondary} />
             </Pressable>
-            <Pressable style={styles.gifButton} onPress={pickAndSendGif} hitSlop={8}>
-              <Text style={styles.gifButtonText}>GIF</Text>
-            </Pressable>
-            <TextInput
-              style={styles.input}
-              value={draft}
-              onChangeText={handleDraftChange}
-              placeholder="Message"
-              placeholderTextColor={colors.textTertiary}
-              multiline
-            />
+            <View style={styles.inputWrapper}>
+              <TextInput
+                style={styles.input}
+                value={draft}
+                onChangeText={handleDraftChange}
+                placeholder="Message"
+                placeholderTextColor={colors.textTertiary}
+                multiline
+              />
+              {/* Opens the combined emoji/GIF tray (see EmojiGifTray) — hidden
+                  once there's typed text so it doesn't sit on top of it, but
+                  kept visible while the tray itself is open so there's always
+                  a way to tap back to the keyboard. */}
+              {pickerOpen || !draft.trim() ? (
+                <Pressable style={styles.pickerBadge} onPress={togglePicker} hitSlop={8}>
+                  {pickerOpen ? (
+                    <MaterialCommunityIcons name="keyboard-outline" size={20} color={colors.textSecondary} />
+                  ) : (
+                    <Ionicons name="happy-outline" size={20} color={colors.textSecondary} />
+                  )}
+                </Pressable>
+              ) : null}
+            </View>
           </>
         )}
 
@@ -1712,13 +2024,21 @@ export default function ChatScreen({ route, navigation }: Props) {
       </View>
       )}
 
-      <EmojiPicker
-        open={emojiPickerOpen}
-        onClose={() => setEmojiPickerOpen(false)}
-        onEmojiSelected={(emoji: EmojiType) => handleDraftChange(draft + emoji.emoji)}
-        enableSearchBar
-        enableRecentlyUsed
-        categoryPosition="floating"
+      {pickerOpen ? (
+        <EmojiGifTray
+          height={keyboardHeight}
+          onEmojiSelected={handleEmojiSelected}
+          onSelectGif={handleGifSelected}
+        />
+      ) : null}
+
+      <AttachmentSheet
+        visible={attachmentSheetOpen}
+        anchor={attachmentAnchor}
+        onClose={() => setAttachmentSheetOpen(false)}
+        onPickImages={() => void pickAndSendAttachment("image")}
+        onPickVideo={() => void pickAndSendAttachment("video")}
+        onPickAudio={() => void pickAndSendAttachment("file")}
       />
     </KeyboardAvoidingView>
   );
@@ -1731,24 +2051,11 @@ const createStyles = (colors: ThemeColors) =>
     missing: { color: colors.textTertiary },
     headerTitleRow: { flexDirection: "row", alignItems: "center", gap: 10 },
     headerTitleRowPressed: { opacity: 0.6 },
-    headerAvatarWrap: { position: "relative" },
-    headerAvatar: { width: 36, height: 36, borderRadius: 18, alignItems: "center", justifyContent: "center" },
-    headerAvatarText: { fontSize: 14, fontWeight: "700", color: "#fff" },
-    headerOnlineDot: {
-      position: "absolute",
-      bottom: -1,
-      right: -1,
-      width: 11,
-      height: 11,
-      borderRadius: 5.5,
-      backgroundColor: colors.tickRead,
-      borderWidth: 2,
-      borderColor: colors.surface,
-    },
     headerTextCol: { flexShrink: 1, maxWidth: 175, justifyContent: "center" },
-    headerName: { fontSize: 17, fontWeight: "700", color: colors.text },
-    headerStatus: { fontSize: 12, color: colors.textSecondary, marginTop: 1 },
-    headerStatusOnline: { fontSize: 12, fontWeight: "500", color: colors.tickRead, marginTop: 1 },
+    // 70% of the previous 17px size, per request.
+    headerName: { fontSize: 14.9, fontWeight: "700", color: colors.text },
+    headerStatus: { fontSize: 11, color: colors.textSecondary, marginTop: 1 },
+    headerStatusOnline: { fontSize: 11, fontWeight: "500", color: colors.tickRead, marginTop: 1 },
     list: { padding: 12 },
     dateSeparator: { alignItems: "center", marginVertical: 10 },
     dateSeparatorText: {
@@ -1888,7 +2195,7 @@ const createStyles = (colors: ThemeColors) =>
       flexDirection: "row",
       alignItems: "flex-end",
       padding: 8,
-      gap: 8,
+      gap: 2,
       backgroundColor: colors.surface,
       borderTopWidth: StyleSheet.hairlineWidth,
       borderTopColor: colors.border,
@@ -1901,6 +2208,8 @@ const createStyles = (colors: ThemeColors) =>
       borderTopColor: colors.border,
     },
     requestBannerText: { fontSize: 14, color: colors.textSecondary, textAlign: "center" },
+    requestBannerPeerRow: { flexDirection: "row", alignItems: "center", gap: 12 },
+    requestBannerPeerText: { flex: 1, textAlign: "left" },
     requestBannerActions: { flexDirection: "row", gap: 10 },
     requestBannerButton: {
       flex: 1,
@@ -1913,34 +2222,37 @@ const createStyles = (colors: ThemeColors) =>
     requestBannerReject: { backgroundColor: colors.background, borderWidth: 1, borderColor: colors.border },
     requestBannerButtonText: { fontSize: 15, fontWeight: "600" },
     emojiButton: {
-      width: 40,
+      width: 34,
       height: 40,
       alignItems: "center",
       justifyContent: "center",
     },
-    gifButton: {
-      height: 26,
-      paddingHorizontal: 6,
-      alignSelf: "center",
-      alignItems: "center",
-      justifyContent: "center",
-      borderRadius: 5,
-      borderWidth: 1.5,
-      borderColor: colors.textSecondary,
-      marginRight: 4,
-    },
-    gifButtonText: { fontSize: 11, fontWeight: "800", color: colors.textSecondary, letterSpacing: 0.3 },
-    input: {
+    inputWrapper: {
       flex: 1,
+      justifyContent: "center",
+    },
+    input: {
       borderWidth: 1,
       borderColor: colors.border,
       backgroundColor: colors.background,
       color: colors.text,
       borderRadius: 20,
-      paddingHorizontal: 14,
+      paddingLeft: 14,
+      // Extra room on the right so typed text never runs under the picker trigger.
+      paddingRight: 40,
       paddingVertical: 10,
       fontSize: 15.5,
+      minHeight: 40,
       maxHeight: 100,
+    },
+    pickerBadge: {
+      position: "absolute",
+      right: 8,
+      bottom: 9,
+      width: 22,
+      height: 22,
+      alignItems: "center",
+      justifyContent: "center",
     },
     sendButton: {
       backgroundColor: colors.accent,

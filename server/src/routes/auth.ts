@@ -122,26 +122,42 @@ async function issueSession(email: string, publicKey: string): Promise<{ token: 
       .run();
   } else {
     const id = randomUUID();
-    db.insert(users)
-      .values({
+    try {
+      db.insert(users)
+        .values({
+          id,
+          email,
+          public_key: publicKey,
+          current_session_id: sessionId,
+          created_at: Date.now(),
+          last_seen_at: null,
+        })
+        .run();
+      user = {
         id,
         email,
         public_key: publicKey,
+        contact_number: null,
         current_session_id: sessionId,
         created_at: Date.now(),
         last_seen_at: null,
-      })
-      .run();
-    user = {
-      id,
-      email,
-      public_key: publicKey,
-      contact_number: null,
-      current_session_id: sessionId,
-      created_at: Date.now(),
-      last_seen_at: null,
-      deletion_requested_at: null,
-    };
+        deletion_requested_at: null,
+      };
+    } catch {
+      // The email-not-found check above and this insert aren't atomic, so two
+      // concurrent first-time verifications for the same address can both
+      // reach here — the loser hits the unique constraint on email. That's
+      // not a real conflict (it's the same account, not someone else's), so
+      // just pick up the row the winner just created instead of surfacing an
+      // error for what looks to the client like a normal login.
+      const created = db.select().from(users).where(eq(users.email, email)).get();
+      if (!created) throw new Error("user insert failed and no row was found after conflict");
+      user = created;
+      db.update(users)
+        .set({ public_key: publicKey, current_session_id: sessionId })
+        .where(eq(users.id, created.id))
+        .run();
+    }
   }
 
   await revokeOtherSessions(user.id);

@@ -117,6 +117,7 @@ export default function ContactsScreen({ navigation }: Props) {
                 avatar_url: contact.avatarUrl ?? null,
                 created_at: Date.now(),
                 status,
+                contact_number: contact.phoneNumber ?? null,
               });
             }
             if (status === "pending_outgoing") {

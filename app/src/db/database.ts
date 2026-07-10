@@ -114,6 +114,25 @@ function runMigrations() {
     ["gif_url", "ALTER TABLE messages ADD COLUMN gif_url TEXT"],
     ["gif_width", "ALTER TABLE messages ADD COLUMN gif_width INTEGER"],
     ["gif_height", "ALTER TABLE messages ADD COLUMN gif_height INTEGER"],
+    ["video_uri", "ALTER TABLE messages ADD COLUMN video_uri TEXT"],
+    ["video_width", "ALTER TABLE messages ADD COLUMN video_width INTEGER"],
+    ["video_height", "ALTER TABLE messages ADD COLUMN video_height INTEGER"],
+    ["video_duration_ms", "ALTER TABLE messages ADD COLUMN video_duration_ms INTEGER"],
+    ["video_size", "ALTER TABLE messages ADD COLUMN video_size INTEGER"],
+    ["file_uri", "ALTER TABLE messages ADD COLUMN file_uri TEXT"],
+    ["file_name", "ALTER TABLE messages ADD COLUMN file_name TEXT"],
+    ["file_mime", "ALTER TABLE messages ADD COLUMN file_mime TEXT"],
+    ["file_size", "ALTER TABLE messages ADD COLUMN file_size INTEGER"],
+    // media_url/key/nonce are shared across S3-backed kinds (image when sent
+    // via the new attachment pipeline, video, file) rather than duplicated
+    // per-kind — one generic "remote encrypted media" tracking set. key/nonce
+    // are the file's crypto_secretbox symmetric key (see crypto/fileCrypto.ts)
+    // and are only ever stored locally on-device, never sent back to the
+    // server — same local-plaintext trust model as plaintext/waveform today.
+    ["media_url", "ALTER TABLE messages ADD COLUMN media_url TEXT"],
+    ["media_key", "ALTER TABLE messages ADD COLUMN media_key TEXT"],
+    ["media_nonce", "ALTER TABLE messages ADD COLUMN media_nonce TEXT"],
+    ["media_status", "ALTER TABLE messages ADD COLUMN media_status TEXT NOT NULL DEFAULT 'ready'"],
   ];
   for (const [column, statement] of migrations) {
     if (!existingColumns.has(column)) {
@@ -135,10 +154,27 @@ function runMigrations() {
   if (!existingConversationColumns.has("status")) {
     db.execSync(`ALTER TABLE conversations ADD COLUMN status TEXT NOT NULL DEFAULT 'accepted'`);
   }
+  // Peer's self-reported contact number, synced from the server (see
+  // updateConversationProfile) — same "cached once, refreshed on open" story
+  // as display_name/avatar_url above.
+  if (!existingConversationColumns.has("contact_number")) {
+    db.execSync(`ALTER TABLE conversations ADD COLUMN contact_number TEXT`);
+  }
 }
 
 export type MessageStatus = "pending" | "sent" | "delivered" | "read" | "failed";
-export type MessageKind = "text" | "voice" | "image" | "gif";
+export type MessageKind = "text" | "voice" | "image" | "gif" | "video" | "file";
+
+// Tracks an S3-backed attachment's transfer state (image sent via the new
+// attachment pipeline, video, file). 'ready' is also the default/no-op value
+// for kinds that never touch S3 (text/voice/gif, and legacy inline images).
+export type MediaStatus =
+  | "ready"
+  | "uploading"
+  | "upload_failed"
+  | "downloading"
+  | "download_failed"
+  | "idle";
 
 export interface MessageRow {
   id: string;
@@ -169,13 +205,31 @@ export interface MessageRow {
   gif_url: string | null;
   gif_width: number | null;
   gif_height: number | null;
+  /** Local file uri for the decrypted video. Only set when kind === 'video'. */
+  video_uri: string | null;
+  video_width: number | null;
+  video_height: number | null;
+  video_duration_ms: number | null;
+  video_size: number | null;
+  /** Local file uri for the decrypted generic attachment. Only set when kind === 'file'. */
+  file_uri: string | null;
+  file_name: string | null;
+  file_mime: string | null;
+  file_size: number | null;
+  /** S3 object url + symmetric decryption key/nonce for an S3-backed
+   * attachment (image sent via the attachment pipeline, video, file).
+   * Null for text/voice/gif and for legacy inline-base64 images. */
+  media_url: string | null;
+  media_key: string | null;
+  media_nonce: string | null;
+  media_status: MediaStatus;
 }
 
 export function insertMessage(message: MessageRow) {
   db.runSync(
     `INSERT INTO messages
-       (id, conversation_id, direction, plaintext, sent_at, status, delivered_at, read_at, reply_to_id, reply_preview, pinned_at, deleted_at, reaction_mine, reaction_peer, kind, audio_uri, duration_ms, waveform, image_uri, image_width, image_height, gif_url, gif_width, gif_height)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       (id, conversation_id, direction, plaintext, sent_at, status, delivered_at, read_at, reply_to_id, reply_preview, pinned_at, deleted_at, reaction_mine, reaction_peer, kind, audio_uri, duration_ms, waveform, image_uri, image_width, image_height, gif_url, gif_width, gif_height, video_uri, video_width, video_height, video_duration_ms, video_size, file_uri, file_name, file_mime, file_size, media_url, media_key, media_nonce, media_status)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [
       message.id,
       message.conversation_id,
@@ -201,8 +255,40 @@ export function insertMessage(message: MessageRow) {
       message.gif_url,
       message.gif_width,
       message.gif_height,
+      message.video_uri,
+      message.video_width,
+      message.video_height,
+      message.video_duration_ms,
+      message.video_size,
+      message.file_uri,
+      message.file_name,
+      message.file_mime,
+      message.file_size,
+      message.media_url,
+      message.media_key,
+      message.media_nonce,
+      message.media_status,
     ]
   );
+}
+
+export function setMessageMediaStatus(id: string, status: MediaStatus): void {
+  db.runSync(`UPDATE messages SET media_status = ? WHERE id = ?`, [status, id]);
+}
+
+// Called once an S3-backed attachment's ciphertext has been downloaded and
+// decrypted — persists the plaintext local file uri and clears the transfer
+// state. One setter per kind since each writes a different *_uri column.
+export function setMessageImageLocal(id: string, uri: string): void {
+  db.runSync(`UPDATE messages SET image_uri = ?, media_status = 'ready' WHERE id = ?`, [uri, id]);
+}
+
+export function setMessageVideoLocal(id: string, uri: string): void {
+  db.runSync(`UPDATE messages SET video_uri = ?, media_status = 'ready' WHERE id = ?`, [uri, id]);
+}
+
+export function setMessageFileLocal(id: string, uri: string): void {
+  db.runSync(`UPDATE messages SET file_uri = ?, media_status = 'ready' WHERE id = ?`, [uri, id]);
 }
 
 export function setMyReaction(id: string, emoji: string | null): void {
@@ -229,6 +315,10 @@ export function getUnreadIncomingMessages(conversationId: string): MessageRow[] 
 
 export function clearMessages(conversationId: string): void {
   db.runSync(`DELETE FROM messages WHERE conversation_id = ?`, [conversationId]);
+}
+
+export function deleteMessagesBefore(conversationId: string, before: number): void {
+  db.runSync(`DELETE FROM messages WHERE conversation_id = ? AND sent_at < ?`, [conversationId, before]);
 }
 
 export function markMessageSent(id: string): void {
@@ -302,6 +392,7 @@ export interface ConversationRow {
   avatar_url: string | null;
   created_at: number;
   status: ConversationStatus;
+  contact_number: string | null;
 }
 
 export function getConversations(): ConversationRow[] {
@@ -348,7 +439,7 @@ export function getConversationById(id: string): ConversationRow | null {
 // existing row before either one inserts.
 export function insertConversation(conversation: ConversationRow): void {
   db.runSync(
-    `INSERT OR IGNORE INTO conversations (id, peer_public_key, display_name, avatar_url, created_at, status) VALUES (?, ?, ?, ?, ?, ?)`,
+    `INSERT OR IGNORE INTO conversations (id, peer_public_key, display_name, avatar_url, created_at, status, contact_number) VALUES (?, ?, ?, ?, ?, ?, ?)`,
     [
       conversation.id,
       conversation.peer_public_key,
@@ -356,6 +447,7 @@ export function insertConversation(conversation: ConversationRow): void {
       conversation.avatar_url,
       conversation.created_at,
       conversation.status,
+      conversation.contact_number,
     ]
   );
 }
@@ -367,13 +459,20 @@ export function setConversationStatus(id: string, status: ConversationStatus): v
   db.runSync(`UPDATE conversations SET status = ? WHERE id = ?`, [status, id]);
 }
 
-// Refreshes a peer's cached name/avatar for an existing conversation (e.g.
-// they updated their profile after the conversation was first created) —
-// insertConversation only ever writes these once, on first contact.
-export function updateConversationProfile(id: string, displayName: string | null, avatarUrl: string | null): void {
-  db.runSync(`UPDATE conversations SET display_name = ?, avatar_url = ? WHERE id = ?`, [
+// Refreshes a peer's cached name/avatar/contact number for an existing
+// conversation (e.g. they updated their profile after the conversation was
+// first created) — insertConversation only ever writes these once, on first
+// contact.
+export function updateConversationProfile(
+  id: string,
+  displayName: string | null,
+  avatarUrl: string | null,
+  contactNumber: string | null
+): void {
+  db.runSync(`UPDATE conversations SET display_name = ?, avatar_url = ?, contact_number = ? WHERE id = ?`, [
     displayName,
     avatarUrl,
+    contactNumber,
     id,
   ]);
 }

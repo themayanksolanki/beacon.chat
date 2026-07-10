@@ -47,6 +47,8 @@ usersRouter.get("/by-id/:id", requireAuth, async (req, res) => {
     publicKey: user.public_key,
     name: profile?.name ?? null,
     avatarUrl: profile ? resolveAvatarUrl(profile) : null,
+    contactNumber: user.contact_number,
+    createdAt: user.created_at,
   });
 });
 

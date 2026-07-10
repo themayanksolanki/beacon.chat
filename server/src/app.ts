@@ -5,6 +5,7 @@ import rateLimit from "express-rate-limit";
 import { authRouter } from "./routes/auth";
 import { usersRouter } from "./routes/users";
 import { profileRouter } from "./routes/profile";
+import { mediaRouter } from "./routes/media";
 
 export function createApp() {
   const app = express();
@@ -25,6 +26,7 @@ export function createApp() {
   app.use("/auth", authRouter);
   app.use("/users", usersRouter);
   app.use("/profile", profileRouter);
+  app.use("/media", mediaRouter);
 
   return app;
 }

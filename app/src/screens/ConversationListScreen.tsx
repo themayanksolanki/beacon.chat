@@ -13,7 +13,7 @@ import MessageActionMenu, { type MessageAction, type MessageMenuAnchor } from ".
 import { blockUser, getConversationSummaries, type ConversationSummary } from "../db/database";
 import { useMessaging } from "../messaging/MessagingContext";
 import { usePresence } from "../presence/PresenceContext";
-import { ensureTestBotConversation, TEST_BOT_CONVERSATION_ID } from "../testBot";
+import { ensureTestBotConversation, syncTestBotConversationIfPresent, TEST_BOT_CONVERSATION_ID, TEST_BOT_NAME } from "../testBot";
 import { useTheme } from "../ThemeContext";
 import { colorForName, initialFor, type ThemeColors } from "../theme";
 
@@ -61,6 +61,7 @@ export default function ConversationListScreen({ navigation }: Props) {
 
   useFocusEffect(
     useCallback(() => {
+      syncTestBotConversationIfPresent();
       setConversations(getConversationSummaries());
     }, [])
   );
@@ -153,7 +154,7 @@ export default function ConversationListScreen({ navigation }: Props) {
         <View style={styles.testBotAvatar}>
           <Text style={styles.testBotEmoji}>🤖</Text>
         </View>
-        <Text style={styles.testBotText}>Chat with Test Bot</Text>
+        <Text style={styles.testBotText}>Chat with {TEST_BOT_NAME}</Text>
         <Ionicons name="chevron-forward" size={18} color={colors.accent} />
       </Pressable>
 

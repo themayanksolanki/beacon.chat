@@ -65,7 +65,13 @@ describe("GET /users/by-id/:id", () => {
       .set("Authorization", `Bearer ${token}`);
 
     expect(authed.status).toBe(200);
-    expect(authed.body).toMatchObject({ userId, email, publicKey: "frank-pubkey" });
+    expect(authed.body).toMatchObject({
+      userId,
+      email,
+      publicKey: "frank-pubkey",
+      contactNumber: null,
+      createdAt: expect.any(Number),
+    });
 
     const missing = await request(app)
       .get("/users/by-id/does-not-exist")
