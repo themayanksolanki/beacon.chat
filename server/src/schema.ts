@@ -4,19 +4,30 @@ import { sqliteTable, text, integer, index, primaryKey, uniqueIndex } from "driz
 // session allowed to be active at a time: logging in on a new device
 // overwrites it, which immediately invalidates the old device's token (see
 // requireAuth / socketServer session checks).
-export const users = sqliteTable("users", {
-  id: text("id").primaryKey(),
-  email: text("email").notNull().unique(),
-  public_key: text("public_key"),
-  current_session_id: text("current_session_id"),
-  created_at: integer("created_at").notNull(),
-  last_seen_at: integer("last_seen_at"),
-  // Set when the user requests account deletion; cleared if they log back in
-  // before the grace period elapses (see accountDeletion.ts). A background
-  // sweep permanently purges any account whose deletion was requested more
-  // than ACCOUNT_DELETION_GRACE_MS ago.
-  deletion_requested_at: integer("deletion_requested_at"),
-});
+export const users = sqliteTable(
+  "users",
+  {
+    id: text("id").primaryKey(),
+    email: text("email").notNull().unique(),
+    public_key: text("public_key"),
+    // Optional, self-reported, unverified (no OTP) — set via PUT /profile/phone.
+    // Stored as a canonical E.164 string (e.g. "+919876543210") so it can
+    // double as a search key for the add-contact flow, same role as email.
+    contact_number: text("contact_number"),
+    current_session_id: text("current_session_id"),
+    created_at: integer("created_at").notNull(),
+    last_seen_at: integer("last_seen_at"),
+    // Set when the user requests account deletion; cleared if they log back in
+    // before the grace period elapses (see accountDeletion.ts). A background
+    // sweep permanently purges any account whose deletion was requested more
+    // than ACCOUNT_DELETION_GRACE_MS ago.
+    deletion_requested_at: integer("deletion_requested_at"),
+  },
+  // SQLite exempts NULLs from unique-index enforcement, so any number of
+  // users can leave this unset — only two users sharing the same non-null
+  // number collides.
+  (table) => [uniqueIndex("idx_users_contact_number").on(table.contact_number)]
+);
 
 export const otpChallenges = sqliteTable(
   "otp_challenges",

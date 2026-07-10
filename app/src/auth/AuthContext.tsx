@@ -17,7 +17,7 @@ import { getOrCreateIdentity } from "../crypto/identity";
 import { initDatabase, wipeAccountDatabase } from "../db/database";
 import { connectSocket, disconnectSocket } from "../network/socket";
 import { clearIdentityKeys } from "../storage/secureKeyStore";
-import { clearProfile, loadProfile, saveProfile, type Profile } from "../storage/profileStore";
+import { clearProfile, loadProfile, savePhoneNumber, saveProfile, type Profile } from "../storage/profileStore";
 import {
   clearSessionEmail,
   clearSessionToken,
@@ -39,6 +39,7 @@ interface AuthContextValue {
   devLogin: (email: string) => Promise<void>;
   completeProfile: (fullName: string, photoUri: string | null) => Promise<void>;
   updateProfile: (fullName: string, photoUri: string | null) => Promise<void>;
+  updatePhoneNumber: (phoneNumber: string | null) => Promise<void>;
   logout: () => Promise<void>;
   deleteAccount: () => Promise<void>;
 }
@@ -233,6 +234,20 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     [email, token, profile]
   );
 
+  // Unlike name/photo above, this can genuinely fail (number already linked
+  // to another account) — the server call happens first and is left to
+  // throw so the caller can surface that, instead of swallowing it and
+  // leaving the local copy out of sync with what the server actually has.
+  const updatePhoneNumber = useCallback(
+    async (phoneNumber: string | null) => {
+      if (!email || !token) throw new Error("updatePhoneNumber called while signed out");
+      await api.updatePhoneNumber(token, phoneNumber);
+      await savePhoneNumber(email, phoneNumber);
+      setProfile((prev) => (prev ? { ...prev, phoneNumber } : prev));
+    },
+    [email, token]
+  );
+
   const logout = useCallback(async () => {
     const currentToken = await loadSessionToken();
     if (currentToken) {
@@ -266,6 +281,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       devLogin,
       completeProfile,
       updateProfile,
+      updatePhoneNumber,
       logout,
       deleteAccount,
     }),
@@ -279,6 +295,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       devLogin,
       completeProfile,
       updateProfile,
+      updatePhoneNumber,
       logout,
       deleteAccount,
     ]

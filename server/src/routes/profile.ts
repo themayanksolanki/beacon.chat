@@ -9,15 +9,69 @@ import { createAvatarUploadPost, deleteAvatarObject, headAvatarObject, isS3Confi
 export const profileRouter = Router();
 
 const MAX_NAME_LENGTH = 80;
+// E.164-shaped: a leading '+', a non-zero first digit, then up to 14 more
+// digits (matches the ITU E.164 15-digit-total cap).
+const PHONE_REGEX = /^\+[1-9]\d{6,14}$/;
 
 profileRouter.get("/me", requireAuth, async (req: AuthedRequest, res) => {
+  // Phone lives in SQLite alongside email/public_key (it's a search key,
+  // same role as email) rather than Mongo, so it's available regardless of
+  // whether the optional Mongo-backed name/avatar profile store is configured.
+  const user = db
+    .select({ contact_number: users.contact_number })
+    .from(users)
+    .where(eq(users.id, req.user!.userId))
+    .get();
+  const phoneNumber = user?.contact_number ?? null;
+
   if (!isMongoConnected()) {
-    res.json({ profile: null });
+    res.json({ profile: null, phoneNumber });
     return;
   }
 
   const doc = await profiles().findOne({ userId: req.user!.userId });
-  res.json({ profile: doc ? { name: doc.name, avatarUrl: resolveAvatarUrl(doc) } : null });
+  res.json({ profile: doc ? { name: doc.name, avatarUrl: resolveAvatarUrl(doc) } : null, phoneNumber });
+});
+
+/**
+ * Sets/clears the caller's optional contact number. Unlike email, this is
+ * never OTP-verified — it's just a self-reported, unique search key so other
+ * users can find this account by phone in the add-contact flow.
+ */
+profileRouter.put("/phone", requireAuth, (req: AuthedRequest, res) => {
+  const { phoneNumber } = req.body ?? {};
+
+  if (phoneNumber === null) {
+    db.update(users).set({ contact_number: null }).where(eq(users.id, req.user!.userId)).run();
+    res.json({ ok: true });
+    return;
+  }
+
+  if (typeof phoneNumber !== "string" || !PHONE_REGEX.test(phoneNumber)) {
+    res.status(400).json({ error: "invalid_phone_number" });
+    return;
+  }
+
+  const existing = db
+    .select({ id: users.id })
+    .from(users)
+    .where(eq(users.contact_number, phoneNumber))
+    .get();
+  if (existing && existing.id !== req.user!.userId) {
+    res.status(409).json({ error: "phone_already_registered" });
+    return;
+  }
+
+  try {
+    db.update(users).set({ contact_number: phoneNumber }).where(eq(users.id, req.user!.userId)).run();
+  } catch {
+    // The pre-check above is just for a fast, friendly error in the common
+    // case — the unique index is the real guard against a race between two
+    // concurrent requests claiming the same number.
+    res.status(409).json({ error: "phone_already_registered" });
+    return;
+  }
+  res.json({ ok: true });
 });
 
 // Issues a presigned S3 POST policy scoped to this user's own key prefix —

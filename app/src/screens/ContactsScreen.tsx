@@ -16,20 +16,26 @@ import type { NativeStackScreenProps } from "@react-navigation/native-stack";
 import { Ionicons } from "@expo/vector-icons";
 
 import type { MainStackParamList } from "../../App";
-import { inviteByEmail } from "../api/client";
+import { ApiError, inviteByEmail } from "../api/client";
 import { useAuth } from "../auth/AuthContext";
 import {
   loadMatchedContacts,
   lookupSingleEmail,
+  lookupSinglePhone,
   normalize,
   type MatchedContact,
 } from "../contacts/matchContacts";
+import PhoneNumberInput from "../components/PhoneNumberInput";
+import { DEFAULT_COUNTRY, type CountryDialCode } from "../constants/countryCodes";
 import { getConversationByPeerKey, insertConversation, isUserBlocked, setConversationStatus } from "../db/database";
 import { getSocket } from "../network/socket";
+import { isValidLocalNumber, toE164 } from "../phone/phoneValidation";
 import { useTheme } from "../ThemeContext";
 import { colorForName, initialFor, type ThemeColors } from "../theme";
 
 type Props = NativeStackScreenProps<MainStackParamList, "Contacts">;
+
+type AddMode = "email" | "phone";
 
 const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
@@ -41,10 +47,23 @@ export default function ContactsScreen({ navigation }: Props) {
   const [error, setError] = useState<string | null>(null);
   const [invitingId, setInvitingId] = useState<string | null>(null);
 
+  const [addMode, setAddMode] = useState<AddMode>("email");
   const [manualEmail, setManualEmail] = useState("");
+  const [manualCountry, setManualCountry] = useState<CountryDialCode>(DEFAULT_COUNTRY);
+  const [manualPhoneDigits, setManualPhoneDigits] = useState("");
+  const [manualPhoneTouched, setManualPhoneTouched] = useState(false);
   const [manualResult, setManualResult] = useState<MatchedContact | null>(null);
   const [manualLoading, setManualLoading] = useState(false);
   const [manualError, setManualError] = useState<string | null>(null);
+
+  const switchMode = useCallback((mode: AddMode) => {
+    setAddMode(mode);
+    setManualError(null);
+    setManualResult(null);
+    setManualEmail("");
+    setManualPhoneDigits("");
+    setManualPhoneTouched(false);
+  }, []);
 
   useEffect(() => {
     if (!token || !email) return;
@@ -112,13 +131,27 @@ export default function ContactsScreen({ navigation }: Props) {
 
   const invite = useCallback(
     async (contact: MatchedContact) => {
-      if (!token) return;
+      if (!token || !contact.email) return;
+      const contactEmail = contact.email;
       setInvitingId(contact.id);
       try {
-        await inviteByEmail(token, contact.email);
-        Alert.alert("Invite sent", `We emailed ${contact.email} a link to join Beacon.`);
-      } catch {
-        Alert.alert("Couldn't send invite", "Please try again later.");
+        await inviteByEmail(token, contactEmail);
+        Alert.alert("Invite sent", `We emailed ${contactEmail} a link to join Beacon.`);
+      } catch (e) {
+        if (e instanceof ApiError && e.message === "already_registered") {
+          // Shouldn't normally happen — /users/lookup should already have
+          // flagged this contact as registered — but the server is the
+          // source of truth, so recover by re-resolving and flipping this
+          // row over to the "chat" state instead of leaving a dead end.
+          const refreshed = await lookupSingleEmail(token, contactEmail).catch(() => null);
+          if (refreshed && refreshed.registered) {
+            setManualResult((prev) => (prev?.id === contact.id ? refreshed : prev));
+            setContacts((prev) => prev?.map((c) => (c.id === contact.id ? refreshed : c)) ?? prev);
+          }
+          Alert.alert("Already on Beacon", `${contact.name} already has an account — you can add them directly now.`);
+        } else {
+          Alert.alert("Couldn't send invite", "Please try again later.");
+        }
       } finally {
         setInvitingId(null);
       }
@@ -155,6 +188,34 @@ export default function ContactsScreen({ navigation }: Props) {
     }
   }, [token, email, manualEmail]);
 
+  const addByPhone = useCallback(async () => {
+    if (!token) return;
+    setManualPhoneTouched(true);
+    if (!isValidLocalNumber(manualCountry.dialCode, manualPhoneDigits)) {
+      // No separate manualError here — PhoneNumberInput already shows an
+      // inline "enter a valid mobile number" message once touched.
+      return;
+    }
+    const e164 = toE164(manualCountry.dialCode, manualPhoneDigits);
+
+    setManualError(null);
+    setManualLoading(true);
+    try {
+      const result = await lookupSinglePhone(token, e164);
+      if (result.userId && isUserBlocked(result.userId)) {
+        setManualError("You've blocked this user.");
+        return;
+      }
+      setManualResult(result);
+      setManualPhoneDigits("");
+      setManualPhoneTouched(false);
+    } catch {
+      setManualError("Couldn't look that up. Please try again.");
+    } finally {
+      setManualLoading(false);
+    }
+  }, [token, manualCountry, manualPhoneDigits]);
+
   if (error) {
     return (
       <View style={styles.center}>
@@ -176,29 +237,69 @@ export default function ContactsScreen({ navigation }: Props) {
       keyboardShouldPersistTaps="handled"
       ListHeaderComponent={
         <View style={styles.addSection}>
-          <View style={styles.addRow}>
-            <TextInput
-              style={styles.input}
-              placeholder="Add by email"
-              placeholderTextColor={colors.textTertiary}
-              autoCapitalize="none"
-              autoCorrect={false}
-              keyboardType="email-address"
-              value={manualEmail}
-              onChangeText={(t) => {
-                setManualEmail(t);
-                setManualError(null);
-              }}
-              onSubmitEditing={addByEmail}
-            />
-            <Pressable style={styles.addButton} onPress={addByEmail} disabled={manualLoading}>
-              {manualLoading ? (
-                <ActivityIndicator size="small" color="#fff" />
-              ) : (
-                <Text style={styles.addButtonText}>Add</Text>
-              )}
+          <View style={styles.modeToggle}>
+            <Pressable
+              style={[styles.modeButton, addMode === "email" && styles.modeButtonActive]}
+              onPress={() => switchMode("email")}
+            >
+              <Text style={[styles.modeButtonText, addMode === "email" && styles.modeButtonTextActive]}>Email</Text>
+            </Pressable>
+            <Pressable
+              style={[styles.modeButton, addMode === "phone" && styles.modeButtonActive]}
+              onPress={() => switchMode("phone")}
+            >
+              <Text style={[styles.modeButtonText, addMode === "phone" && styles.modeButtonTextActive]}>Phone</Text>
             </Pressable>
           </View>
+
+          {addMode === "email" ? (
+            <View style={styles.addRow}>
+              <TextInput
+                style={styles.input}
+                placeholder="Add by email"
+                placeholderTextColor={colors.textTertiary}
+                autoCapitalize="none"
+                autoCorrect={false}
+                keyboardType="email-address"
+                value={manualEmail}
+                onChangeText={(t) => {
+                  setManualEmail(t);
+                  setManualError(null);
+                }}
+                onSubmitEditing={addByEmail}
+              />
+              <Pressable style={styles.addButton} onPress={addByEmail} disabled={manualLoading}>
+                {manualLoading ? (
+                  <ActivityIndicator size="small" color="#fff" />
+                ) : (
+                  <Text style={styles.addButtonText}>Add</Text>
+                )}
+              </Pressable>
+            </View>
+          ) : (
+            <View style={styles.addRow}>
+              <View style={styles.phoneInputWrap}>
+                <PhoneNumberInput
+                  country={manualCountry}
+                  localNumber={manualPhoneDigits}
+                  onChangeCountry={setManualCountry}
+                  onChangeLocalNumber={(digits) => {
+                    setManualPhoneDigits(digits);
+                    setManualError(null);
+                  }}
+                  showError={manualPhoneTouched}
+                  onBlur={() => setManualPhoneTouched(true)}
+                />
+              </View>
+              <Pressable style={styles.addButton} onPress={addByPhone} disabled={manualLoading}>
+                {manualLoading ? (
+                  <ActivityIndicator size="small" color="#fff" />
+                ) : (
+                  <Text style={styles.addButtonText}>Add</Text>
+                )}
+              </Pressable>
+            </View>
+          )}
           {manualError ? <Text style={styles.manualError}>{manualError}</Text> : null}
           {manualResult ? (
             <ContactRow
@@ -261,11 +362,11 @@ function ContactRow({
       )}
       <View style={styles.info}>
         <Text style={styles.name}>{contact.name}</Text>
-        <Text style={styles.email}>{contact.email}</Text>
+        <Text style={styles.email}>{contact.email ?? contact.phoneNumber}</Text>
       </View>
       {contact.registered ? (
         <Ionicons name="chevron-forward" size={18} color={colors.textTertiary} />
-      ) : (
+      ) : contact.email ? (
         <Pressable style={styles.inviteButton} onPress={() => onInvite(contact)} disabled={inviting}>
           {inviting ? (
             <ActivityIndicator size="small" color={colors.accent} />
@@ -276,6 +377,10 @@ function ContactRow({
             </>
           )}
         </Pressable>
+      ) : (
+        // No SMS-invite capability — a phone search that doesn't match a
+        // registered account just has nothing actionable to offer.
+        <Text style={styles.notFoundText}>Not on Beacon</Text>
       )}
     </Pressable>
   );
@@ -289,7 +394,24 @@ const createStyles = (colors: ThemeColors) =>
     empty: { color: colors.textTertiary, textAlign: "center", marginTop: 24 },
     error: { color: colors.textSecondary, textAlign: "center", paddingHorizontal: 24 },
     addSection: { paddingTop: 12, paddingHorizontal: 16, backgroundColor: colors.surface },
+    modeToggle: {
+      flexDirection: "row",
+      backgroundColor: colors.background,
+      borderRadius: 10,
+      padding: 3,
+      marginBottom: 10,
+    },
+    modeButton: {
+      flex: 1,
+      alignItems: "center",
+      paddingVertical: 8,
+      borderRadius: 8,
+    },
+    modeButtonActive: { backgroundColor: colors.surface, shadowColor: "#000", shadowOpacity: 0.08, shadowRadius: 3, shadowOffset: { width: 0, height: 1 }, elevation: 1 },
+    modeButtonText: { fontSize: 14, fontWeight: "600", color: colors.textSecondary },
+    modeButtonTextActive: { color: colors.accent },
     addRow: { flexDirection: "row", gap: 8 },
+    phoneInputWrap: { flex: 1 },
     input: {
       flex: 1,
       borderWidth: 1,
@@ -346,4 +468,5 @@ const createStyles = (colors: ThemeColors) =>
       justifyContent: "center",
     },
     inviteText: { color: colors.accent, fontWeight: "600", fontSize: 13 },
+    notFoundText: { color: colors.textTertiary, fontSize: 12.5, fontStyle: "italic" },
   });

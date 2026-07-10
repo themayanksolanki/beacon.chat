@@ -109,6 +109,11 @@ function runMigrations() {
     ["image_uri", "ALTER TABLE messages ADD COLUMN image_uri TEXT"],
     ["image_width", "ALTER TABLE messages ADD COLUMN image_width INTEGER"],
     ["image_height", "ALTER TABLE messages ADD COLUMN image_height INTEGER"],
+    // Unlike image_uri (a local file path), gif_url is a remote GIPHY CDN
+    // URL — GIFs aren't downloaded/persisted locally, just referenced.
+    ["gif_url", "ALTER TABLE messages ADD COLUMN gif_url TEXT"],
+    ["gif_width", "ALTER TABLE messages ADD COLUMN gif_width INTEGER"],
+    ["gif_height", "ALTER TABLE messages ADD COLUMN gif_height INTEGER"],
   ];
   for (const [column, statement] of migrations) {
     if (!existingColumns.has(column)) {
@@ -133,7 +138,7 @@ function runMigrations() {
 }
 
 export type MessageStatus = "pending" | "sent" | "delivered" | "read" | "failed";
-export type MessageKind = "text" | "voice" | "image";
+export type MessageKind = "text" | "voice" | "image" | "gif";
 
 export interface MessageRow {
   id: string;
@@ -160,13 +165,17 @@ export interface MessageRow {
   image_uri: string | null;
   image_width: number | null;
   image_height: number | null;
+  /** Remote GIPHY CDN url — not a local file, unlike image_uri. Only set when kind === 'gif'. */
+  gif_url: string | null;
+  gif_width: number | null;
+  gif_height: number | null;
 }
 
 export function insertMessage(message: MessageRow) {
   db.runSync(
     `INSERT INTO messages
-       (id, conversation_id, direction, plaintext, sent_at, status, delivered_at, read_at, reply_to_id, reply_preview, pinned_at, deleted_at, reaction_mine, reaction_peer, kind, audio_uri, duration_ms, waveform, image_uri, image_width, image_height)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       (id, conversation_id, direction, plaintext, sent_at, status, delivered_at, read_at, reply_to_id, reply_preview, pinned_at, deleted_at, reaction_mine, reaction_peer, kind, audio_uri, duration_ms, waveform, image_uri, image_width, image_height, gif_url, gif_width, gif_height)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [
       message.id,
       message.conversation_id,
@@ -189,6 +198,9 @@ export function insertMessage(message: MessageRow) {
       message.image_uri,
       message.image_width,
       message.image_height,
+      message.gif_url,
+      message.gif_width,
+      message.gif_height,
     ]
   );
 }

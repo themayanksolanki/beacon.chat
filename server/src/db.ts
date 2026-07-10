@@ -136,6 +136,12 @@ export function initDatabase() {
     sqlite.exec("ALTER TABLE users ADD COLUMN deletion_requested_at INTEGER");
   }
 
+  const userColumnsForPhone = sqlite.prepare("PRAGMA table_info(users)").all() as { name: string }[];
+  if (!userColumnsForPhone.some((c) => c.name === "contact_number")) {
+    sqlite.exec("ALTER TABLE users ADD COLUMN contact_number TEXT");
+  }
+  sqlite.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_contact_number ON users(contact_number)");
+
   const otpColumns = sqlite.prepare("PRAGMA table_info(otp_challenges)").all() as { name: string }[];
   if (!otpColumns.some((c) => c.name === "email")) {
     sqlite.exec("ALTER TABLE otp_challenges ADD COLUMN email TEXT");
@@ -149,4 +155,26 @@ export function initDatabase() {
   // Created after the email column is guaranteed to exist (either from the
   // fresh CREATE TABLE above, or the migration just above this).
   sqlite.exec("CREATE INDEX IF NOT EXISTS idx_otp_email ON otp_challenges(email, created_at)");
+
+  // Emails are now normalized (trim + lowercase) at every write, but rows
+  // created before that fix may still hold mixed-case addresses — those
+  // silently failed to match the case-sensitive lookups used by the
+  // add-contact search (see routes/users.ts). Backfill them once; a
+  // per-row update (rather than one bulk UPDATE) means a leftover
+  // collision between two differently-cased rows for what's really the
+  // same address just gets logged and skipped instead of aborting the
+  // whole migration.
+  const usersToNormalize = sqlite
+    .prepare("SELECT id, email FROM users")
+    .all() as { id: string; email: string }[];
+  const updateUserEmail = sqlite.prepare("UPDATE users SET email = ? WHERE id = ?");
+  for (const row of usersToNormalize) {
+    const normalized = row.email.trim().toLowerCase();
+    if (normalized === row.email) continue;
+    try {
+      updateUserEmail.run(normalized, row.id);
+    } catch (err) {
+      console.error(`[migration] couldn't normalize email casing for user ${row.id}:`, err);
+    }
+  }
 }

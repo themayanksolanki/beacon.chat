@@ -9,6 +9,7 @@ import { revokeOtherSessions } from "../socketServer";
 import { generateOtp, hashOtp, otpHashesMatch, MAX_ATTEMPTS, OTP_TTL_MS } from "../otp";
 import { sendOtpEmail } from "../email";
 import { cancelDeletionIfPending, requestDeletion } from "../accountDeletion";
+import { normalizeEmail } from "../util";
 
 export const authRouter = Router();
 
@@ -31,26 +32,27 @@ authRouter.post("/otp/request", otpRequestLimiter, async (req, res) => {
     res.status(400).json({ error: "invalid_email" });
     return;
   }
+  const normalizedEmail = normalizeEmail(email);
 
   // Opportunistic cleanup: otherwise every request leaves a row behind
   // forever, since nothing else ever deletes expired challenges.
   db.delete(otpChallenges)
-    .where(and(eq(otpChallenges.email, email), lt(otpChallenges.expires_at, Date.now())))
+    .where(and(eq(otpChallenges.email, normalizedEmail), lt(otpChallenges.expires_at, Date.now())))
     .run();
 
   const code = generateOtp();
   db.insert(otpChallenges)
     .values({
       id: randomUUID(),
-      email,
-      code_hash: hashOtp(code, email),
+      email: normalizedEmail,
+      code_hash: hashOtp(code, normalizedEmail),
       expires_at: Date.now() + OTP_TTL_MS,
       attempts: 0,
       created_at: Date.now(),
     })
     .run();
 
-  await sendOtpEmail(email, code);
+  await sendOtpEmail(normalizedEmail, code);
   res.status(202).json({ ok: true });
 });
 
@@ -66,11 +68,12 @@ authRouter.post("/otp/verify", async (req, res) => {
     res.status(400).json({ error: "email, code and publicKey are required" });
     return;
   }
+  const normalizedEmail = normalizeEmail(email);
 
   const challenge: OtpChallengeRow | undefined = db
     .select()
     .from(otpChallenges)
-    .where(eq(otpChallenges.email, email))
+    .where(eq(otpChallenges.email, normalizedEmail))
     .orderBy(desc(otpChallenges.created_at))
     .limit(1)
     .get();
@@ -85,7 +88,7 @@ authRouter.post("/otp/verify", async (req, res) => {
     return;
   }
 
-  if (!otpHashesMatch(challenge.code_hash, hashOtp(code, email))) {
+  if (!otpHashesMatch(challenge.code_hash, hashOtp(code, normalizedEmail))) {
     db.update(otpChallenges)
       .set({ attempts: challenge.attempts + 1 })
       .where(eq(otpChallenges.id, challenge.id))
@@ -94,9 +97,9 @@ authRouter.post("/otp/verify", async (req, res) => {
     return;
   }
 
-  db.delete(otpChallenges).where(eq(otpChallenges.email, email)).run();
+  db.delete(otpChallenges).where(eq(otpChallenges.email, normalizedEmail)).run();
 
-  const { token, userId } = await issueSession(email, publicKey);
+  const { token, userId } = await issueSession(normalizedEmail, publicKey);
   res.status(200).json({ token, userId });
 });
 
@@ -133,6 +136,7 @@ async function issueSession(email: string, publicKey: string): Promise<{ token: 
       id,
       email,
       public_key: publicKey,
+      contact_number: null,
       current_session_id: sessionId,
       created_at: Date.now(),
       last_seen_at: null,
@@ -159,7 +163,7 @@ if (process.env.SKIP_OTP === "true") {
       return;
     }
 
-    const { token, userId } = await issueSession(email, publicKey);
+    const { token, userId } = await issueSession(normalizeEmail(email), publicKey);
     res.status(200).json({ token, userId });
   });
 }

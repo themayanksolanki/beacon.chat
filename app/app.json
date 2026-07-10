@@ -52,6 +52,7 @@
       "./plugins/withCallKeepAndroid.js",
       "./plugins/withAndroidPip.js",
       "./plugins/withAndroidReleaseSigning.js",
+      "@giphy/react-native-sdk",
       [
         "expo-image-picker",
         {

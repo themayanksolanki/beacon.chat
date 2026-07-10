@@ -117,6 +117,32 @@ export function inviteByEmail(token: string, email: string) {
   });
 }
 
+export interface PhoneLookupMatch {
+  phoneNumber: string;
+  userId: string;
+  publicKey: string;
+  name: string | null;
+  avatarUrl: string | null;
+}
+
+export async function lookupUsersByPhone(token: string, phoneNumbers: string[]) {
+  const { matches } = await request<{ matches: PhoneLookupMatch[] }>("/users/lookup-by-phone", {
+    method: "POST",
+    token,
+    body: JSON.stringify({ phoneNumbers }),
+  });
+  return matches;
+}
+
+// null clears the stored number; the server never OTP-verifies this field.
+export function updatePhoneNumber(token: string, phoneNumber: string | null) {
+  return request<{ ok: true }>("/profile/phone", {
+    method: "PUT",
+    token,
+    body: JSON.stringify({ phoneNumber }),
+  });
+}
+
 // avatarKey omitted entirely => server leaves the stored avatar untouched
 // (used for a name-only edit); pass null to explicitly clear it.
 export function updateRemoteProfile(token: string, name: string, avatarKey?: string | null) {

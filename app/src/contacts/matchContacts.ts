@@ -1,11 +1,14 @@
 import * as Contacts from "expo-contacts/legacy";
 
-import { lookupUsers } from "../api/client";
+import { lookupUsers, lookupUsersByPhone } from "../api/client";
 
 export interface MatchedContact {
   id: string;
   name: string;
-  email: string;
+  // Exactly one of these is set, depending on which flow produced this
+  // match (address-book/manual email search vs. manual phone search).
+  email?: string;
+  phoneNumber?: string;
   registered: boolean;
   userId?: string;
   publicKey?: string;
@@ -25,6 +28,21 @@ export async function lookupSingleEmail(token: string, email: string): Promise<M
     id: normalized,
     name: match?.name ?? normalized,
     email: normalized,
+    registered: !!match,
+    userId: match?.userId,
+    publicKey: match?.publicKey,
+    avatarUrl: match?.avatarUrl,
+  };
+}
+
+/** Looks up a single manually-entered phone number (E.164), for the "add by phone" flow. */
+export async function lookupSinglePhone(token: string, phoneNumber: string): Promise<MatchedContact> {
+  const [match] = await lookupUsersByPhone(token, [phoneNumber]);
+
+  return {
+    id: phoneNumber,
+    name: match?.name ?? phoneNumber,
+    phoneNumber,
     registered: !!match,
     userId: match?.userId,
     publicKey: match?.publicKey,

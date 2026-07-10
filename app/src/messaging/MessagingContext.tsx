@@ -33,11 +33,13 @@ import {
 
 const VOICE_MESSAGE_LABEL = "🎤 Voice message";
 const IMAGE_MESSAGE_LABEL = "📷 Photo";
+const GIF_MESSAGE_LABEL = "🎞️ GIF";
 
 export type MessagePayload =
   | { kind: "text"; text: string; replyTo?: { id: string; preview: string } }
   | { kind: "voice"; audio: string; durationMs: number; waveform: number[]; replyTo?: { id: string; preview: string } }
-  | { kind: "image"; image: string; width: number; height: number; replyTo?: { id: string; preview: string } };
+  | { kind: "image"; image: string; width: number; height: number; replyTo?: { id: string; preview: string } }
+  | { kind: "gif"; url: string; width: number; height: number; replyTo?: { id: string; preview: string } };
 
 export interface ReactionPayload {
   emoji: string;
@@ -181,7 +183,13 @@ export function MessagingProvider({ children }: { children: ReactNode }) {
           conversation_id: message.sender_id,
           direction: "incoming",
           plaintext:
-            payload.kind === "voice" ? VOICE_MESSAGE_LABEL : payload.kind === "image" ? IMAGE_MESSAGE_LABEL : payload.text,
+            payload.kind === "voice"
+              ? VOICE_MESSAGE_LABEL
+              : payload.kind === "image"
+                ? IMAGE_MESSAGE_LABEL
+                : payload.kind === "gif"
+                  ? GIF_MESSAGE_LABEL
+                  : payload.text,
           sent_at: message.created_at,
           status: "delivered",
           delivered_at: message.created_at,
@@ -199,6 +207,11 @@ export function MessagingProvider({ children }: { children: ReactNode }) {
           image_uri: imageUri,
           image_width: payload.kind === "image" ? payload.width : null,
           image_height: payload.kind === "image" ? payload.height : null,
+          // GIFs are referenced by their GIPHY CDN url, not downloaded to a
+          // local file — nothing analogous to writeImageMessageBase64 needed.
+          gif_url: payload.kind === "gif" ? payload.url : null,
+          gif_width: payload.kind === "gif" ? payload.width : null,
+          gif_height: payload.kind === "gif" ? payload.height : null,
         };
         insertMessage(row);
         getSocket().emit("message:delivered", { id: message.id });

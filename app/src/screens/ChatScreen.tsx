@@ -58,6 +58,13 @@ import {
 } from "../db/database";
 import { compressImage } from "../media/imageCompression";
 import { deleteImageMessage, persistPickedImage, readImageMessageBase64 } from "../media/imageStorage";
+import { isGifPickerAvailable, pickGif } from "../media/gifPicker";
+import {
+  base64FromRemoteUrl,
+  isDownloadAvailable,
+  saveMediaToDevice,
+  type MediaCategory,
+} from "../media/downloadStorage";
 import { useCall } from "../calls/CallContext";
 import { getSocket } from "../network/socket";
 import { useMessaging, type MessagePayload, type ReactionPayload } from "../messaging/MessagingContext";
@@ -70,6 +77,7 @@ import { colorForName, initialFor, type ThemeColors } from "../theme";
 
 const VOICE_MESSAGE_LABEL = "🎤 Voice message";
 const IMAGE_MESSAGE_LABEL = "📷 Photo";
+const GIF_MESSAGE_LABEL = "🎞️ GIF";
 
 type Props = NativeStackScreenProps<MainStackParamList, "Chat">;
 
@@ -363,6 +371,7 @@ interface MessageBubbleProps {
   onDeleteForEveryone: (message: MessageRow) => void;
   onOpenMenu: (message: MessageRow, actions: MessageAction[], anchor: MessageMenuAnchor) => void;
   onCancelSend: (message: MessageRow) => void;
+  onSaveMedia: (message: MessageRow) => void;
 }
 
 function MessageBubble({
@@ -377,6 +386,7 @@ function MessageBubble({
   onDeleteForEveryone,
   onOpenMenu,
   onCancelSend,
+  onSaveMedia,
 }: MessageBubbleProps) {
   const { colors } = useTheme();
   const styles = useMemo(() => createStyles(colors), [colors]);
@@ -423,6 +433,13 @@ function MessageBubble({
           { label: "Reply", icon: "arrow-undo-outline", onPress: () => onReply(message) },
           { label: "Copy", icon: "copy-outline", onPress: () => onCopy(message) },
         ];
+        if (message.kind !== "text" && isDownloadAvailable()) {
+          actions.push({
+            label: "Save to device",
+            icon: "download-outline",
+            onPress: () => onSaveMedia(message),
+          });
+        }
         if (isOutgoing) {
           actions.push({
             label: "Info",
@@ -515,6 +532,23 @@ function MessageBubble({
                     isOutgoing && message.status === "pending" ? () => onCancelSend(message) : undefined
                   }
                 />
+              ) : message.kind === "gif" ? (
+                <View>
+                  <ImageMessageBubble
+                    imageUri={message.gif_url}
+                    width={message.gif_width ?? 0}
+                    height={message.gif_height ?? 0}
+                    isSending={isOutgoing && message.status === "pending"}
+                    onCancelSend={
+                      isOutgoing && message.status === "pending" ? () => onCancelSend(message) : undefined
+                    }
+                  />
+                  {/* GIPHY's terms require attribution wherever their content is
+                      shown, not just in the picker — GiphyMediaView shows this
+                      automatically, but a plain Image (used here for parity
+                      with how photos render) doesn't. */}
+                  <Text style={styles.gifAttribution}>GIPHY</Text>
+                </View>
               ) : (
                 <Text style={isOutgoing ? styles.outgoingText : styles.incomingText}>{message.plaintext}</Text>
               )}
@@ -981,6 +1015,12 @@ export default function ChatScreen({ route, navigation }: Props) {
     [sendPayload]
   );
 
+  const sendGifEncrypted = useCallback(
+    (id: string, url: string, width: number, height: number, replyTo: ReplyTarget | null) =>
+      sendPayload(id, { kind: "gif", url, width, height, replyTo: replyTo ?? undefined }),
+    [sendPayload]
+  );
+
   const onCancelSend = useCallback((message: MessageRow) => {
     cancelledSendIdsRef.current.add(message.id);
     deleteMessage(message.id);
@@ -995,7 +1035,9 @@ export default function ChatScreen({ route, navigation }: Props) {
       const replyTo = message.reply_to_id
         ? { id: message.reply_to_id, preview: message.reply_preview ?? "" }
         : null;
-      if (message.kind === "voice" && message.audio_uri) {
+      if (message.kind === "gif" && message.gif_url) {
+        void sendGifEncrypted(message.id, message.gif_url, message.gif_width ?? 0, message.gif_height ?? 0, replyTo);
+      } else if (message.kind === "voice" && message.audio_uri) {
         void sendVoiceEncrypted(
           message.id,
           message.audio_uri,
@@ -1015,7 +1057,7 @@ export default function ChatScreen({ route, navigation }: Props) {
         void sendEncrypted(message.id, message.plaintext, replyTo);
       }
     },
-    [sendEncrypted, sendVoiceEncrypted, sendImageEncrypted]
+    [sendEncrypted, sendVoiceEncrypted, sendImageEncrypted, sendGifEncrypted]
   );
 
   const onSend = useCallback(async () => {
@@ -1049,6 +1091,9 @@ export default function ChatScreen({ route, navigation }: Props) {
       image_uri: null,
       image_width: null,
       image_height: null,
+      gif_url: null,
+      gif_width: null,
+      gif_height: null,
     };
     insertMessage(outgoing);
     setMessages((prev) => [...prev, outgoing]);
@@ -1092,6 +1137,9 @@ export default function ChatScreen({ route, navigation }: Props) {
           image_uri: null,
           image_width: null,
           image_height: null,
+          gif_url: null,
+          gif_width: null,
+          gif_height: null,
         };
         insertMessage(reply);
         setMessages((prev) => [...prev, reply]);
@@ -1132,6 +1180,9 @@ export default function ChatScreen({ route, navigation }: Props) {
         image_uri: null,
         image_width: null,
         image_height: null,
+        gif_url: null,
+        gif_width: null,
+        gif_height: null,
       };
       insertMessage(outgoing);
       setMessages((prev) => [...prev, outgoing]);
@@ -1240,6 +1291,9 @@ export default function ChatScreen({ route, navigation }: Props) {
           image_uri: persistedUri,
           image_width: compressed.width,
           image_height: compressed.height,
+          gif_url: null,
+          gif_width: null,
+          gif_height: null,
         };
         insertMessage(outgoing);
         setMessages((prev) => [...prev, outgoing]);
@@ -1294,8 +1348,108 @@ export default function ChatScreen({ route, navigation }: Props) {
     ]);
   }, [pickImage]);
 
+  // Unlike sendImage, there's no compression/local-persistence step — the
+  // GIF already lives permanently on GIPHY's CDN, so the picked url is the
+  // final payload as soon as it's picked.
+  const sendGif = useCallback(
+    (url: string, width: number, height: number) => {
+      if (!conversation) return;
+      const activeReply = replyingTo;
+      setReplyingTo(null);
+
+      const id = Crypto.randomUUID();
+      const outgoing: MessageRow = {
+        id,
+        conversation_id: conversationId,
+        direction: "outgoing",
+        plaintext: GIF_MESSAGE_LABEL,
+        sent_at: Date.now(),
+        status: "pending",
+        delivered_at: null,
+        read_at: null,
+        reply_to_id: activeReply?.id ?? null,
+        reply_preview: activeReply?.preview ?? null,
+        pinned_at: null,
+        deleted_at: null,
+        reaction_mine: null,
+        reaction_peer: null,
+        kind: "gif",
+        audio_uri: null,
+        duration_ms: null,
+        waveform: null,
+        image_uri: null,
+        image_width: null,
+        image_height: null,
+        gif_url: url,
+        gif_width: width,
+        gif_height: height,
+      };
+      insertMessage(outgoing);
+      setMessages((prev) => [...prev, outgoing]);
+
+      if (isTestBot) {
+        markMessageSent(id);
+        setMessages((prev) => prev.map((m) => (m.id === id ? { ...m, status: "sent" } : m)));
+        return;
+      }
+
+      void sendGifEncrypted(id, url, width, height, activeReply);
+    },
+    [conversation, conversationId, isTestBot, replyingTo, sendGifEncrypted]
+  );
+
+  const pickAndSendGif = useCallback(async () => {
+    if (!conversation) return;
+    if (!isGifPickerAvailable()) {
+      Alert.alert("GIFs unavailable", "The GIF picker isn't configured for this build.");
+      return;
+    }
+    try {
+      const picked = await pickGif();
+      if (picked) sendGif(picked.url, picked.width, picked.height);
+    } catch (err) {
+      console.warn("[chat] failed to pick gif", err);
+      Alert.alert("Couldn't open GIF picker", "Please try again.");
+    }
+  }, [conversation, sendGif]);
+
   const onCopy = useCallback((message: MessageRow) => {
     Clipboard.setStringAsync(message.plaintext);
+  }, []);
+
+  const onSaveMedia = useCallback(async (message: MessageRow) => {
+    let category: MediaCategory;
+    let mimeType: string;
+    let base64: string;
+    try {
+      if (message.kind === "image" && message.image_uri) {
+        category = "Photos";
+        mimeType = "image/jpeg";
+        base64 = readImageMessageBase64(message.image_uri);
+      } else if (message.kind === "voice" && message.audio_uri) {
+        category = "Audio";
+        mimeType = "audio/m4a";
+        base64 = readVoiceMessageBase64(message.audio_uri);
+      } else if (message.kind === "gif" && message.gif_url) {
+        category = "Photos";
+        mimeType = "image/gif";
+        base64 = await base64FromRemoteUrl(message.gif_url);
+      } else {
+        return;
+      }
+
+      const result = await saveMediaToDevice({ category, fileName: message.id, mimeType, base64 });
+      if (result.ok) {
+        Alert.alert("Saved", `Saved to Beacon/${category}.`);
+      } else if (result.error === "permission_denied") {
+        Alert.alert("Permission needed", "Grant folder access so Beacon can save media to your device.");
+      } else {
+        Alert.alert("Couldn't save", "Please try again.");
+      }
+    } catch (err) {
+      console.warn("[chat] failed to save media", err);
+      Alert.alert("Couldn't save", "Please try again.");
+    }
   }, []);
 
   const onDelete = useCallback((message: MessageRow) => {
@@ -1455,6 +1609,7 @@ export default function ChatScreen({ route, navigation }: Props) {
               onDeleteForEveryone={onDeleteForEveryone}
               onOpenMenu={openMenu}
               onCancelSend={onCancelSend}
+              onSaveMedia={onSaveMedia}
             />
           )
         }
@@ -1522,6 +1677,9 @@ export default function ChatScreen({ route, navigation }: Props) {
             </Pressable>
             <Pressable style={styles.emojiButton} onPress={showImageSourceOptions} hitSlop={8}>
               <Ionicons name="camera-outline" size={24} color={colors.textSecondary} />
+            </Pressable>
+            <Pressable style={styles.gifButton} onPress={pickAndSendGif} hitSlop={8}>
+              <Text style={styles.gifButtonText}>GIF</Text>
             </Pressable>
             <TextInput
               style={styles.input}
@@ -1668,6 +1826,18 @@ const createStyles = (colors: ThemeColors) =>
     reactionBadgeText: { fontSize: 13 },
     outgoingText: { color: "#fff", fontSize: 15.5 },
     incomingText: { color: colors.text, fontSize: 15.5 },
+    gifAttribution: {
+      position: "absolute",
+      bottom: 4,
+      right: 8,
+      fontSize: 9,
+      fontWeight: "800",
+      letterSpacing: 0.5,
+      color: "rgba(255,255,255,0.85)",
+      textShadowColor: "rgba(0,0,0,0.5)",
+      textShadowRadius: 2,
+      textShadowOffset: { width: 0, height: 0 },
+    },
     deletedRow: { flexDirection: "row", alignItems: "center", gap: 6 },
     outgoingDeletedText: { color: "rgba(255,255,255,0.75)", fontSize: 15, fontStyle: "italic" },
     incomingDeletedText: { color: colors.textTertiary, fontSize: 15, fontStyle: "italic" },
@@ -1748,6 +1918,18 @@ const createStyles = (colors: ThemeColors) =>
       alignItems: "center",
       justifyContent: "center",
     },
+    gifButton: {
+      height: 26,
+      paddingHorizontal: 6,
+      alignSelf: "center",
+      alignItems: "center",
+      justifyContent: "center",
+      borderRadius: 5,
+      borderWidth: 1.5,
+      borderColor: colors.textSecondary,
+      marginRight: 4,
+    },
+    gifButtonText: { fontSize: 11, fontWeight: "800", color: colors.textSecondary, letterSpacing: 0.3 },
     input: {
       flex: 1,
       borderWidth: 1,
