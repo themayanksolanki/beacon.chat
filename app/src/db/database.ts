@@ -673,6 +673,32 @@ export function getCallsForConversation(conversationId: string): CallRow[] {
   );
 }
 
+/** Calls counterpart of getRecentMessages — see there for why this exists (bounded initial/paginated load, not the full history). */
+export function getRecentCalls(conversationId: string, limit: number): CallRow[] {
+  const rows = db.getAllSync<CallRow>(
+    `SELECT * FROM calls WHERE conversation_id = ? ORDER BY started_at DESC, id DESC LIMIT ?`,
+    [conversationId, limit]
+  );
+  return rows.reverse();
+}
+
+/** Calls counterpart of getMessagesBefore. */
+export function getCallsBefore(conversationId: string, beforeStartedAt: number, limit: number): CallRow[] {
+  const rows = db.getAllSync<CallRow>(
+    `SELECT * FROM calls WHERE conversation_id = ? AND started_at < ? ORDER BY started_at DESC, id DESC LIMIT ?`,
+    [conversationId, beforeStartedAt, limit]
+  );
+  return rows.reverse();
+}
+
+/** Calls counterpart of getMessagesFrom. */
+export function getCallsFrom(conversationId: string, sinceStartedAt: number): CallRow[] {
+  return db.getAllSync<CallRow>(
+    `SELECT * FROM calls WHERE conversation_id = ? AND started_at >= ? ORDER BY started_at ASC, id ASC`,
+    [conversationId, sinceStartedAt]
+  );
+}
+
 export interface CallHistoryEntry extends CallRow {
   display_name: string | null;
 }
