@@ -1,8 +1,6 @@
 import jwt from "jsonwebtoken";
-import { eq } from "drizzle-orm";
 import type { Request, Response, NextFunction } from "express";
-import { db } from "./db";
-import { users } from "./schema";
+import { prisma } from "./prisma";
 
 const JWT_SECRET: string = (() => {
   const value = process.env.JWT_SECRET;
@@ -15,6 +13,7 @@ const JWT_SECRET: string = (() => {
 export interface TokenPayload {
   userId: string;
   sessionId: string;
+  deviceId: string;
 }
 
 export function signToken(payload: TokenPayload): string {
@@ -30,25 +29,27 @@ export function verifyToken(token: string): TokenPayload {
 
 /**
  * A valid JWT signature is not enough: the embedded sessionId must still
- * match the user's current_session_id. Logging in on another device
- * overwrites that column, which is what makes the old device's token stop
- * working immediately instead of only expiring after 90 days.
+ * resolve to a live Session row for that same device. Re-logging in on the
+ * SAME device revokes its own previous session (see issueSession in
+ * routes/auth.ts); other devices linked to the account are untouched —
+ * that's what makes concurrent multi-device work while still killing a
+ * stolen/old token the moment its device re-authenticates or gets removed
+ * from Settings.
  */
-export function isSessionActive(payload: TokenPayload): boolean {
-  const user = db
-    .select({ id: users.id, current_session_id: users.current_session_id })
-    .from(users)
-    .where(eq(users.id, payload.userId))
-    .get();
+export async function isSessionActive(payload: TokenPayload): Promise<boolean> {
+  const session = await prisma.session.findUnique({ where: { id: payload.sessionId } });
 
-  return user?.current_session_id === payload.sessionId;
+  if (!session || session.userId !== payload.userId || session.deviceId !== payload.deviceId) return false;
+  if (session.revokedAt) return false;
+  if (session.expiresAt.getTime() < Date.now()) return false;
+  return true;
 }
 
 export interface AuthedRequest extends Request {
   user?: TokenPayload;
 }
 
-export function requireAuth(req: AuthedRequest, res: Response, next: NextFunction) {
+export async function requireAuth(req: AuthedRequest, res: Response, next: NextFunction) {
   const header = req.headers.authorization;
   const token = header?.startsWith("Bearer ") ? header.slice("Bearer ".length) : null;
 
@@ -65,7 +66,7 @@ export function requireAuth(req: AuthedRequest, res: Response, next: NextFunctio
     return;
   }
 
-  if (!isSessionActive(payload)) {
+  if (!(await isSessionActive(payload))) {
     res.status(401).json({ error: "session_revoked" });
     return;
   }

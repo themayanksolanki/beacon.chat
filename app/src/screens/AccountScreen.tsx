@@ -1,12 +1,16 @@
 import { useCallback, useMemo, useState } from "react";
 import { ActivityIndicator, Alert, Pressable, StyleSheet, Text, View } from "react-native";
+import type { NativeStackScreenProps } from "@react-navigation/native-stack";
 import { Ionicons } from "@expo/vector-icons";
 
+import type { MainStackParamList } from "../../App";
 import { useAuth } from "../auth/AuthContext";
 import { useTheme } from "../ThemeContext";
 import type { ThemeColors } from "../theme";
 
-export default function AccountScreen() {
+type Props = NativeStackScreenProps<MainStackParamList, "Account">;
+
+export default function AccountScreen({ navigation }: Props) {
   const { colors } = useTheme();
   const styles = useMemo(() => createStyles(colors), [colors]);
   const { email, logout, deleteAccount } = useAuth();
@@ -62,6 +66,14 @@ export default function AccountScreen() {
 
       <Text style={styles.sectionHeader}>SESSION</Text>
       <View style={styles.section}>
+        <Pressable style={styles.row} onPress={() => navigation.navigate("LinkedDevices")}>
+          <View style={styles.rowLeft}>
+            <Ionicons name="phone-portrait-outline" size={20} color={colors.text} />
+            <Text style={styles.rowLabel}>Linked devices</Text>
+          </View>
+          <Ionicons name="chevron-forward" size={20} color={colors.textTertiary} />
+        </Pressable>
+        <View style={styles.divider} />
         <Pressable style={styles.row} onPress={() => logout()} disabled={deleting}>
           <View style={styles.rowLeft}>
             <Ionicons name="log-out-outline" size={20} color={colors.text} />
@@ -69,7 +81,9 @@ export default function AccountScreen() {
           </View>
         </Pressable>
       </View>
-      <Text style={styles.sectionFooter}>You can log back in anytime using this email.</Text>
+      <Text style={styles.sectionFooter}>
+        Log out signs out just this device. See and remove other signed-in devices under Linked devices.
+      </Text>
 
       <Text style={styles.sectionHeader}>DANGER ZONE</Text>
       <View style={styles.section}>

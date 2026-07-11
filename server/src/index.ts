@@ -2,13 +2,16 @@ import "dotenv/config";
 import { createServer } from "node:http";
 import { createApp } from "./app";
 import { createSocketServer } from "./socketServer";
-import { initDatabase } from "./db";
 import { connectMongo } from "./mongo";
 import { startAccountDeletionSweep } from "./accountDeletion";
 import { backfillAcceptedContactsFromMessages } from "./contacts";
 
-initDatabase();
-backfillAcceptedContactsFromMessages();
+// Schema is provisioned via `npm run prisma:migrate` (prod) /
+// `npm run prisma:migrate:dev` (local) — Prisma migrations run as a
+// separate CLI step, not at process startup like the old SQLite initDatabase().
+backfillAcceptedContactsFromMessages().catch((err) =>
+  console.error("[contacts] backfill failed:", err)
+);
 startAccountDeletionSweep();
 
 const app = createApp();

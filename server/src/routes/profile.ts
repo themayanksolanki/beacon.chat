@@ -1,7 +1,5 @@
 import { Router } from "express";
-import { eq } from "drizzle-orm";
-import { db } from "../db";
-import { users } from "../schema";
+import { prisma } from "../prisma";
 import { requireAuth, type AuthedRequest } from "../auth";
 import { isMongoConnected, profiles, resolveAvatarUrl } from "../mongo";
 import { createAvatarUploadPost, deleteAvatarObject, headAvatarObject, isS3Configured } from "../s3";
@@ -14,15 +12,14 @@ const MAX_NAME_LENGTH = 80;
 const PHONE_REGEX = /^\+[1-9]\d{6,14}$/;
 
 profileRouter.get("/me", requireAuth, async (req: AuthedRequest, res) => {
-  // Phone lives in SQLite alongside email/public_key (it's a search key,
+  // Phone lives in Postgres alongside email/publicKey (it's a search key,
   // same role as email) rather than Mongo, so it's available regardless of
   // whether the optional Mongo-backed name/avatar profile store is configured.
-  const user = db
-    .select({ contact_number: users.contact_number })
-    .from(users)
-    .where(eq(users.id, req.user!.userId))
-    .get();
-  const phoneNumber = user?.contact_number ?? null;
+  const user = await prisma.user.findUnique({
+    where: { id: req.user!.userId },
+    select: { contactNumber: true },
+  });
+  const phoneNumber = user?.contactNumber ?? null;
 
   if (!isMongoConnected()) {
     res.json({ profile: null, phoneNumber });
@@ -38,11 +35,11 @@ profileRouter.get("/me", requireAuth, async (req: AuthedRequest, res) => {
  * never OTP-verified — it's just a self-reported, unique search key so other
  * users can find this account by phone in the add-contact flow.
  */
-profileRouter.put("/phone", requireAuth, (req: AuthedRequest, res) => {
+profileRouter.put("/phone", requireAuth, async (req: AuthedRequest, res) => {
   const { phoneNumber } = req.body ?? {};
 
   if (phoneNumber === null) {
-    db.update(users).set({ contact_number: null }).where(eq(users.id, req.user!.userId)).run();
+    await prisma.user.update({ where: { id: req.user!.userId }, data: { contactNumber: null } });
     res.json({ ok: true });
     return;
   }
@@ -52,18 +49,14 @@ profileRouter.put("/phone", requireAuth, (req: AuthedRequest, res) => {
     return;
   }
 
-  const existing = db
-    .select({ id: users.id })
-    .from(users)
-    .where(eq(users.contact_number, phoneNumber))
-    .get();
+  const existing = await prisma.user.findUnique({ where: { contactNumber: phoneNumber }, select: { id: true } });
   if (existing && existing.id !== req.user!.userId) {
     res.status(409).json({ error: "phone_already_registered" });
     return;
   }
 
   try {
-    db.update(users).set({ contact_number: phoneNumber }).where(eq(users.id, req.user!.userId)).run();
+    await prisma.user.update({ where: { id: req.user!.userId }, data: { contactNumber: phoneNumber } });
   } catch {
     // The pre-check above is just for a fast, friendly error in the common
     // case — the unique index is the real guard against a race between two
@@ -111,11 +104,10 @@ profileRouter.put("/", requireAuth, async (req: AuthedRequest, res) => {
     return;
   }
 
-  const user = db
-    .select({ id: users.id, email: users.email })
-    .from(users)
-    .where(eq(users.id, req.user!.userId))
-    .get();
+  const user = await prisma.user.findUnique({
+    where: { id: req.user!.userId },
+    select: { id: true, email: true },
+  });
   if (!user) {
     res.status(404).json({ error: "user_not_found" });
     return;

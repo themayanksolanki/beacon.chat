@@ -16,7 +16,13 @@ import { ApiError } from "../api/client";
 import { getOrCreateIdentity } from "../crypto/identity";
 import { initDatabase, wipeAccountDatabase } from "../db/database";
 import { connectSocket, disconnectSocket } from "../network/socket";
-import { clearIdentityKeys } from "../storage/secureKeyStore";
+import {
+  clearDeviceId,
+  clearIdentityKeys,
+  getDeviceName,
+  getOrCreateDeviceId,
+  saveDeviceId,
+} from "../storage/secureKeyStore";
 import { clearProfile, loadProfile, savePhoneNumber, saveProfile, type Profile } from "../storage/profileStore";
 import {
   clearSessionEmail,
@@ -188,8 +194,19 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       const identity = await getOrCreateIdentity(emailAddress);
       await sodium.ready;
       const publicKey = sodium.to_base64(identity.publicKey);
+      // Persisted per-account (see secureKeyStore) so re-authenticating from
+      // this same device later reuses this same device registration instead
+      // of the server treating it as a brand new linked device.
+      const deviceId = await getOrCreateDeviceId(emailAddress);
 
-      const { token: newToken } = await api.verifyOtp(emailAddress, code, publicKey);
+      const { token: newToken, deviceId: linkedDeviceId } = await api.verifyOtp(
+        emailAddress,
+        code,
+        publicKey,
+        deviceId,
+        getDeviceName()
+      );
+      await saveDeviceId(emailAddress, linkedDeviceId);
       await establishSession(emailAddress, newToken);
     },
     [establishSession]
@@ -202,8 +219,15 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       const identity = await getOrCreateIdentity(emailAddress);
       await sodium.ready;
       const publicKey = sodium.to_base64(identity.publicKey);
+      const deviceId = await getOrCreateDeviceId(emailAddress);
 
-      const { token: newToken } = await api.devLogin(emailAddress, publicKey);
+      const { token: newToken, deviceId: linkedDeviceId } = await api.devLogin(
+        emailAddress,
+        publicKey,
+        deviceId,
+        getDeviceName()
+      );
+      await saveDeviceId(emailAddress, linkedDeviceId);
       await establishSession(emailAddress, newToken);
     },
     [establishSession]
@@ -267,6 +291,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     await api.requestAccountDeletion(token);
     wipeAccountDatabase(email);
     await clearIdentityKeys(email);
+    await clearDeviceId(email);
     signOutLocally();
   }, [token, email, signOutLocally]);
 

@@ -97,6 +97,13 @@ interface IncomingServerMessage {
   ciphertext: string;
   nonce: string;
   created_at: number;
+  // The specific device key this copy was actually encrypted with — real
+  // multi-device means a peer's messages can arrive from different devices
+  // with different keys, so trust this over the single cached
+  // conversation.peer_public_key (which only reflects whichever device
+  // logged in most recently). Falls back to the old cached-key+retry path
+  // (see decryptFromPeer) if a server hasn't started sending this yet.
+  sender_public_key: string | null;
 }
 
 interface IncomingServerReaction {
@@ -105,6 +112,8 @@ interface IncomingServerReaction {
   recipient_id: string;
   ciphertext: string;
   nonce: string;
+  // Same reasoning as IncomingServerMessage.sender_public_key above.
+  sender_public_key: string | null;
 }
 
 interface MessagingContextValue {
@@ -213,13 +222,20 @@ export function MessagingProvider({ children }: { children: ReactNode }) {
       try {
         const identity = await getOrCreateIdentity(email);
         await sodium.ready;
-        const decrypted = await decryptFromPeer(
-          message.sender_id,
-          conversation.peer_public_key,
-          message.ciphertext,
-          message.nonce,
-          identity.privateKey
-        );
+        const decrypted = message.sender_public_key
+          ? await decryptMessage(
+              message.ciphertext,
+              message.nonce,
+              sodium.from_base64(message.sender_public_key),
+              identity.privateKey
+            )
+          : await decryptFromPeer(
+              message.sender_id,
+              conversation.peer_public_key,
+              message.ciphertext,
+              message.nonce,
+              identity.privateKey
+            );
         const payload: MessagePayload = JSON.parse(decrypted);
 
         // Legacy inline images (pre-S3-attachment-pipeline) still arrive as
@@ -340,13 +356,20 @@ export function MessagingProvider({ children }: { children: ReactNode }) {
       try {
         const identity = await getOrCreateIdentity(email);
         await sodium.ready;
-        const decrypted = await decryptFromPeer(
-          reaction.sender_id,
-          conversation.peer_public_key,
-          reaction.ciphertext,
-          reaction.nonce,
-          identity.privateKey
-        );
+        const decrypted = reaction.sender_public_key
+          ? await decryptMessage(
+              reaction.ciphertext,
+              reaction.nonce,
+              sodium.from_base64(reaction.sender_public_key),
+              identity.privateKey
+            )
+          : await decryptFromPeer(
+              reaction.sender_id,
+              conversation.peer_public_key,
+              reaction.ciphertext,
+              reaction.nonce,
+              identity.privateKey
+            );
         const payload: ReactionPayload = JSON.parse(decrypted);
         setPeerReaction(reaction.message_id, payload.emoji);
         bump();

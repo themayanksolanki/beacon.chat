@@ -9,21 +9,30 @@ import {
   markDelivered,
   markReactionDelivered,
   markRead,
-  setReaction,
-  storeMessage,
+  setReactions,
+  storeMessages,
   userExists,
+  type OutgoingEnvelope,
 } from "./messages";
 import { getLastSeen, setLastSeen } from "./presence";
+import { setDeviceLastSeen } from "./devices";
 import { acceptContact, isAcceptedContact, rejectContact, requestContact, type RejectAction } from "./contacts";
 
 interface AuthedSocket extends Socket {
   userId?: string;
+  deviceId?: string;
 }
 
 interface ActiveCall {
   callId: string;
   callerId: string;
   calleeId: string;
+  // call:invite rings every device the callee is linked on at once (it
+  // targets their user room, which every device joins). This flips true the
+  // moment ANY of those devices answers, so a second/third device's
+  // near-simultaneous call:answer is recognized as redundant instead of
+  // being relayed to the caller again — see call:answer below.
+  answered: boolean;
 }
 
 // Ephemeral signaling state only — calls aren't persisted server-side, so a
@@ -46,17 +55,49 @@ function endActiveCall(callId: string, io: Server, reason: string, notify: strin
   }
 }
 
-// Socket count per user rather than a plain Set, so a brief overlap between
-// an old and new connection (reconnect, or the old device's socket lingering
-// a moment after login-elsewhere revocation) doesn't flip presence offline
-// and back on.
-const onlineUsers = new Map<string, number>();
+// Presence is tracked per DEVICE, then aggregated up to "is this user online
+// at all" — a user is online iff at least one of their devices has a live
+// socket. Socket count per device (rather than a plain Set of device ids)
+// so a brief overlap between an old and new connection for the same device
+// (reconnect, or the old socket lingering a moment after login-elsewhere
+// revocation) doesn't flip that device's — and therefore possibly the
+// user's — presence offline and back on.
+const onlineDeviceSocketCounts = new Map<string, number>();
+const onlineDevicesByUser = new Map<string, Set<string>>();
+
+function isUserOnline(userId: string): boolean {
+  return (onlineDevicesByUser.get(userId)?.size ?? 0) > 0;
+}
 
 function presenceRoom(userId: string): string {
   return `presence:${userId}`;
 }
 
+function deviceRoom(deviceId: string): string {
+  return `device:${deviceId}`;
+}
+
 let io: Server | undefined;
+
+/**
+ * Flushes anything that arrived while this device was offline: queued
+ * messages and reactions addressed to THIS device specifically (each
+ * recipient device tracks its own delivery independently — see
+ * messages.ts). Reactions are marked delivered as soon as they're flushed
+ * rather than waiting for a client ack — worst case one is a step behind
+ * after a crash, never lost. Deliberately not awaited by the caller — see
+ * the comment at its call site in the connection handler.
+ */
+async function flushUndelivered(socket: AuthedSocket, deviceId: string): Promise<void> {
+  for (const pending of await getUndeliveredMessages(deviceId)) {
+    socket.emit("message", pending);
+  }
+
+  for (const reaction of await getUndeliveredReactions(deviceId)) {
+    socket.emit("reaction:set", reaction);
+    void markReactionDelivered(reaction.message_id, reaction.sender_id, reaction.recipient_device_id);
+  }
+}
 
 export function createSocketServer(httpServer: HttpServer): Server {
   io = new Server(httpServer, {
@@ -66,7 +107,7 @@ export function createSocketServer(httpServer: HttpServer): Server {
     maxHttpBufferSize: 15 * 1024 * 1024,
   });
 
-  io.use((socket: AuthedSocket, next) => {
+  io.use(async (socket: AuthedSocket, next) => {
     const token = socket.handshake.auth?.token;
     if (typeof token !== "string") {
       next(new Error("Missing auth token"));
@@ -74,11 +115,12 @@ export function createSocketServer(httpServer: HttpServer): Server {
     }
     try {
       const payload = verifyToken(token);
-      if (!isSessionActive(payload)) {
+      if (!(await isSessionActive(payload))) {
         next(new Error("session_revoked"));
         return;
       }
       socket.userId = payload.userId;
+      socket.deviceId = payload.deviceId;
       next();
     } catch {
       next(new Error("Invalid auth token"));
@@ -88,56 +130,79 @@ export function createSocketServer(httpServer: HttpServer): Server {
   io.on("connection", (socket: AuthedSocket) => {
     const userId = socket.userId!;
     // Each user gets a private room keyed by their id so messages can be
-    // relayed to them regardless of which socket/device they're on.
+    // relayed to them regardless of which socket/device they're on. Each
+    // device additionally gets its own room, so a device-scoped revoke
+    // (same-device re-login, or explicit removal in Settings) can kick just
+    // that one device instead of every device the account is linked on.
     socket.join(userId);
+    if (socket.deviceId) {
+      const deviceId = socket.deviceId;
+      socket.join(deviceRoom(deviceId));
 
-    const wasOffline = !onlineUsers.has(userId);
-    onlineUsers.set(userId, (onlineUsers.get(userId) ?? 0) + 1);
-    if (wasOffline) {
-      io!.to(presenceRoom(userId)).emit("presence:update", { userId, online: true, lastSeenAt: null });
+      onlineDeviceSocketCounts.set(deviceId, (onlineDeviceSocketCounts.get(deviceId) ?? 0) + 1);
+      let userDevices = onlineDevicesByUser.get(userId);
+      const wasUserOffline = !userDevices || userDevices.size === 0;
+      if (!userDevices) {
+        userDevices = new Set();
+        onlineDevicesByUser.set(userId, userDevices);
+      }
+      userDevices.add(deviceId);
+      // Only the FIRST device coming online flips the user's aggregate
+      // presence — a second device connecting while the first is already up
+      // doesn't re-announce "online" (it already is).
+      if (wasUserOffline) {
+        io!.to(presenceRoom(userId)).emit("presence:update", { userId, online: true, lastSeenAt: null });
+      }
     }
 
-    for (const pending of getUndeliveredMessages(userId)) {
-      socket.emit("message", pending);
-    }
-
-    // Fire-and-forget: marked delivered as soon as it's flushed rather than
-    // waiting for a client ack, same tradeoff as the rest of presence-style
-    // metadata — worst case a reaction is a step behind after a crash, never lost data.
-    for (const reaction of getUndeliveredReactions(userId)) {
-      socket.emit("reaction:set", reaction);
-      markReactionDelivered(reaction.message_id, reaction.sender_id);
-    }
+    // Fire-and-forget, deliberately not awaited: every socket.on(...) listener
+    // below must be registered synchronously, in this same tick, before
+    // control ever yields to the event loop. Awaiting here first would leave
+    // a window — after the client sees "connect" but before its listeners
+    // exist — where anything the client emits immediately (as a fast test or
+    // a real client racing to reconnect might) is silently dropped.
+    if (socket.deviceId) void flushUndelivered(socket, socket.deviceId);
 
     socket.on(
       "message:send",
-      (
-        payload: { id: string; recipientId: string; ciphertext: string; nonce: string },
+      async (
+        payload: { id: string; recipientId: string; envelopes: OutgoingEnvelope[] },
         ack?: (response: { ok: true; createdAt: number } | { ok: false; error: string }) => void
       ) => {
         try {
-          // recipientId is client-supplied; storeMessage's FK constraint would
+          // recipientId is client-supplied; storeMessages' FK constraint would
           // otherwise throw here and — uncaught — take down the whole process
           // for every connected user over one bad payload.
-          if (!userExists(payload.recipientId)) {
+          if (!(await userExists(payload.recipientId))) {
             ack?.({ ok: false, error: "recipient_not_found" });
             return;
           }
-          if (!isAcceptedContact(userId, payload.recipientId)) {
+          if (!(await isAcceptedContact(userId, payload.recipientId))) {
             ack?.({ ok: false, error: "not_contacts" });
             return;
           }
 
-          const message = storeMessage({
-            id: payload.id,
+          // One envelope per device the client encrypted for; storeMessages
+          // silently drops any addressed to a device that's no longer active
+          // (a stale entry in the sender's cached device list — a normal
+          // race, not an error) and returns one row per envelope it kept.
+          const messages = await storeMessages({
+            clientId: payload.id,
             senderId: userId,
+            senderDeviceId: socket.deviceId ?? null,
             recipientId: payload.recipientId,
-            ciphertext: payload.ciphertext,
-            nonce: payload.nonce,
+            envelopes: payload.envelopes,
           });
 
-          io!.to(payload.recipientId).emit("message", message);
-          ack?.({ ok: true, createdAt: message.created_at });
+          if (messages.length === 0) {
+            ack?.({ ok: false, error: "no_active_devices" });
+            return;
+          }
+
+          for (const message of messages) {
+            io!.to(deviceRoom(message.recipient_device_id)).emit("message", message);
+          }
+          ack?.({ ok: true, createdAt: messages[0].created_at });
         } catch (err) {
           console.error("[socket] message:send failed", err);
           ack?.({ ok: false, error: "internal_error" });
@@ -145,9 +210,10 @@ export function createSocketServer(httpServer: HttpServer): Server {
       }
     );
 
-    socket.on("message:delivered", (payload: { id: string }) => {
+    socket.on("message:delivered", async (payload: { id: string }) => {
       try {
-        const result = markDelivered(payload.id, userId);
+        if (!socket.deviceId) return;
+        const result = await markDelivered(payload.id, socket.deviceId, userId);
         if (!result.ok) return;
         io!.to(result.senderId).emit("message:delivered", { id: payload.id, deliveredAt: result.at });
       } catch (err) {
@@ -155,9 +221,10 @@ export function createSocketServer(httpServer: HttpServer): Server {
       }
     });
 
-    socket.on("message:read", (payload: { id: string }) => {
+    socket.on("message:read", async (payload: { id: string }) => {
       try {
-        const result = markRead(payload.id, userId);
+        if (!socket.deviceId) return;
+        const result = await markRead(payload.id, socket.deviceId, userId);
         if (!result.ok) return;
         io!.to(result.senderId).emit("message:read", { id: payload.id, readAt: result.at });
       } catch (err) {
@@ -167,9 +234,9 @@ export function createSocketServer(httpServer: HttpServer): Server {
 
     socket.on(
       "message:delete",
-      (payload: { id: string }, ack?: (response: { ok: true } | { ok: false; error: string }) => void) => {
+      async (payload: { id: string }, ack?: (response: { ok: true } | { ok: false; error: string }) => void) => {
         try {
-          const result = deleteMessageForEveryone(payload.id, userId);
+          const result = await deleteMessageForEveryone(payload.id, userId);
           if (!result.ok) {
             ack?.({ ok: false, error: result.error });
             return;
@@ -185,27 +252,35 @@ export function createSocketServer(httpServer: HttpServer): Server {
 
     socket.on(
       "reaction:set",
-      (
-        payload: { messageId: string; recipientId: string; ciphertext: string; nonce: string },
+      async (
+        payload: { messageId: string; recipientId: string; envelopes: OutgoingEnvelope[] },
         ack?: (response: { ok: true } | { ok: false; error: string }) => void
       ) => {
         try {
-          if (!userExists(payload.recipientId)) {
+          if (!(await userExists(payload.recipientId))) {
             ack?.({ ok: false, error: "recipient_not_found" });
             return;
           }
-          if (!isAcceptedContact(userId, payload.recipientId)) {
+          if (!(await isAcceptedContact(userId, payload.recipientId))) {
             ack?.({ ok: false, error: "not_contacts" });
             return;
           }
-          const reaction = setReaction({
+          // One envelope per active recipient device, same fan-out shape as
+          // message:send above.
+          const reactions = await setReactions({
             messageId: payload.messageId,
             senderId: userId,
+            senderDeviceId: socket.deviceId ?? null,
             recipientId: payload.recipientId,
-            ciphertext: payload.ciphertext,
-            nonce: payload.nonce,
+            envelopes: payload.envelopes,
           });
-          io!.to(payload.recipientId).emit("reaction:set", reaction);
+          if (reactions.length === 0) {
+            ack?.({ ok: false, error: "no_active_devices" });
+            return;
+          }
+          for (const reaction of reactions) {
+            io!.to(deviceRoom(reaction.recipient_device_id)).emit("reaction:set", reaction);
+          }
           ack?.({ ok: true });
         } catch (err) {
           console.error("[socket] reaction:set failed", err);
@@ -216,12 +291,12 @@ export function createSocketServer(httpServer: HttpServer): Server {
 
     socket.on(
       "reaction:clear",
-      (
+      async (
         payload: { messageId: string; recipientId: string },
         ack?: (response: { ok: true } | { ok: false; error: string }) => void
       ) => {
         try {
-          clearReaction(payload.messageId, userId);
+          await clearReaction(payload.messageId, userId);
           io!.to(payload.recipientId).emit("reaction:cleared", { messageId: payload.messageId, senderId: userId });
           ack?.({ ok: true });
         } catch (err) {
@@ -233,15 +308,17 @@ export function createSocketServer(httpServer: HttpServer): Server {
 
     socket.on(
       "presence:subscribe",
-      (
+      async (
         payload: { userIds: string[] },
         ack?: (snapshot: { userId: string; online: boolean; lastSeenAt: number | null }[]) => void
       ) => {
-        const snapshot = payload.userIds.map((id) => {
-          socket.join(presenceRoom(id));
-          const online = onlineUsers.has(id);
-          return { userId: id, online, lastSeenAt: online ? null : getLastSeen(id) };
-        });
+        const snapshot = await Promise.all(
+          payload.userIds.map(async (id) => {
+            socket.join(presenceRoom(id));
+            const online = isUserOnline(id);
+            return { userId: id, online, lastSeenAt: online ? null : await getLastSeen(id) };
+          })
+        );
         ack?.(snapshot);
       }
     );
@@ -292,17 +369,17 @@ export function createSocketServer(httpServer: HttpServer): Server {
 
     socket.on(
       "contact:request",
-      (payload: { recipientId: string }, ack?: (response: { ok: true; status: "pending" | "accepted" } | { ok: false; error: string }) => void) => {
+      async (payload: { recipientId: string }, ack?: (response: { ok: true; status: "pending" | "accepted" } | { ok: false; error: string }) => void) => {
         try {
           if (payload.recipientId === userId) {
             ack?.({ ok: false, error: "invalid_recipient" });
             return;
           }
-          if (!userExists(payload.recipientId)) {
+          if (!(await userExists(payload.recipientId))) {
             ack?.({ ok: false, error: "recipient_not_found" });
             return;
           }
-          const result = requestContact(userId, payload.recipientId);
+          const result = await requestContact(userId, payload.recipientId);
           if (result.status === "accepted") {
             // Mutual: the recipient had already requested us — tell them
             // their own pending outgoing request just became accepted.
@@ -320,9 +397,9 @@ export function createSocketServer(httpServer: HttpServer): Server {
 
     socket.on(
       "contact:accept",
-      (payload: { requesterId: string }, ack?: (response: { ok: true } | { ok: false; error: string }) => void) => {
+      async (payload: { requesterId: string }, ack?: (response: { ok: true } | { ok: false; error: string }) => void) => {
         try {
-          const result = acceptContact(payload.requesterId, userId);
+          const result = await acceptContact(payload.requesterId, userId);
           if (!result.ok) {
             ack?.({ ok: false, error: result.error });
             return;
@@ -338,12 +415,12 @@ export function createSocketServer(httpServer: HttpServer): Server {
 
     socket.on(
       "contact:reject",
-      (
+      async (
         payload: { requesterId: string; action: RejectAction; reason?: string },
         ack?: (response: { ok: true } | { ok: false; error: string }) => void
       ) => {
         try {
-          const result = rejectContact(payload.requesterId, userId, payload.action, payload.reason);
+          const result = await rejectContact(payload.requesterId, userId, payload.action, payload.reason);
           if (!result.ok) {
             ack?.({ ok: false, error: result.error });
             return;
@@ -365,16 +442,16 @@ export function createSocketServer(httpServer: HttpServer): Server {
 
     socket.on(
       "call:invite",
-      (
+      async (
         payload: { callId: string; calleeId: string; kind: "audio" | "video"; sdp: unknown },
         ack?: (response: { ok: true } | { ok: false; error: string }) => void
       ) => {
         try {
-          if (!userExists(payload.calleeId)) {
+          if (!(await userExists(payload.calleeId))) {
             ack?.({ ok: false, error: "recipient_not_found" });
             return;
           }
-          if (!isAcceptedContact(userId, payload.calleeId)) {
+          if (!(await isAcceptedContact(userId, payload.calleeId))) {
             ack?.({ ok: false, error: "not_contacts" });
             return;
           }
@@ -387,10 +464,14 @@ export function createSocketServer(httpServer: HttpServer): Server {
             callId: payload.callId,
             callerId: userId,
             calleeId: payload.calleeId,
+            answered: false,
           });
           userActiveCall.set(userId, payload.callId);
           userActiveCall.set(payload.calleeId, payload.callId);
 
+          // Targets the callee's user room, which every one of their linked
+          // devices joined on connect — so this already rings all of them
+          // at once, with no per-device fan-out needed here.
           io!.to(payload.calleeId).emit("call:invite", {
             callId: payload.callId,
             callerId: userId,
@@ -409,7 +490,17 @@ export function createSocketServer(httpServer: HttpServer): Server {
       try {
         const call = activeCalls.get(payload.callId);
         if (!call || call.calleeId !== userId) return;
+        // Another of the callee's devices already answered this same call —
+        // ignore a redundant/racing answer instead of relaying it to the
+        // caller a second time (which would confuse WebRTC renegotiation).
+        if (call.answered) return;
+        call.answered = true;
+
         io!.to(call.callerId).emit("call:answer", { callId: payload.callId, sdp: payload.sdp });
+        // Tell every OTHER device still ringing for this call to stop —
+        // `socket.to` (as opposed to `io.to`) excludes the answering
+        // socket itself, so only the sibling devices get this.
+        socket.to(userId).emit("call:cancel", { callId: payload.callId });
       } catch (err) {
         console.error("[socket] call:answer failed", err);
       }
@@ -479,6 +570,10 @@ export function createSocketServer(httpServer: HttpServer): Server {
       try {
         const call = activeCalls.get(payload.callId);
         if (!call || call.calleeId !== userId) return;
+        // Same "tell the other ringing devices to stop" as call:answer above
+        // — declining on one device should stop every other linked device
+        // from still ringing, not just this one.
+        socket.to(userId).emit("call:cancel", { callId: payload.callId });
         endActiveCall(payload.callId, io!, "rejected", [call.callerId]);
       } catch (err) {
         console.error("[socket] call:reject failed", err);
@@ -502,14 +597,35 @@ export function createSocketServer(httpServer: HttpServer): Server {
         if (call) endActiveCall(callId, io!, "disconnected", [otherParty(call, userId)]);
       }
 
-      const remaining = (onlineUsers.get(userId) ?? 1) - 1;
-      if (remaining > 0) {
-        onlineUsers.set(userId, remaining);
+      if (!socket.deviceId) return;
+      const deviceId = socket.deviceId;
+
+      const remainingForDevice = (onlineDeviceSocketCounts.get(deviceId) ?? 1) - 1;
+      if (remainingForDevice > 0) {
+        onlineDeviceSocketCounts.set(deviceId, remainingForDevice);
         return;
       }
-      onlineUsers.delete(userId);
+
+      // This device's last live socket just closed — it's genuinely offline
+      // now, so record ITS OWN last-seen (useful for a future Linked Devices
+      // "active 2h ago" display) independently of whether the user as a
+      // whole is still online on another device.
+      onlineDeviceSocketCounts.delete(deviceId);
+      const deviceLastSeenAt = Date.now();
+      setDeviceLastSeen(deviceId, deviceLastSeenAt).catch((err) =>
+        console.error("[socket] setDeviceLastSeen failed", err)
+      );
+
+      const userDevices = onlineDevicesByUser.get(userId);
+      userDevices?.delete(deviceId);
+      // Only flip the user's aggregate presence to offline once EVERY
+      // device has disconnected — a sibling device still being connected
+      // means the user is still online, just not on this one.
+      if (!userDevices || userDevices.size > 0) return;
+
+      onlineDevicesByUser.delete(userId);
       const lastSeenAt = Date.now();
-      setLastSeen(userId, lastSeenAt);
+      setLastSeen(userId, lastSeenAt).catch((err) => console.error("[socket] setLastSeen failed", err));
       io!.to(presenceRoom(userId)).emit("presence:update", { userId, online: false, lastSeenAt });
     });
   });
@@ -518,12 +634,25 @@ export function createSocketServer(httpServer: HttpServer): Server {
 }
 
 /**
- * Called right after a new session is issued for a user (login on another
- * device). Anyone still connected under the old session is told explicitly
- * and dropped, so the previous device logs itself out immediately instead
- * of waiting for its next API call to 401.
+ * Called right after a device re-authenticates (same deviceId logging in
+ * again). Anyone still connected under that device's old session is told
+ * explicitly and dropped, so it logs itself out immediately instead of
+ * waiting for its next API call to 401 — without touching any *other*
+ * device the account is linked on. Also used by DELETE /devices/:id to kick
+ * a device the user explicitly removed from Settings.
  */
-export async function revokeOtherSessions(userId: string): Promise<void> {
+export async function revokeDeviceSessions(deviceId: string): Promise<void> {
+  if (!io) return;
+  const room = deviceRoom(deviceId);
+  io.to(room).emit("session:revoked");
+  await io.in(room).disconnectSockets(true);
+}
+
+/**
+ * Kicks every device the account is linked on at once — used only for
+ * account deletion, where signing out everywhere is the point.
+ */
+export async function revokeAllUserSessions(userId: string): Promise<void> {
   if (!io) return;
   io.to(userId).emit("session:revoked");
   await io.in(userId).disconnectSockets(true);

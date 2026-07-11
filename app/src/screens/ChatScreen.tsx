@@ -44,6 +44,7 @@ import {
   getCallsForConversation,
   getConversationById,
   getMessages,
+  getPeerDevices,
   getUnreadIncomingMessages,
   insertMessage,
   markMessageDelivered,
@@ -53,6 +54,7 @@ import {
   markMessageRead,
   markMessageSent,
   pinMessage,
+  replacePeerDevices,
   setMessageMediaStatus,
   setMyReaction,
   unpinMessage,
@@ -716,6 +718,13 @@ export default function ChatScreen({ route, navigation }: Props) {
         if (keyChanged) updateConversationPeerKey(conversationId, peer.publicKey);
         if (profileChanged) updateConversationProfile(conversationId, peer.name, peer.avatarUrl, peer.contactNumber);
         if (keyChanged || profileChanged) setConversation(getConversationById(conversationId));
+        // Wholesale replace, not merge — a device missing from this response
+        // has been unlinked server-side and must stop being a valid send
+        // target, not just linger as stale cache (see replacePeerDevices).
+        replacePeerDevices(
+          conversationId,
+          peer.devices.map((d) => ({ device_id: d.deviceId, public_key: d.publicKey }))
+        );
       } catch (err) {
         console.warn("[chat] failed to refresh peer key/profile", err);
       }
@@ -998,18 +1007,40 @@ export default function ChatScreen({ route, navigation }: Props) {
       try {
         const identity = await getOrCreateIdentity(email);
         await sodium.ready;
-        const peerPublicKey = sodium.from_base64(conversation.peer_public_key);
-        const { ciphertext, nonce } = await encryptMessage(
-          JSON.stringify(payload),
-          peerPublicKey,
-          identity.privateKey
+
+        // Real multi-device delivery: encrypt once per active recipient
+        // device rather than once for a single (and, once the peer's second
+        // device logs in, stale) cached key. Prefer the local cache
+        // (refreshed on chat open, see the effect above); if it's empty —
+        // e.g. this conversation was created but never opened yet — fetch
+        // live rather than failing the send outright.
+        let peerDevices = getPeerDevices(conversationId);
+        if (peerDevices.length === 0 && token) {
+          const peer = await getUserById(token, conversationId);
+          peerDevices = peer.devices.map((d) => ({ device_id: d.deviceId, public_key: d.publicKey }));
+          replacePeerDevices(conversationId, peerDevices);
+        }
+        if (peerDevices.length === 0) {
+          throw new Error("recipient has no known devices to encrypt for");
+        }
+
+        const plaintext = JSON.stringify(payload);
+        const envelopes = await Promise.all(
+          peerDevices.map(async (device) => {
+            const { ciphertext, nonce } = await encryptMessage(
+              plaintext,
+              sodium.from_base64(device.public_key),
+              identity.privateKey
+            );
+            return { deviceId: device.device_id, ciphertext, nonce };
+          })
         );
 
         getSocket()
           .timeout(SEND_TIMEOUT_MS)
           .emit(
             "message:send",
-            { id, recipientId: conversationId, ciphertext, nonce },
+            { id, recipientId: conversationId, envelopes },
             (err: unknown, response?: { ok: boolean; error?: string }) => {
               if (cancelledSendIdsRef.current.delete(id)) return;
               if (err || !response?.ok) {
@@ -1028,7 +1059,7 @@ export default function ChatScreen({ route, navigation }: Props) {
         setMessages((prev) => prev.map((m) => (m.id === id ? { ...m, status: "failed" } : m)));
       }
     },
-    [conversation, conversationId, email]
+    [conversation, conversationId, email, token]
   );
 
   const sendEncrypted = useCallback(
@@ -1768,19 +1799,36 @@ export default function ChatScreen({ route, navigation }: Props) {
         }
         const identity = await getOrCreateIdentity(email);
         await sodium.ready;
-        const peerPublicKey = sodium.from_base64(conversation.peer_public_key);
+
+        // Same per-device fan-out as sendPayload above: encrypt once per
+        // active recipient device rather than once for a single (and,
+        // once a second device logs in, stale) cached key.
+        let peerDevices = getPeerDevices(conversationId);
+        if (peerDevices.length === 0 && token) {
+          const peer = await getUserById(token, conversationId);
+          peerDevices = peer.devices.map((d) => ({ device_id: d.deviceId, public_key: d.publicKey }));
+          replacePeerDevices(conversationId, peerDevices);
+        }
+        if (peerDevices.length === 0) return;
+
         const payload: ReactionPayload = { emoji };
-        const { ciphertext, nonce } = await encryptMessage(
-          JSON.stringify(payload),
-          peerPublicKey,
-          identity.privateKey
+        const plaintext = JSON.stringify(payload);
+        const envelopes = await Promise.all(
+          peerDevices.map(async (device) => {
+            const { ciphertext, nonce } = await encryptMessage(
+              plaintext,
+              sodium.from_base64(device.public_key),
+              identity.privateKey
+            );
+            return { deviceId: device.device_id, ciphertext, nonce };
+          })
         );
-        getSocket().emit("reaction:set", { messageId: message.id, recipientId: conversationId, ciphertext, nonce });
+        getSocket().emit("reaction:set", { messageId: message.id, recipientId: conversationId, envelopes });
       } catch (err) {
         console.warn("[chat] failed to send reaction", err);
       }
     },
-    [conversation, conversationId, isTestBot, email]
+    [conversation, conversationId, isTestBot, email, token]
   );
 
   const onDeleteForEveryone = useCallback(

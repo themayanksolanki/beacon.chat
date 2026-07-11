@@ -18,6 +18,7 @@ import ContactInfoScreen from "./src/screens/ContactInfoScreen";
 import SettingsScreen from "./src/screens/SettingsScreen";
 import AccountScreen from "./src/screens/AccountScreen";
 import AppearanceScreen from "./src/screens/AppearanceScreen";
+import LinkedDevicesScreen from "./src/screens/LinkedDevicesScreen";
 import EditProfileScreen from "./src/screens/EditProfileScreen";
 import EmailEntryScreen from "./src/screens/EmailEntryScreen";
 import OtpScreen from "./src/screens/OtpScreen";
@@ -58,6 +59,7 @@ export type MainStackParamList = {
   ContactInfo: { conversationId: string };
   Account: undefined;
   Appearance: undefined;
+  LinkedDevices: undefined;
   EditProfile: undefined;
   IncomingCall: undefined;
   ActiveCall: undefined;
@@ -167,6 +169,11 @@ function RootNavigator() {
         name="Appearance"
         component={AppearanceScreen}
         options={{ title: "Appearance" }}
+      />
+      <MainStack.Screen
+        name="LinkedDevices"
+        component={LinkedDevicesScreen}
+        options={{ title: "Linked Devices" }}
       />
       <MainStack.Screen
         name="EditProfile"

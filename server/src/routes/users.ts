@@ -1,8 +1,7 @@
 import { Router } from "express";
-import { and, eq, inArray, isNotNull } from "drizzle-orm";
-import { db } from "../db";
-import { users } from "../schema";
+import { prisma } from "../prisma";
 import { requireAuth, type AuthedRequest } from "../auth";
+import { listActiveDevices } from "../devices";
 import { sendInviteEmail } from "../email";
 import { isMongoConnected, profiles, resolveAvatarUrl } from "../mongo";
 import { normalizeEmail } from "../util";
@@ -12,16 +11,16 @@ export const usersRouter = Router();
 const MAX_LOOKUP_EMAILS = 500;
 const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
-usersRouter.get("/by-email/:email/public-key", requireAuth, (req, res) => {
+usersRouter.get("/by-email/:email/public-key", requireAuth, async (req, res) => {
   const email = normalizeEmail(String(req.params.email));
-  const user = db.select().from(users).where(eq(users.email, email)).get();
+  const user = await prisma.user.findUnique({ where: { email } });
 
-  if (!user || !user.public_key) {
+  if (!user || !user.publicKey) {
     res.status(404).json({ error: "user not found" });
     return;
   }
 
-  res.json({ userId: user.id, publicKey: user.public_key });
+  res.json({ userId: user.id, publicKey: user.publicKey });
 });
 
 /**
@@ -29,26 +28,36 @@ usersRouter.get("/by-email/:email/public-key", requireAuth, (req, res) => {
  * materialize a local conversation for a sender it has no prior relationship
  * with (e.g. someone who added you by email before you added them back) —
  * incoming messages/reactions only carry the sender's id, not their email.
+ *
+ * `devices` is what makes real multi-device encryption possible: a sender
+ * fetches this list and encrypts once per active device rather than relying
+ * on the single (and, once a second device logs in, stale) `publicKey`
+ * column — see app/src/screens/ChatScreen.tsx's send path. `publicKey` is
+ * kept for callers that haven't moved to the device list yet.
  */
 usersRouter.get("/by-id/:id", requireAuth, async (req, res) => {
   const id = String(req.params.id);
-  const user = db.select().from(users).where(eq(users.id, id)).get();
+  const user = await prisma.user.findUnique({ where: { id } });
 
-  if (!user || !user.public_key) {
+  if (!user || !user.publicKey) {
     res.status(404).json({ error: "user not found" });
     return;
   }
 
-  const profile = isMongoConnected() ? await profiles().findOne({ userId: id }) : null;
+  const [profile, devices] = await Promise.all([
+    isMongoConnected() ? profiles().findOne({ userId: id }) : Promise.resolve(null),
+    listActiveDevices(id),
+  ]);
 
   res.json({
     userId: user.id,
     email: user.email,
-    publicKey: user.public_key,
+    publicKey: user.publicKey,
+    devices: devices.map((d) => ({ deviceId: d.id, publicKey: d.publicKey })),
     name: profile?.name ?? null,
     avatarUrl: profile ? resolveAvatarUrl(profile) : null,
-    contactNumber: user.contact_number,
-    createdAt: user.created_at,
+    contactNumber: user.contactNumber,
+    createdAt: user.createdAt.getTime(),
   });
 });
 
@@ -73,19 +82,13 @@ usersRouter.post("/lookup", requireAuth, async (req, res) => {
     return;
   }
 
-  const rows = db
-    .select({ id: users.id, email: users.email, public_key: users.public_key })
-    .from(users)
-    .where(and(inArray(users.email, unique), isNotNull(users.public_key)))
-    .all();
+  const rows = await prisma.user.findMany({
+    where: { email: { in: unique }, publicKey: { not: null } },
+    select: { id: true, email: true, publicKey: true },
+  });
 
   const profileByUserId = isMongoConnected()
-    ? new Map(
-        (await profiles().find({ userId: { $in: rows.map((r) => r.id) } }).toArray()).map((p) => [
-          p.userId,
-          p,
-        ])
-      )
+    ? new Map((await profiles().find({ userId: { $in: rows.map((r) => r.id) } }).toArray()).map((p) => [p.userId, p]))
     : new Map();
 
   res.json({
@@ -94,7 +97,7 @@ usersRouter.post("/lookup", requireAuth, async (req, res) => {
       return {
         email: r.email,
         userId: r.id,
-        publicKey: r.public_key,
+        publicKey: r.publicKey,
         name: profile?.name ?? null,
         avatarUrl: profile ? resolveAvatarUrl(profile) : null,
       };
@@ -122,28 +125,22 @@ usersRouter.post("/lookup-by-phone", requireAuth, async (req, res) => {
     return;
   }
 
-  const rows = db
-    .select({ id: users.id, contact_number: users.contact_number, public_key: users.public_key })
-    .from(users)
-    .where(and(inArray(users.contact_number, unique), isNotNull(users.public_key)))
-    .all();
+  const rows = await prisma.user.findMany({
+    where: { contactNumber: { in: unique }, publicKey: { not: null } },
+    select: { id: true, contactNumber: true, publicKey: true },
+  });
 
   const profileByUserId = isMongoConnected()
-    ? new Map(
-        (await profiles().find({ userId: { $in: rows.map((r) => r.id) } }).toArray()).map((p) => [
-          p.userId,
-          p,
-        ])
-      )
+    ? new Map((await profiles().find({ userId: { $in: rows.map((r) => r.id) } }).toArray()).map((p) => [p.userId, p]))
     : new Map();
 
   res.json({
     matches: rows.map((r) => {
       const profile = profileByUserId.get(r.id);
       return {
-        phoneNumber: r.contact_number,
+        phoneNumber: r.contactNumber,
         userId: r.id,
-        publicKey: r.public_key,
+        publicKey: r.publicKey,
         name: profile?.name ?? null,
         avatarUrl: profile ? resolveAvatarUrl(profile) : null,
       };
@@ -165,17 +162,13 @@ usersRouter.post("/invite", requireAuth, async (req: AuthedRequest, res) => {
   // client is expected to have already routed them to a contact request via
   // /users/lookup, but re-check here so a stale client/cache can't still
   // fire a real "join Beacon" email at an existing account.
-  const existing = db
-    .select({ public_key: users.public_key })
-    .from(users)
-    .where(eq(users.email, normalizedEmail))
-    .get();
-  if (existing?.public_key) {
+  const existing = await prisma.user.findUnique({ where: { email: normalizedEmail }, select: { publicKey: true } });
+  if (existing?.publicKey) {
     res.status(409).json({ error: "already_registered" });
     return;
   }
 
-  const inviter = db.select().from(users).where(eq(users.id, req.user!.userId)).get();
+  const inviter = await prisma.user.findUnique({ where: { id: req.user!.userId } });
 
   await sendInviteEmail(normalizedEmail, inviter?.email ?? "A Beacon user");
   res.status(202).json({ ok: true });

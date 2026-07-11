@@ -1,49 +1,134 @@
-import { and, asc, eq, isNull } from "drizzle-orm";
-import { db } from "./db";
-import { messages, reactions, users } from "./schema";
+import { prisma } from "./prisma";
 
-export type MessageRow = typeof messages.$inferSelect;
+// Wire format (and everything downstream in socketServer.ts) still speaks
+// the old snake_case/epoch-ms shape from the SQLite days — Postgres/Prisma
+// is an internal storage detail. `id` on the wire is the shared clientId,
+// NOT the per-device row's own internal primary key — that's what lets the
+// sender's single local outbox row (and its delivered/read receipts) stay
+// keyed off one id even though one logical send now produces one row per
+// recipient device server-side. `sender_public_key` is that device's own
+// encryption key, attached here so the recipient can decrypt without
+// maintaining a local cache of every peer device's key — it just trusts
+// whatever key arrives on this specific message.
+export interface MessageRow {
+  id: string;
+  sender_id: string;
+  recipient_id: string;
+  // The specific device this particular row/delivery is addressed to —
+  // harmless to echo back to that same device (it's just being told its own
+  // id), and lets socketServer.ts route each row to the right device room
+  // without a separate parallel data structure.
+  recipient_device_id: string;
+  ciphertext: string;
+  nonce: string;
+  created_at: number;
+  delivered_at: number | null;
+  read_at: number | null;
+  sender_public_key: string | null;
+}
 
-export function userExists(id: string): boolean {
-  return !!db.select({ id: users.id }).from(users).where(eq(users.id, id)).get();
+function toMessageRow(
+  m: {
+    clientId: string;
+    senderId: string;
+    recipientId: string;
+    recipientDeviceId: string;
+    ciphertext: string;
+    nonce: string;
+    createdAt: Date;
+    deliveredAt: Date | null;
+    readAt: Date | null;
+  },
+  senderPublicKey: string | null
+): MessageRow {
+  return {
+    id: m.clientId,
+    sender_id: m.senderId,
+    recipient_id: m.recipientId,
+    recipient_device_id: m.recipientDeviceId,
+    ciphertext: m.ciphertext,
+    nonce: m.nonce,
+    created_at: m.createdAt.getTime(),
+    delivered_at: m.deliveredAt?.getTime() ?? null,
+    read_at: m.readAt?.getTime() ?? null,
+    sender_public_key: senderPublicKey,
+  };
+}
+
+async function resolveDevicePublicKeys(deviceIds: (string | null)[]): Promise<Map<string, string>> {
+  const ids = [...new Set(deviceIds.filter((id): id is string => !!id))];
+  if (ids.length === 0) return new Map();
+  const devices = await prisma.device.findMany({ where: { id: { in: ids } }, select: { id: true, publicKey: true } });
+  return new Map(devices.map((d) => [d.id, d.publicKey]));
+}
+
+export async function userExists(id: string): Promise<boolean> {
+  const user = await prisma.user.findUnique({ where: { id }, select: { id: true } });
+  return !!user;
+}
+
+// deviceId (not recipientDeviceId) to match the wire convention used
+// elsewhere, e.g. GET /users/by-id/:id's devices: [{deviceId, publicKey}] —
+// this is what the client actually sends as part of message:send's payload.
+export interface OutgoingEnvelope {
+  deviceId: string;
+  ciphertext: string;
+  nonce: string;
 }
 
 /**
- * The message id is generated client-side (by the sender) rather than here,
- * so the sender's own local copy and the recipient's delivered copy share
- * one id — that's what lets delivered/read receipts be relayed back to the
- * right local row.
+ * One logical send, encrypted client-side once per active recipient
+ * device, becomes one Message row per envelope here — all sharing
+ * `clientId` so delivery/read receipts and delete-for-everyone can treat
+ * them as a single message again. Envelopes addressed to a device that
+ * isn't currently active (revoked, or a stale id the client cached before a
+ * removal) are silently dropped rather than erroring — that's a normal
+ * race between "the client fetched the device list" and "now", not a bug.
+ * Returns an empty array if none of the envelopes had a valid target.
  */
-export function storeMessage(input: {
-  id: string;
+export async function storeMessages(input: {
+  clientId: string;
   senderId: string;
+  senderDeviceId: string | null;
   recipientId: string;
-  ciphertext: string;
-  nonce: string;
-}): MessageRow {
-  const row: MessageRow = {
-    id: input.id,
-    sender_id: input.senderId,
-    recipient_id: input.recipientId,
-    ciphertext: input.ciphertext,
-    nonce: input.nonce,
-    created_at: Date.now(),
-    delivered_at: null,
-    read_at: null,
-  };
+  envelopes: OutgoingEnvelope[];
+}): Promise<MessageRow[]> {
+  const activeDevices = await prisma.device.findMany({
+    where: { userId: input.recipientId, revokedAt: null },
+    select: { id: true },
+  });
+  const activeDeviceIds = new Set(activeDevices.map((d) => d.id));
+  const validEnvelopes = input.envelopes.filter((e) => activeDeviceIds.has(e.deviceId));
+  if (validEnvelopes.length === 0) return [];
 
-  db.insert(messages).values(row).run();
+  const senderPublicKey = (await resolveDevicePublicKeys([input.senderDeviceId])).get(input.senderDeviceId ?? "") ?? null;
 
-  return row;
+  const rows = await prisma.$transaction(
+    validEnvelopes.map((envelope) =>
+      prisma.message.create({
+        data: {
+          clientId: input.clientId,
+          senderId: input.senderId,
+          senderDeviceId: input.senderDeviceId,
+          recipientId: input.recipientId,
+          recipientDeviceId: envelope.deviceId,
+          ciphertext: envelope.ciphertext,
+          nonce: envelope.nonce,
+        },
+      })
+    )
+  );
+
+  return rows.map((row) => toMessageRow(row, senderPublicKey));
 }
 
-export function getUndeliveredMessages(recipientId: string): MessageRow[] {
-  return db
-    .select()
-    .from(messages)
-    .where(and(eq(messages.recipient_id, recipientId), isNull(messages.delivered_at)))
-    .orderBy(asc(messages.created_at))
-    .all();
+export async function getUndeliveredMessages(deviceId: string): Promise<MessageRow[]> {
+  const rows = await prisma.message.findMany({
+    where: { recipientDeviceId: deviceId, deliveredAt: null },
+    orderBy: { createdAt: "asc" },
+  });
+  const publicKeys = await resolveDevicePublicKeys(rows.map((r) => r.senderDeviceId));
+  return rows.map((row) => toMessageRow(row, publicKeys.get(row.senderDeviceId ?? "") ?? null));
 }
 
 export type MarkResult =
@@ -53,28 +138,29 @@ export type MarkResult =
 /**
  * requesterId must be the authenticated socket's own userId, not a
  * client-supplied value — otherwise any user could mark someone else's
- * message delivered/read and spoof a receipt to an arbitrary room. The
- * sender to notify is read back from the row rather than trusted from the
- * client for the same reason.
+ * message delivered/read and spoof a receipt to an arbitrary room. Looked
+ * up by (clientId, requesterDeviceId) since each recipient device acks its
+ * own copy independently; the sender to notify is read back from the row
+ * rather than trusted from the client for the same reason.
  */
-export function markDelivered(messageId: string, requesterId: string): MarkResult {
-  const message = db.select().from(messages).where(eq(messages.id, messageId)).get();
+export async function markDelivered(clientId: string, requesterDeviceId: string, requesterId: string): Promise<MarkResult> {
+  const message = await prisma.message.findFirst({ where: { clientId, recipientDeviceId: requesterDeviceId } });
   if (!message) return { ok: false, error: "not_found" };
-  if (message.recipient_id !== requesterId) return { ok: false, error: "not_recipient" };
+  if (message.recipientId !== requesterId) return { ok: false, error: "not_recipient" };
 
-  const deliveredAt = Date.now();
-  db.update(messages).set({ delivered_at: deliveredAt }).where(eq(messages.id, messageId)).run();
-  return { ok: true, senderId: message.sender_id, at: deliveredAt };
+  const deliveredAt = new Date();
+  await prisma.message.update({ where: { id: message.id }, data: { deliveredAt } });
+  return { ok: true, senderId: message.senderId, at: deliveredAt.getTime() };
 }
 
-export function markRead(messageId: string, requesterId: string): MarkResult {
-  const message = db.select().from(messages).where(eq(messages.id, messageId)).get();
+export async function markRead(clientId: string, requesterDeviceId: string, requesterId: string): Promise<MarkResult> {
+  const message = await prisma.message.findFirst({ where: { clientId, recipientDeviceId: requesterDeviceId } });
   if (!message) return { ok: false, error: "not_found" };
-  if (message.recipient_id !== requesterId) return { ok: false, error: "not_recipient" };
+  if (message.recipientId !== requesterId) return { ok: false, error: "not_recipient" };
 
-  const readAt = Date.now();
-  db.update(messages).set({ read_at: readAt }).where(eq(messages.id, messageId)).run();
-  return { ok: true, senderId: message.sender_id, at: readAt };
+  const readAt = new Date();
+  await prisma.message.update({ where: { id: message.id }, data: { readAt } });
+  return { ok: true, senderId: message.senderId, at: readAt.getTime() };
 }
 
 export const DELETE_FOR_EVERYONE_WINDOW_MS = 2 * 60 * 60 * 1000;
@@ -86,72 +172,136 @@ export type DeleteForEveryoneResult =
 /**
  * Only the original sender can delete for everyone, and only within the
  * time window — enforced here since the client's own check is just UX, not
- * a security boundary.
+ * a security boundary. Deletes every per-device fan-out row sharing this
+ * clientId in one go.
  */
-export function deleteMessageForEveryone(id: string, requesterId: string): DeleteForEveryoneResult {
-  const message = db.select().from(messages).where(eq(messages.id, id)).get();
-  if (!message) return { ok: false, error: "not_found" };
-  if (message.sender_id !== requesterId) return { ok: false, error: "not_sender" };
-  if (Date.now() - message.created_at > DELETE_FOR_EVERYONE_WINDOW_MS) return { ok: false, error: "too_late" };
+export async function deleteMessageForEveryone(clientId: string, requesterId: string): Promise<DeleteForEveryoneResult> {
+  const rows = await prisma.message.findMany({ where: { clientId } });
+  if (rows.length === 0) return { ok: false, error: "not_found" };
+  const [first] = rows;
+  if (first.senderId !== requesterId) return { ok: false, error: "not_sender" };
+  if (Date.now() - first.createdAt.getTime() > DELETE_FOR_EVERYONE_WINDOW_MS) {
+    return { ok: false, error: "too_late" };
+  }
 
-  db.delete(messages).where(eq(messages.id, id)).run();
-  return { ok: true, message };
+  await prisma.message.deleteMany({ where: { clientId } });
+  return { ok: true, message: toMessageRow(first, null) };
 }
 
-export type ReactionRow = typeof reactions.$inferSelect;
-
-/** One reaction per (message, reactor) — reacting again just overwrites the previous emoji. */
-export function setReaction(input: {
-  messageId: string;
-  senderId: string;
-  recipientId: string;
+export interface ReactionRow {
+  message_id: string;
+  sender_id: string;
+  recipient_id: string;
+  recipient_device_id: string;
   ciphertext: string;
   nonce: string;
-}): ReactionRow {
-  const row: ReactionRow = {
-    message_id: input.messageId,
-    sender_id: input.senderId,
-    recipient_id: input.recipientId,
-    ciphertext: input.ciphertext,
-    nonce: input.nonce,
-    created_at: Date.now(),
-    delivered_at: null,
+  created_at: number;
+  delivered_at: number | null;
+  sender_public_key: string | null;
+}
+
+function toReactionRow(
+  r: {
+    messageId: string;
+    senderId: string;
+    recipientId: string;
+    recipientDeviceId: string;
+    ciphertext: string;
+    nonce: string;
+    createdAt: Date;
+    deliveredAt: Date | null;
+  },
+  senderPublicKey: string | null
+): ReactionRow {
+  return {
+    message_id: r.messageId,
+    sender_id: r.senderId,
+    recipient_id: r.recipientId,
+    recipient_device_id: r.recipientDeviceId,
+    ciphertext: r.ciphertext,
+    nonce: r.nonce,
+    created_at: r.createdAt.getTime(),
+    delivered_at: r.deliveredAt?.getTime() ?? null,
+    sender_public_key: senderPublicKey,
   };
-
-  db.insert(reactions)
-    .values(row)
-    .onConflictDoUpdate({
-      target: [reactions.message_id, reactions.sender_id],
-      set: {
-        ciphertext: row.ciphertext,
-        nonce: row.nonce,
-        created_at: row.created_at,
-        delivered_at: null,
-      },
-    })
-    .run();
-
-  return row;
 }
 
-export function clearReaction(messageId: string, senderId: string): void {
-  db.delete(reactions)
-    .where(and(eq(reactions.message_id, messageId), eq(reactions.sender_id, senderId)))
-    .run();
+/**
+ * One reaction per (message, reactor, recipient device) — reacting again
+ * just overwrites the previous emoji for that device. Fanned out to every
+ * active recipient device the same way storeMessages fans out messages, for
+ * the same reason: without this, a reaction fetched by whichever device
+ * happens to come online first gets marked delivered and a second linked
+ * device never sees it. Envelopes addressed to a device that isn't
+ * currently active are silently dropped, same as storeMessages. Returns an
+ * empty array if none of the envelopes had a valid target.
+ */
+export async function setReactions(input: {
+  messageId: string;
+  senderId: string;
+  senderDeviceId: string | null;
+  recipientId: string;
+  envelopes: OutgoingEnvelope[];
+}): Promise<ReactionRow[]> {
+  const activeDevices = await prisma.device.findMany({
+    where: { userId: input.recipientId, revokedAt: null },
+    select: { id: true },
+  });
+  const activeDeviceIds = new Set(activeDevices.map((d) => d.id));
+  const validEnvelopes = input.envelopes.filter((e) => activeDeviceIds.has(e.deviceId));
+  if (validEnvelopes.length === 0) return [];
+
+  const senderPublicKey = (await resolveDevicePublicKeys([input.senderDeviceId])).get(input.senderDeviceId ?? "") ?? null;
+
+  const rows = await prisma.$transaction(
+    validEnvelopes.map((envelope) =>
+      prisma.reaction.upsert({
+        where: {
+          messageId_senderId_recipientDeviceId: {
+            messageId: input.messageId,
+            senderId: input.senderId,
+            recipientDeviceId: envelope.deviceId,
+          },
+        },
+        update: {
+          ciphertext: envelope.ciphertext,
+          nonce: envelope.nonce,
+          senderDeviceId: input.senderDeviceId,
+          createdAt: new Date(),
+          deliveredAt: null,
+        },
+        create: {
+          messageId: input.messageId,
+          senderId: input.senderId,
+          senderDeviceId: input.senderDeviceId,
+          recipientId: input.recipientId,
+          recipientDeviceId: envelope.deviceId,
+          ciphertext: envelope.ciphertext,
+          nonce: envelope.nonce,
+        },
+      })
+    )
+  );
+
+  return rows.map((row) => toReactionRow(row, senderPublicKey));
 }
 
-export function getUndeliveredReactions(recipientId: string): ReactionRow[] {
-  return db
-    .select()
-    .from(reactions)
-    .where(and(eq(reactions.recipient_id, recipientId), isNull(reactions.delivered_at)))
-    .orderBy(asc(reactions.created_at))
-    .all();
+export async function clearReaction(messageId: string, senderId: string): Promise<void> {
+  await prisma.reaction.deleteMany({ where: { messageId, senderId } });
 }
 
-export function markReactionDelivered(messageId: string, senderId: string): void {
-  db.update(reactions)
-    .set({ delivered_at: Date.now() })
-    .where(and(eq(reactions.message_id, messageId), eq(reactions.sender_id, senderId)))
-    .run();
+export async function getUndeliveredReactions(deviceId: string): Promise<ReactionRow[]> {
+  const rows = await prisma.reaction.findMany({
+    where: { recipientDeviceId: deviceId, deliveredAt: null },
+    orderBy: { createdAt: "asc" },
+  });
+  const publicKeys = await resolveDevicePublicKeys(rows.map((r) => r.senderDeviceId));
+  return rows.map((row) => toReactionRow(row, publicKeys.get(row.senderDeviceId ?? "") ?? null));
+}
+
+export async function markReactionDelivered(messageId: string, senderId: string, recipientDeviceId: string): Promise<void> {
+  await prisma.reaction.updateMany({
+    where: { messageId, senderId, recipientDeviceId },
+    data: { deliveredAt: new Date() },
+  });
 }

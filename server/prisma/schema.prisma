@@ -1,0 +1,209 @@
+// Cloud schema (Postgres) replacing server/src/schema.ts (SQLite/Drizzle).
+// Two things are new relative to the old schema, both needed for
+// WhatsApp-style multi-device:
+//   1. Device — one row per app install. Holds that device's own identity
+//      public key, so a sender can encrypt one ciphertext per recipient
+//      device instead of one per recipient user.
+//   2. Session — replaces users.current_session_id. Many can be active at
+//      once (one per logged-in device); closing/killing the app just drops
+//      the socket, it does NOT touch this row. Only explicit revoke (user
+//      removes a device from Settings) or natural expiry ends a session.
+//
+// Column names stay snake_case via @map so existing SQL/dashboards that
+// assume the old naming keep working; model/field names are idiomatic
+// Prisma camelCase.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// Identified by email, same as today. No longer holds a session pointer —
+// that moved to Session, one-to-many.
+model User {
+  id                  String    @id @default(uuid())
+  email               String    @unique
+  publicKey           String?   @map("public_key")
+  // Optional, self-reported, unverified — same role/shape as today
+  // (canonical E.164 string, doubles as an add-contact search key).
+  // Postgres, like SQLite, does not enforce uniqueness across NULLs, so
+  // this behaves the same as the old idx_users_contact_number.
+  contactNumber       String?   @unique @map("contact_number")
+  createdAt           DateTime  @default(now()) @map("created_at")
+  lastSeenAt          DateTime? @map("last_seen_at")
+  deletionRequestedAt DateTime? @map("deletion_requested_at")
+
+  devices           Device[]
+  sentMessages      Message[]  @relation("MessageSender")
+  receivedMessages  Message[]  @relation("MessageRecipient")
+  sentReactions     Reaction[] @relation("ReactionSender")
+  receivedReactions Reaction[] @relation("ReactionRecipient")
+  contactsAsA       Contact[]  @relation("ContactUserA")
+  contactsAsB       Contact[]  @relation("ContactUserB")
+  reportsFiled      Report[]   @relation("ReportFiledBy")
+  reportsReceived   Report[]   @relation("ReportAgainst")
+
+  @@map("users")
+}
+
+// A single linked device (phone/tablet/desktop). publicKey is that
+// device's own encryption key — separate from any other device the same
+// user is logged into elsewhere.
+model Device {
+  id         String    @id @default(uuid())
+  userId     String    @map("user_id")
+  name       String?
+  publicKey  String    @map("public_key")
+  pushToken  String?   @map("push_token")
+  createdAt  DateTime  @default(now()) @map("created_at")
+  lastSeenAt DateTime? @map("last_seen_at")
+  // Set when the user removes this device from "Linked Devices" (or an
+  // admin action); a revoked device's sessions are rejected even if the
+  // JWT itself hasn't expired yet.
+  revokedAt  DateTime? @map("revoked_at")
+
+  user              User       @relation(fields: [userId], references: [id])
+  sessions          Session[]
+  messagesReceived  Message[]  @relation("MessageRecipientDevice")
+  messagesSent      Message[]  @relation("MessageSenderDevice")
+  reactionsReceived Reaction[] @relation("ReactionRecipientDevice")
+  reactionsSent     Reaction[] @relation("ReactionSenderDevice")
+
+  @@index([userId])
+  @@map("devices")
+}
+
+// One row per active login. userId is denormalized onto the row (rather
+// than joined through Device) so "revoke all my sessions" and presence
+// look-ups don't need a join.
+model Session {
+  id        String    @id @default(uuid())
+  deviceId  String    @map("device_id")
+  userId    String    @map("user_id")
+  createdAt DateTime  @default(now()) @map("created_at")
+  expiresAt DateTime  @map("expires_at")
+  revokedAt DateTime? @map("revoked_at")
+
+  device Device @relation(fields: [deviceId], references: [id])
+
+  @@index([userId])
+  @@index([deviceId])
+  @@map("sessions")
+}
+
+model OtpChallenge {
+  id        String   @id @default(uuid())
+  email     String
+  codeHash  String   @map("code_hash")
+  expiresAt DateTime @map("expires_at")
+  attempts  Int      @default(0)
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@index([email, createdAt])
+  @@map("otp_challenges")
+}
+
+// Server only ever stores ciphertext, and now addresses it to one
+// recipient DEVICE, not just a user — a sender encrypts the same logical
+// message once per active recipient device (see messages.ts:storeMessages),
+// so ONE user-visible "send" produces N rows here, one per device, each
+// carrying that device's own ciphertext. clientId is what ties those N rows
+// back together and to the sender's single local outbox row — delivery/read
+// receipts, delete-for-everyone, and reactions all key off it rather than
+// the (now per-device, server-generated) id. recipientId/senderId
+// (user-level) are kept for contact-gating and "all messages with this
+// person" queries; recipientDeviceId is what delivery/read tracking and
+// socket routing key off. senderDeviceId lets a user's other devices
+// receive a synced copy of what they sent, same as WhatsApp Web/Desktop
+// seeing your outbound messages.
+model Message {
+  id                 String    @id @default(uuid())
+  clientId           String    @map("client_id")
+  senderId           String    @map("sender_id")
+  senderDeviceId     String?   @map("sender_device_id")
+  recipientId        String    @map("recipient_id")
+  recipientDeviceId  String    @map("recipient_device_id")
+  ciphertext         String
+  nonce              String
+  createdAt          DateTime  @default(now()) @map("created_at")
+  deliveredAt        DateTime? @map("delivered_at")
+  readAt             DateTime? @map("read_at")
+
+  sender          User    @relation("MessageSender", fields: [senderId], references: [id])
+  recipient       User    @relation("MessageRecipient", fields: [recipientId], references: [id])
+  recipientDevice Device  @relation("MessageRecipientDevice", fields: [recipientDeviceId], references: [id])
+  senderDevice    Device? @relation("MessageSenderDevice", fields: [senderDeviceId], references: [id])
+
+  @@index([recipientDeviceId, deliveredAt])
+  @@index([clientId])
+  @@map("messages")
+}
+
+// One reaction per (message, reactor, recipient device) — ciphertext/nonce
+// only, the server never sees which emoji was used. Fanned out per device
+// the same way messages are (see Message above): one row per active
+// recipient device, each carrying that device's own ciphertext, so setting
+// a reaction reaches every linked device rather than whichever one happens
+// to fetch it first.
+model Reaction {
+  messageId         String    @map("message_id")
+  senderId          String    @map("sender_id")
+  senderDeviceId    String?   @map("sender_device_id")
+  recipientId       String    @map("recipient_id")
+  recipientDeviceId String    @map("recipient_device_id")
+  ciphertext        String
+  nonce             String
+  createdAt         DateTime  @default(now()) @map("created_at")
+  deliveredAt       DateTime? @map("delivered_at")
+
+  sender          User    @relation("ReactionSender", fields: [senderId], references: [id])
+  recipient       User    @relation("ReactionRecipient", fields: [recipientId], references: [id])
+  recipientDevice Device  @relation("ReactionRecipientDevice", fields: [recipientDeviceId], references: [id])
+  senderDevice    Device? @relation("ReactionSenderDevice", fields: [senderDeviceId], references: [id])
+
+  @@id([messageId, senderId, recipientDeviceId])
+  @@index([recipientDeviceId, deliveredAt])
+  @@map("reactions")
+}
+
+enum ContactStatus {
+  pending
+  accepted
+  rejected
+}
+
+// Gates message:send / reaction:set / call:invite. One row per pair,
+// canonically ordered (userAId < userBId) — see contacts.ts.
+model Contact {
+  id          String        @id @default(uuid())
+  userAId     String        @map("user_a_id")
+  userBId     String        @map("user_b_id")
+  status      ContactStatus
+  requestedBy String        @map("requested_by")
+  createdAt   DateTime      @default(now()) @map("created_at")
+  respondedAt DateTime?     @map("responded_at")
+
+  userA User @relation("ContactUserA", fields: [userAId], references: [id])
+  userB User @relation("ContactUserB", fields: [userBId], references: [id])
+
+  @@unique([userAId, userBId])
+  @@map("contacts")
+}
+
+// Persisted only — no moderation UI yet, just a record for later review.
+model Report {
+  id         String   @id @default(uuid())
+  reporterId String   @map("reporter_id")
+  reportedId String   @map("reported_id")
+  reason     String?
+  createdAt  DateTime @default(now()) @map("created_at")
+
+  reporter User @relation("ReportFiledBy", fields: [reporterId], references: [id])
+  reported User @relation("ReportAgainst", fields: [reportedId], references: [id])
+
+  @@map("reports")
+}

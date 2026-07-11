@@ -46,24 +46,63 @@ export function requestOtp(email: string) {
   });
 }
 
-export function verifyOtp(email: string, code: string, publicKey: string) {
-  return request<{ token: string; userId: string }>("/auth/otp/verify", {
+export interface LoginResult {
+  token: string;
+  userId: string;
+  deviceId: string;
+}
+
+// deviceId/deviceName are optional: omitted on this account's very first
+// login on this device, in which case the server registers a new device and
+// returns its id — the caller is expected to persist that for next time
+// (see AuthContext, storage/secureKeyStore's getOrCreateDeviceId). Sending a
+// previously-issued deviceId back reuses that device's identity instead of
+// registering a new one, replacing just that device's session server-side.
+export function verifyOtp(
+  email: string,
+  code: string,
+  publicKey: string,
+  deviceId?: string,
+  deviceName?: string | null
+) {
+  return request<LoginResult>("/auth/otp/verify", {
     method: "POST",
-    body: JSON.stringify({ email, code, publicKey }),
+    body: JSON.stringify({ email, code, publicKey, deviceId, deviceName }),
   });
 }
 
 // Dev-only: mirrors verifyOtp but skips the code entirely. Only works while
 // the server has SKIP_OTP=true; see EmailEntryScreen for the toggle.
-export function devLogin(email: string, publicKey: string) {
-  return request<{ token: string; userId: string }>("/auth/dev-login", {
+export function devLogin(email: string, publicKey: string, deviceId?: string, deviceName?: string | null) {
+  return request<LoginResult>("/auth/dev-login", {
     method: "POST",
-    body: JSON.stringify({ email, publicKey }),
+    body: JSON.stringify({ email, publicKey, deviceId, deviceName }),
   });
 }
 
 export function getSession(token: string) {
   return request<{ userId: string; email: string }>("/auth/session", { token });
+}
+
+export interface LinkedDevice {
+  id: string;
+  name: string | null;
+  createdAt: number;
+  lastSeenAt: number | null;
+  isCurrentDevice: boolean;
+}
+
+/** Powers the "Linked Devices" Settings screen. */
+export async function listDevices(token: string) {
+  const { devices } = await request<{ devices: LinkedDevice[] }>("/devices", { token });
+  return devices;
+}
+
+// Unlinks a device (including, potentially, this very one — the server
+// kicks its live socket via session:revoked, which AuthContext already
+// listens for and signs out locally in response).
+export function revokeDevice(token: string, deviceId: string) {
+  return request<void>(`/devices/${encodeURIComponent(deviceId)}`, { method: "DELETE", token });
 }
 
 export function logout(token: string) {
@@ -96,10 +135,20 @@ export async function lookupUsers(token: string, emails: string[]) {
   return matches;
 }
 
+export interface UserDevice {
+  deviceId: string;
+  publicKey: string;
+}
+
 export interface UserLookup {
   userId: string;
   email: string;
   publicKey: string;
+  // This peer's currently-active linked devices — encrypt once per device
+  // for real multi-device delivery instead of the single (and, once a
+  // second device logs in, stale) publicKey above. See ChatScreen's send
+  // path and storage/database.ts's peer_devices cache.
+  devices: UserDevice[];
   name: string | null;
   avatarUrl: string | null;
   contactNumber: string | null;

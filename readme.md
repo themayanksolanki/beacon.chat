@@ -1,0 +1,1 @@
+Optional: upgrade to full Signal-protocol prekeys for offline-device async encryption.

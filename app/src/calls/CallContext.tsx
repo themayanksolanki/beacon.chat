@@ -685,11 +685,35 @@ export function CallProvider({ children }: { children: ReactNode }) {
     [cleanup, logCallOutcome]
   );
 
+  // Fires on every device EXCEPT the one that answered/declined — call:invite
+  // rings all of this account's linked devices at once (see socketServer.ts),
+  // so once one of them handles the call, the rest need to be told to stop
+  // ringing rather than sitting there forever. There's never a peer
+  // connection to tear down here (this device never actually answered), just
+  // the ringing UI/vibration/CallKit registration from handleInvite.
+  const handleRemoteCancel = useCallback(
+    (payload: { callId: string }) => {
+      if (callRef.current?.callId !== payload.callId) return;
+      clearRingTimeout();
+      Vibration.cancel();
+      logCallOutcome("missed");
+      if (callKeepReadyRef.current) {
+        safeCallKeep(() =>
+          RNCallKeep.reportEndCallWithUUID(payload.callId, CK_CONSTANTS.END_CALL_REASONS.DECLINED_ELSEWHERE)
+        );
+      }
+      dismissCallScreen();
+      cleanup();
+    },
+    [cleanup, clearRingTimeout, logCallOutcome]
+  );
+
   useEffect(() => {
     if (!token) return;
     const socket = getSocket();
     socket.on("call:invite", handleInvite);
     socket.on("call:answer", handleAnswer);
+    socket.on("call:cancel", handleRemoteCancel);
     socket.on("call:ice-candidate", handleRemoteIceCandidate);
     socket.on("call:end", handleRemoteEnd);
     socket.on("call:camera-state", handleRemoteCameraState);
@@ -698,6 +722,7 @@ export function CallProvider({ children }: { children: ReactNode }) {
     return () => {
       socket.off("call:invite", handleInvite);
       socket.off("call:answer", handleAnswer);
+      socket.off("call:cancel", handleRemoteCancel);
       socket.off("call:ice-candidate", handleRemoteIceCandidate);
       socket.off("call:end", handleRemoteEnd);
       socket.off("call:camera-state", handleRemoteCameraState);
@@ -708,6 +733,7 @@ export function CallProvider({ children }: { children: ReactNode }) {
     token,
     handleInvite,
     handleAnswer,
+    handleRemoteCancel,
     handleRemoteIceCandidate,
     handleRemoteEnd,
     handleRemoteCameraState,

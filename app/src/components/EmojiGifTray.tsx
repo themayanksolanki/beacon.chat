@@ -80,7 +80,7 @@ export default function EmojiGifTray({ height, onEmojiSelected, onSelectGif }: E
             skinTonesContainer: colors.surface,
             knob: colors.textTertiary,
             category: {
-              icon: colors.textSecondary,
+              icon: colors.text,
               iconActive: colors.accent,
               container: colors.bubbleIncoming,
               containerActive: colors.accentSoft,

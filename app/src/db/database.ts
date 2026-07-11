@@ -84,6 +84,20 @@ function runMigrations() {
       peer_id TEXT PRIMARY KEY NOT NULL,
       blocked_at INTEGER NOT NULL
     );
+
+    -- A peer's currently-active linked devices, each with its own
+    -- encryption key — real multi-device fan-out needs one ciphertext per
+    -- device, not one per peer (see conversations.peer_public_key above,
+    -- which is now only a fallback for before this cache is first
+    -- populated). Refreshed wholesale (see replacePeerDevices) at the same
+    -- points peer_public_key refreshes today: on chat open, and on a
+    -- decrypt-retry.
+    CREATE TABLE IF NOT EXISTS peer_devices (
+      conversation_id TEXT NOT NULL,
+      device_id TEXT NOT NULL,
+      public_key TEXT NOT NULL,
+      PRIMARY KEY (conversation_id, device_id)
+    );
   `);
 
   // status/delivered_at/read_at/reply_* were added after this table already
@@ -485,12 +499,41 @@ export function updateConversationPeerKey(id: string, peerPublicKey: string): vo
   db.runSync(`UPDATE conversations SET peer_public_key = ? WHERE id = ?`, [peerPublicKey, id]);
 }
 
+export interface PeerDeviceRow {
+  device_id: string;
+  public_key: string;
+}
+
+export function getPeerDevices(conversationId: string): PeerDeviceRow[] {
+  return db.getAllSync<PeerDeviceRow>(
+    `SELECT device_id, public_key FROM peer_devices WHERE conversation_id = ?`,
+    [conversationId]
+  );
+}
+
+// Wholesale replace rather than upsert: a device that's no longer in the
+// fetched list has been unlinked/revoked on the server and must stop being
+// a valid send target here too, not just silently linger as stale cache.
+export function replacePeerDevices(conversationId: string, devices: PeerDeviceRow[]): void {
+  db.withTransactionSync(() => {
+    db.runSync(`DELETE FROM peer_devices WHERE conversation_id = ?`, [conversationId]);
+    for (const device of devices) {
+      db.runSync(`INSERT INTO peer_devices (conversation_id, device_id, public_key) VALUES (?, ?, ?)`, [
+        conversationId,
+        device.device_id,
+        device.public_key,
+      ]);
+    }
+  });
+}
+
 // Removes the conversation itself along with its messages and call history —
 // unlike clearMessages(), nothing is left behind in the chat list.
 export function deleteConversationRecord(conversationId: string): void {
   db.withTransactionSync(() => {
     db.runSync(`DELETE FROM messages WHERE conversation_id = ?`, [conversationId]);
     db.runSync(`DELETE FROM calls WHERE conversation_id = ?`, [conversationId]);
+    db.runSync(`DELETE FROM peer_devices WHERE conversation_id = ?`, [conversationId]);
     db.runSync(`DELETE FROM conversations WHERE id = ?`, [conversationId]);
   });
 }

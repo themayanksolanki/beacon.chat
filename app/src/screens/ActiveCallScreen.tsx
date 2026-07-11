@@ -179,7 +179,7 @@ const styles = StyleSheet.create({
   topOverlay: { position: "absolute", top: 0, left: 0, right: 0, alignItems: "center" },
   minimizeButton: {
     position: "absolute",
-    top: 0,
+    top: 20,
     left: 20,
     width: 36,
     height: 36,

@@ -1,58 +1,63 @@
-import { and, eq, isNotNull, lte, or } from "drizzle-orm";
-import { db } from "./db";
-import { messages, reactions, users } from "./schema";
+import { prisma } from "./prisma";
 import { isMongoConnected, profiles } from "./mongo";
 import { deleteAvatarObject } from "./s3";
 
 export const ACCOUNT_DELETION_GRACE_MS = 48 * 60 * 60 * 1000;
 
 /**
- * Marks an account for deletion and immediately revokes its session (the
+ * Marks an account for deletion and immediately revokes its sessions (the
  * caller is expected to also disconnect any live socket — see
  * routes/auth.ts). The account and its data aren't actually removed until
  * purgeExpiredAccounts sweeps it up after the grace period.
  */
-export function requestDeletion(userId: string): number {
+export async function requestDeletion(userId: string): Promise<number> {
   const requestedAt = Date.now();
-  db.update(users)
-    .set({ deletion_requested_at: requestedAt, current_session_id: null })
-    .where(eq(users.id, userId))
-    .run();
+  await prisma.$transaction([
+    prisma.user.update({ where: { id: userId }, data: { deletionRequestedAt: new Date(requestedAt) } }),
+    prisma.session.updateMany({ where: { userId, revokedAt: null }, data: { revokedAt: new Date(requestedAt) } }),
+  ]);
   return requestedAt + ACCOUNT_DELETION_GRACE_MS;
 }
 
 /** Called on every successful login — logging back in cancels a pending deletion. */
-export function cancelDeletionIfPending(userId: string): void {
-  db.update(users)
-    .set({ deletion_requested_at: null })
-    .where(eq(users.id, userId))
-    .run();
+export async function cancelDeletionIfPending(userId: string): Promise<void> {
+  await prisma.user.update({ where: { id: userId }, data: { deletionRequestedAt: null } });
 }
 
 /**
  * Permanently removes any account whose deletion grace period has elapsed:
- * its messages/reactions (in either direction), its Mongo profile doc, and
- * the user row itself. Meant to be run periodically (see
- * startAccountDeletionSweep) rather than called directly outside tests.
+ * its sessions/devices, messages/reactions (in either direction), contact
+ * relationships, reports, its Mongo profile doc, and the user row itself.
+ * Unlike the old SQLite database (which never had foreign keys turned on),
+ * Postgres enforces them — so every table that references users.id has to
+ * be cleared before the user row itself can go, in FK-dependency order.
+ * Meant to be run periodically (see startAccountDeletionSweep) rather than
+ * called directly outside tests.
  */
 export async function purgeExpiredAccounts(): Promise<void> {
-  const cutoff = Date.now() - ACCOUNT_DELETION_GRACE_MS;
-  const due = db
-    .select({ id: users.id })
-    .from(users)
-    .where(and(isNotNull(users.deletion_requested_at), lte(users.deletion_requested_at, cutoff)))
-    .all();
+  const cutoff = new Date(Date.now() - ACCOUNT_DELETION_GRACE_MS);
+  const due = await prisma.user.findMany({
+    where: { deletionRequestedAt: { not: null, lte: cutoff } },
+    select: { id: true },
+  });
 
   for (const { id } of due) {
-    db.delete(messages).where(or(eq(messages.sender_id, id), eq(messages.recipient_id, id))).run();
-    db.delete(reactions).where(or(eq(reactions.sender_id, id), eq(reactions.recipient_id, id))).run();
+    // Sessions reference devices, so they have to go first.
+    await prisma.session.deleteMany({ where: { userId: id } });
+    // Messages/reactions reference this user's device(s) via
+    // recipientDeviceId/senderDeviceId, so they have to clear before devices.
+    await prisma.message.deleteMany({ where: { OR: [{ senderId: id }, { recipientId: id }] } });
+    await prisma.reaction.deleteMany({ where: { OR: [{ senderId: id }, { recipientId: id }] } });
+    await prisma.device.deleteMany({ where: { userId: id } });
+    await prisma.contact.deleteMany({ where: { OR: [{ userAId: id }, { userBId: id }] } });
+    await prisma.report.deleteMany({ where: { OR: [{ reporterId: id }, { reportedId: id }] } });
     if (isMongoConnected()) {
       const profile = await profiles().findOneAndDelete({ userId: id });
       if (profile?.avatarKey) {
         void deleteAvatarObject(profile.avatarKey);
       }
     }
-    db.delete(users).where(eq(users.id, id)).run();
+    await prisma.user.delete({ where: { id } });
     console.log(`[accountDeletion] purged account ${id}`);
   }
 }
