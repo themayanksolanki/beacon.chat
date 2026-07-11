@@ -123,7 +123,8 @@
       "Bash(java -version)",
       "Bash(pkill -f \"ts-node-dev\")",
       "Bash(pkill -f \"ts-node-dev --transpile-only src/index.ts\")",
-      "Bash(pkill -f \"ts-node-dev --transpile-only src/index.ts\" 2>/dev/null; sleep 1; rm -f /tmp/beacon-verify-fanout.log /tmp/beacon-verify-fanout.pid; ps aux | grep ts-node-dev | grep -v grep || echo \"server stopped\")"
+      "Bash(pkill -f \"ts-node-dev --transpile-only src/index.ts\" 2>/dev/null; sleep 1; rm -f /tmp/beacon-verify-fanout.log /tmp/beacon-verify-fanout.pid; ps aux | grep ts-node-dev | grep -v grep || echo \"server stopped\")",
+      "Bash(echo \"TSC_EXIT: $?\")"
     ]
   }
 }

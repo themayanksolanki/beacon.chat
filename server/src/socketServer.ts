@@ -535,6 +535,22 @@ export function createSocketServer(httpServer: HttpServer): Server {
       }
     });
 
+    // Same reasoning as call:camera-state above — mute is purely local
+    // (track.enabled on the audio track), so the other party needs this
+    // relayed to show a "muted" indicator for them.
+    socket.on("call:mute-state", (payload: { callId: string; muted: boolean }) => {
+      try {
+        const call = activeCalls.get(payload.callId);
+        if (!call || (call.callerId !== userId && call.calleeId !== userId)) return;
+        io!.to(otherParty(call, userId)).emit("call:mute-state", {
+          callId: payload.callId,
+          muted: payload.muted,
+        });
+      } catch (err) {
+        console.error("[socket] call:mute-state failed", err);
+      }
+    });
+
     // Mid-call renegotiation (e.g. adding a video track to a call that
     // started audio-only) — same relay-only shape as call:answer, but must
     // not touch activeCalls/userActiveCall bookkeeping, which stays owned by

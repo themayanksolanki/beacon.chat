@@ -34,9 +34,11 @@ export default function ActiveCallScreen() {
     localStreamURL,
     remoteStreamURL,
     isMuted,
+    isRemoteMuted,
     isSpeakerOn,
     isCameraOff,
     isRemoteCameraOff,
+    isFrontCamera,
     callDurationSec,
     isSystemInterrupted,
     endCall,
@@ -83,7 +85,13 @@ export default function ActiveCallScreen() {
       {showRemotePrimary ? (
         <RTCView streamURL={remoteStreamURL!} style={StyleSheet.absoluteFill} objectFit="cover" zOrder={0} />
       ) : showLocalPrimary ? (
-        <RTCView streamURL={localStreamURL!} style={StyleSheet.absoluteFill} objectFit="cover" mirror zOrder={0} />
+        <RTCView
+          streamURL={localStreamURL!}
+          style={StyleSheet.absoluteFill}
+          objectFit="cover"
+          mirror={isFrontCamera}
+          zOrder={0}
+        />
       ) : (
         <View style={styles.avatarBackdrop}>
           <Avatar name={call.peerName} avatarUrl={call.peerAvatarUrl} size={160} />
@@ -96,7 +104,13 @@ export default function ActiveCallScreen() {
               on Android, RTCView renders via a real SurfaceView composited outside
               normal view draw order, so two overlapping RTCViews left at the same
               (default 0) zOrder z-fight/flicker against each other. */}
-          <RTCView streamURL={localStreamURL!} style={StyleSheet.absoluteFill} objectFit="cover" mirror zOrder={1} />
+          <RTCView
+            streamURL={localStreamURL!}
+            style={StyleSheet.absoluteFill}
+            objectFit="cover"
+            mirror={isFrontCamera}
+            zOrder={1}
+          />
         </View>
       ) : null}
 
@@ -113,6 +127,12 @@ export default function ActiveCallScreen() {
         ) : null}
         <Text style={styles.name}>{call.peerName}</Text>
         <Text style={styles.status}>{statusText(phase, callDurationSec)}</Text>
+        {isRemoteMuted && phase === "connected" ? (
+          <View style={styles.mutedBanner}>
+            <Ionicons name="mic-off" size={12} color={palette.text} />
+            <Text style={styles.mutedText}>{call.peerName} is muted</Text>
+          </View>
+        ) : null}
         {isSystemInterrupted ? (
           <View style={styles.interruptedBanner}>
             <Ionicons name="alert-circle" size={14} color={palette.text} />
@@ -216,6 +236,17 @@ const styles = StyleSheet.create({
     backgroundColor: "rgba(255,59,48,0.85)",
   },
   interruptedText: { color: palette.text, fontSize: 12, fontWeight: "600" },
+  mutedBanner: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 6,
+    marginTop: 10,
+    paddingHorizontal: 12,
+    paddingVertical: 6,
+    borderRadius: 14,
+    backgroundColor: "rgba(255,255,255,0.16)",
+  },
+  mutedText: { color: palette.text, fontSize: 12, fontWeight: "600" },
   controls: { position: "absolute", bottom: 0, left: 0, right: 0, alignItems: "center", gap: 28 },
   controlsRow: { flexDirection: "row", gap: 20 },
   controlButton: { width: 52, height: 52, borderRadius: 26, alignItems: "center", justifyContent: "center" },

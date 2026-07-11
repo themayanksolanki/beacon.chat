@@ -127,9 +127,16 @@ interface CallContextValue {
   localStreamURL: string | null;
   remoteStreamURL: string | null;
   isMuted: boolean;
+  isRemoteMuted: boolean;
   isSpeakerOn: boolean;
   isCameraOff: boolean;
   isRemoteCameraOff: boolean;
+  // True while the front camera is active — used to mirror the local
+  // preview (feels like a real mirror) without mirroring the back camera
+  // (which should show the true, unflipped scene, same as what the peer
+  // sees — mirroring is a purely local rendering choice, never part of the
+  // transmitted video).
+  isFrontCamera: boolean;
   callDurationSec: number;
   // True while the OS has taken the audio session away from this call for
   // another one (e.g. a cellular call rang mid-call) — the local mic/camera
@@ -155,9 +162,11 @@ export function CallProvider({ children }: { children: ReactNode }) {
   const [localStreamURL, setLocalStreamURL] = useState<string | null>(null);
   const [remoteStreamURL, setRemoteStreamURL] = useState<string | null>(null);
   const [isMuted, setIsMuted] = useState(false);
+  const [isRemoteMuted, setIsRemoteMuted] = useState(false);
   const [isSpeakerOn, setIsSpeakerOn] = useState(false);
   const [isCameraOff, setIsCameraOff] = useState(false);
   const [isRemoteCameraOff, setIsRemoteCameraOff] = useState(false);
+  const [isFrontCamera, setIsFrontCamera] = useState(true);
   const [callDurationSec, setCallDurationSec] = useState(0);
   const [isSystemInterrupted, setIsSystemInterrupted] = useState(false);
 
@@ -320,9 +329,11 @@ export function CallProvider({ children }: { children: ReactNode }) {
     setLocalStreamURL(null);
     setRemoteStreamURL(null);
     setIsMuted(false);
+    setIsRemoteMuted(false);
     setIsSpeakerOn(false);
     setIsCameraOff(true);
     setIsRemoteCameraOff(true);
+    setIsFrontCamera(true);
     setCallDurationSec(0);
     setCall(null);
     setPhase("idle");
@@ -558,9 +569,14 @@ export function CallProvider({ children }: { children: ReactNode }) {
     // routinely unavailable (simulators, Expo Go, devices without a Telecom
     // stack supporting self-managed connections — see the CallKeep setup
     // effect) and silently no-ops when it is. Without this, those cases rang
-    // with vibration only and no audible sound at all. Empty vibrate_pattern
-    // here since Vibration.vibrate above already covers that cross-platform.
-    InCallManager.startRingtone("_DEFAULT_", [], "playAndRecord", 30);
+    // with vibration only and no audible sound at all. vibrate_pattern is `0`
+    // (not `[]`) since Vibration.vibrate above already covers vibration
+    // cross-platform — InCallManager's JS wrapper only checks
+    // Array.isArray(vibrate_pattern), so an empty array still triggers its own
+    // Vibration.vibrate([], false) call, which is silently harmless on iOS but
+    // throws IllegalArgumentException natively on Android (VibrationEffect
+    // .createWaveform rejects an empty pattern), killing the whole app.
+    InCallManager.startRingtone("_DEFAULT_", 0, "playAndRecord", 30);
 
     insertCall({
       id: payload.callId,
@@ -704,6 +720,11 @@ export function CallProvider({ children }: { children: ReactNode }) {
     setIsRemoteCameraOff(!payload.cameraOn);
   }, []);
 
+  const handleRemoteMuteState = useCallback((payload: { callId: string; muted: boolean }) => {
+    if (callRef.current?.callId !== payload.callId) return;
+    setIsRemoteMuted(payload.muted);
+  }, []);
+
   // The peer just added a video track to a call that didn't have one from
   // them before (audio-only call, or their first time enabling camera) —
   // apply their offer and answer back, same SDP dance as acceptIncomingCall/
@@ -794,6 +815,7 @@ export function CallProvider({ children }: { children: ReactNode }) {
     socket.on("call:ice-candidate", handleRemoteIceCandidate);
     socket.on("call:end", handleRemoteEnd);
     socket.on("call:camera-state", handleRemoteCameraState);
+    socket.on("call:mute-state", handleRemoteMuteState);
     socket.on("call:renegotiate-offer", handleRenegotiateOffer);
     socket.on("call:renegotiate-answer", handleRenegotiateAnswer);
     return () => {
@@ -803,6 +825,7 @@ export function CallProvider({ children }: { children: ReactNode }) {
       socket.off("call:ice-candidate", handleRemoteIceCandidate);
       socket.off("call:end", handleRemoteEnd);
       socket.off("call:camera-state", handleRemoteCameraState);
+      socket.off("call:mute-state", handleRemoteMuteState);
       socket.off("call:renegotiate-offer", handleRenegotiateOffer);
       socket.off("call:renegotiate-answer", handleRenegotiateAnswer);
     };
@@ -814,9 +837,19 @@ export function CallProvider({ children }: { children: ReactNode }) {
     handleRemoteIceCandidate,
     handleRemoteEnd,
     handleRemoteCameraState,
+    handleRemoteMuteState,
     handleRenegotiateOffer,
     handleRenegotiateAnswer,
   ]);
+
+  // Tells the peer our mic just muted/unmuted — shared by the in-app mute
+  // button and the system mute listener below, so a "muted" indicator on
+  // their end stays accurate regardless of which control was actually used.
+  const emitMuteState = useCallback((muted: boolean) => {
+    const callId = callRef.current?.callId;
+    if (!callId) return;
+    getSocket().emit("call:mute-state", { callId, muted });
+  }, []);
 
   // Mirrors the system's own mute button (car Bluetooth, CallKit's lock
   // screen card) back into our WebRTC track/UI state.
@@ -826,9 +859,10 @@ export function CallProvider({ children }: { children: ReactNode }) {
       const track = localStreamRef.current?.getAudioTracks()[0];
       if (track) track.enabled = !muted;
       setIsMuted(muted);
+      emitMuteState(muted);
     });
     return () => listener.remove();
-  }, []);
+  }, [emitMuteState]);
 
   // The app's own IncomingCallScreen is the primary answer surface, but on a
   // locked or backgrounded device the OS's native CallKit/ConnectionService
@@ -919,6 +953,7 @@ export function CallProvider({ children }: { children: ReactNode }) {
     track.enabled = !track.enabled;
     const nowMuted = !track.enabled;
     setIsMuted(nowMuted);
+    emitMuteState(nowMuted);
     // Android's self-managed ConnectionService has no equivalent JS setter
     // for this (see index.d.ts) — the local track flip above is all that
     // platform needs. iOS's CallKit UI/hardware buttons (car Bluetooth, the
@@ -927,7 +962,7 @@ export function CallProvider({ children }: { children: ReactNode }) {
     if (callKeepReadyRef.current && Platform.OS === "ios" && callRef.current) {
       safeCallKeep(() => RNCallKeep.setMutedCall(callRef.current!.callId, nowMuted));
     }
-  }, []);
+  }, [emitMuteState]);
 
   const toggleSpeaker = useCallback(() => {
     setIsSpeakerOn((prev) => {
@@ -973,6 +1008,9 @@ export function CallProvider({ children }: { children: ReactNode }) {
       });
 
       setIsCameraOff(false);
+      // A fresh getUserMedia call always starts on the front camera,
+      // regardless of which one was active before the camera got turned off.
+      setIsFrontCamera(true);
       setCall((prev) => (prev ? { ...prev, kind: "video" } : prev));
     } catch (err) {
       console.warn("[call] failed to enable camera", err);
@@ -985,6 +1023,11 @@ export function CallProvider({ children }: { children: ReactNode }) {
     const track = localStreamRef.current?.getVideoTracks()[0];
     // _switchCamera is a react-native-webrtc extension, not part of the spec typings.
     (track as unknown as { _switchCamera?: () => void })?._switchCamera?.();
+    // Only the front camera should mirror the local preview (it's meant to
+    // feel like a real mirror); the back camera should show the true scene,
+    // same as what the peer already sees — mirroring never touches the
+    // transmitted video, only how ActiveCallScreen renders our own preview.
+    setIsFrontCamera((prev) => !prev);
   }, []);
 
   const value = useMemo<CallContextValue>(
@@ -994,9 +1037,11 @@ export function CallProvider({ children }: { children: ReactNode }) {
       localStreamURL,
       remoteStreamURL,
       isMuted,
+      isRemoteMuted,
       isSpeakerOn,
       isCameraOff,
       isRemoteCameraOff,
+      isFrontCamera,
       callDurationSec,
       isSystemInterrupted,
       startCall,
@@ -1014,9 +1059,11 @@ export function CallProvider({ children }: { children: ReactNode }) {
       localStreamURL,
       remoteStreamURL,
       isMuted,
+      isRemoteMuted,
       isSpeakerOn,
       isCameraOff,
       isRemoteCameraOff,
+      isFrontCamera,
       callDurationSec,
       isSystemInterrupted,
       startCall,

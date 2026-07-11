@@ -320,6 +320,38 @@ export function getMessages(conversationId: string): MessageRow[] {
   );
 }
 
+/**
+ * The most recent `limit` messages, for ChatScreen's initial/paginated load —
+ * unlike getMessages above (full history, used by delete/clear/test-bot
+ * context), this backs the infinite-scroll-up window so opening a long
+ * conversation doesn't deserialize its entire history up front. Returned
+ * oldest-first (same order as getMessages) so callers can render it directly.
+ */
+export function getRecentMessages(conversationId: string, limit: number): MessageRow[] {
+  const rows = db.getAllSync<MessageRow>(
+    `SELECT * FROM messages WHERE conversation_id = ? ORDER BY sent_at DESC, id DESC LIMIT ?`,
+    [conversationId, limit]
+  );
+  return rows.reverse();
+}
+
+/** Up to `limit` messages strictly older than `beforeSentAt` — the "load more history" page for scrolling up. */
+export function getMessagesBefore(conversationId: string, beforeSentAt: number, limit: number): MessageRow[] {
+  const rows = db.getAllSync<MessageRow>(
+    `SELECT * FROM messages WHERE conversation_id = ? AND sent_at < ? ORDER BY sent_at DESC, id DESC LIMIT ?`,
+    [conversationId, beforeSentAt, limit]
+  );
+  return rows.reverse();
+}
+
+/** Everything from `sinceSentAt` (inclusive) onward — used to refresh an already-paginated window in place, without losing how far back the user has scrolled. */
+export function getMessagesFrom(conversationId: string, sinceSentAt: number): MessageRow[] {
+  return db.getAllSync<MessageRow>(
+    `SELECT * FROM messages WHERE conversation_id = ? AND sent_at >= ? ORDER BY sent_at ASC, id ASC`,
+    [conversationId, sinceSentAt]
+  );
+}
+
 export function getUnreadIncomingMessages(conversationId: string): MessageRow[] {
   return db.getAllSync<MessageRow>(
     `SELECT * FROM messages WHERE conversation_id = ? AND direction = 'incoming' AND read_at IS NULL`,

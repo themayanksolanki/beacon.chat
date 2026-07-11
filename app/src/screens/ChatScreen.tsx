@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import {
+  ActivityIndicator,
   Alert,
   Animated,
   FlatList,
@@ -12,6 +13,8 @@ import {
   Text,
   TextInput,
   View,
+  type NativeScrollEvent,
+  type NativeSyntheticEvent,
 } from "react-native";
 import { Ionicons, MaterialCommunityIcons } from "@expo/vector-icons";
 import * as Clipboard from "expo-clipboard";
@@ -44,7 +47,10 @@ import {
   getCallsForConversation,
   getConversationById,
   getMessages,
+  getMessagesBefore,
+  getMessagesFrom,
   getPeerDevices,
+  getRecentMessages,
   getUnreadIncomingMessages,
   insertMessage,
   isUserBlocked,
@@ -134,6 +140,12 @@ interface ReplyTarget {
 
 const REPLY_PREVIEW_MAX_LENGTH = 80;
 const SEND_TIMEOUT_MS = 15000;
+// Messages loaded per page — initial mount and each subsequent scroll-to-top
+// load this many older messages at once (see the pagination state below).
+const MESSAGE_PAGE_SIZE = 30;
+// Trigger the next "load older" fetch once the user has scrolled within this
+// many px of the top, so the page arrives before they hit a hard stop.
+const LOAD_OLDER_SCROLL_THRESHOLD = 150;
 const DELETE_FOR_EVERYONE_WINDOW_MS = 2 * 60 * 60 * 1000;
 // How long to wait after the last keystroke before telling the peer we
 // stopped typing.
@@ -764,8 +776,96 @@ export default function ChatScreen({ route, navigation }: Props) {
   const { colors } = useTheme();
   const styles = useMemo(() => createStyles(colors), [colors]);
 
-  const [messages, setMessages] = useState<MessageRow[]>(() => getMessages(conversationId));
+  // Oldest-loaded boundary (sent_at of the earliest message currently in
+  // `messages`) — null until the first page has loaded. reloadMessages below
+  // uses it to refresh the already-loaded window in place (picking up new
+  // arrivals/edits without losing how far back the user has scrolled),
+  // instead of re-reading the whole conversation on every DB change.
+  const oldestLoadedAtRef = useRef<number | null>(null);
+  const hasLoadedInitialPageRef = useRef(false);
+
+  const [messages, setMessages] = useState<MessageRow[]>(() => {
+    const page = getRecentMessages(conversationId, MESSAGE_PAGE_SIZE);
+    hasLoadedInitialPageRef.current = true;
+    oldestLoadedAtRef.current = page.length > 0 ? page[0].sent_at : null;
+    return page;
+  });
+  const [hasMoreOlderMessages, setHasMoreOlderMessages] = useState(() => messages.length === MESSAGE_PAGE_SIZE);
+  const [loadingOlderMessages, setLoadingOlderMessages] = useState(false);
   const [calls, setCalls] = useState<CallRow[]>(() => getCallsForConversation(conversationId));
+
+  // Discards any extra history the user scrolled into and jumps back to just
+  // the latest page — used on focus/conversation switch, matching what the
+  // old unconditional full reload did (always land back at the newest
+  // messages), just bounded to one page instead of the whole conversation.
+  const resetAndLoadMessages = useCallback(() => {
+    const page = getRecentMessages(conversationId, MESSAGE_PAGE_SIZE);
+    hasLoadedInitialPageRef.current = true;
+    oldestLoadedAtRef.current = page.length > 0 ? page[0].sent_at : null;
+    setHasMoreOlderMessages(page.length === MESSAGE_PAGE_SIZE);
+    setMessages(page);
+  }, [conversationId]);
+
+  // Re-reads the already-loaded window from the DB in place — used after any
+  // in-session local mutation (read receipts, reactions, a completed
+  // download, a new message arriving) so those keep working exactly as
+  // before pagination was added, without discarding history the user has
+  // scrolled back into just to pick up the change.
+  const reloadMessages = useCallback(() => {
+    if (!hasLoadedInitialPageRef.current || oldestLoadedAtRef.current === null) {
+      resetAndLoadMessages();
+      return;
+    }
+    setMessages(getMessagesFrom(conversationId, oldestLoadedAtRef.current));
+  }, [conversationId, resetAndLoadMessages]);
+
+  // Belt-and-suspenders: if this screen instance were ever reused across a
+  // conversationId change instead of remounting (React Navigation normally
+  // pushes a fresh instance per chat), the pagination refs above would still
+  // point at the previous conversation's boundary — reset them explicitly
+  // rather than risk reloadMessages querying with a stale cursor.
+  useEffect(() => {
+    resetAndLoadMessages();
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- resetAndLoadMessages is conversationId-derived; re-running only on conversationId change is correct
+  }, [conversationId]);
+
+  // Set right before prepending an older page so the scroll-to-bottom effect
+  // below (onContentSizeChange) skips its usual snap-to-end for that content
+  // size change — otherwise "load older" would immediately scroll the user
+  // right back to the bottom they're trying to scroll away from. Disarmed on
+  // a short timer rather than by onContentSizeChange itself, since RN's
+  // VirtualizedList can fire onContentSizeChange more than once for a single
+  // prepend (incremental layout measurement) — clearing the flag on the
+  // first firing let a second one right after slip through and snap back
+  // down anyway, which is what made scrolling up feel like it kept getting
+  // fought/reversed.
+  const suppressAutoScrollRef = useRef(false);
+  const suppressAutoScrollTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const loadOlderMessages = useCallback(() => {
+    if (loadingOlderMessages || !hasMoreOlderMessages || oldestLoadedAtRef.current === null) return;
+    setLoadingOlderMessages(true);
+    const older = getMessagesBefore(conversationId, oldestLoadedAtRef.current, MESSAGE_PAGE_SIZE);
+    if (older.length > 0) {
+      oldestLoadedAtRef.current = older[0].sent_at;
+      suppressAutoScrollRef.current = true;
+      if (suppressAutoScrollTimeoutRef.current) clearTimeout(suppressAutoScrollTimeoutRef.current);
+      suppressAutoScrollTimeoutRef.current = setTimeout(() => {
+        suppressAutoScrollRef.current = false;
+      }, 400);
+      setMessages((prev) => [...older, ...prev]);
+    }
+    setHasMoreOlderMessages(older.length === MESSAGE_PAGE_SIZE);
+    setLoadingOlderMessages(false);
+  }, [conversationId, hasMoreOlderMessages, loadingOlderMessages]);
+
+  const handleListScroll = useCallback(
+    (e: NativeSyntheticEvent<NativeScrollEvent>) => {
+      if (e.nativeEvent.contentOffset.y < LOAD_OLDER_SCROLL_THRESHOLD) loadOlderMessages();
+    },
+    [loadOlderMessages]
+  );
+
   const [draft, setDraft] = useState("");
   const [replyingTo, setReplyingTo] = useState<ReplyTarget | null>(null);
   const [attachmentSheetOpen, setAttachmentSheetOpen] = useState(false);
@@ -986,18 +1086,18 @@ export default function ChatScreen({ route, navigation }: Props) {
       changed = true;
     }
     if (changed) {
-      setMessages(getMessages(conversationId));
+      reloadMessages();
     }
-  }, [conversation, conversationId, isTestBot]);
+  }, [conversation, conversationId, isTestBot, reloadMessages]);
 
   useFocusEffect(
     useCallback(() => {
       if (isTestBot) cleanupExpiredTestBotMessages();
-      setMessages(getMessages(conversationId));
+      resetAndLoadMessages();
       setCalls(getCallsForConversation(conversationId));
       setBlocked(isUserBlocked(conversationId));
       markVisibleMessagesRead();
-    }, [conversationId, isTestBot, markVisibleMessagesRead])
+    }, [conversationId, isTestBot, markVisibleMessagesRead, resetAndLoadMessages])
   );
 
   // Notification suppression (see notificationService.ts) keys off this: a
@@ -1024,9 +1124,9 @@ export default function ChatScreen({ route, navigation }: Props) {
   const isFocused = useIsFocused();
   useEffect(() => {
     if (!conversation || isTestBot) return;
-    setMessages(getMessages(conversationId));
+    reloadMessages();
     if (isFocused) markVisibleMessagesRead();
-  }, [revision, conversation, conversationId, isTestBot, isFocused, markVisibleMessagesRead]);
+  }, [revision, conversation, conversationId, isTestBot, isFocused, markVisibleMessagesRead, reloadMessages]);
 
   // Ids of pending sends the user cancelled locally (image uploads, via the
   // bubble's cross button) — the socket ack for these may still arrive after
@@ -1227,11 +1327,9 @@ export default function ChatScreen({ route, navigation }: Props) {
   const downloadMedia = useCallback(
     (message: MessageRow) => {
       setMessages((prev) => prev.map((m) => (m.id === message.id ? { ...m, media_status: "downloading" } : m)));
-      void fetchAndStoreChatMedia(message)
-        .then(() => setMessages(getMessages(conversationId)))
-        .catch(() => setMessages(getMessages(conversationId)));
+      void fetchAndStoreChatMedia(message).then(reloadMessages).catch(reloadMessages);
     },
-    [conversationId]
+    [reloadMessages]
   );
 
   const onRetry = useCallback(
@@ -1395,14 +1493,14 @@ export default function ChatScreen({ route, navigation }: Props) {
           };
           insertMessage(reply);
           cleanupExpiredTestBotMessages();
-          setMessages(getMessages(conversationId));
+          reloadMessages();
         })();
       }, 700);
       return;
     }
 
     void sendEncrypted(id, text, activeReply);
-  }, [draft, conversation, conversationId, isTestBot, replyingTo, sendEncrypted, stopTypingNow]);
+  }, [draft, conversation, conversationId, isTestBot, replyingTo, reloadMessages, sendEncrypted, stopTypingNow]);
 
   const onVoiceRecorded = useCallback(
     async ({ uri, durationMs, waveform }: RecordedVoice) => {
@@ -1949,10 +2047,31 @@ export default function ChatScreen({ route, navigation }: Props) {
         // start of `data`, which is oldest-first here — with a longer history
         // that leaves the true latest message unrendered, so scrollToEnd below
         // lands at the bottom of whatever's rendered so far, not the real end.
+        // Now bounded by MESSAGE_PAGE_SIZE (pagination above), so rendering
+        // the whole initial page up front is cheap.
         initialNumToRender={listItems.length || 1}
-        onContentSizeChange={() => listRef.current?.scrollToEnd({ animated: true })}
+        onContentSizeChange={() => {
+          // Loading older history prepends at the top and must not yank the
+          // view back down to the bottom — see suppressAutoScrollRef above.
+          // Deliberately not cleared here: this can fire more than once per
+          // prepend, and the timer that owns it already accounts for that.
+          if (suppressAutoScrollRef.current) return;
+          listRef.current?.scrollToEnd({ animated: true });
+        }}
         onScrollToIndexFailed={({ averageItemLength, index }) =>
           listRef.current?.scrollToOffset({ offset: averageItemLength * index, animated: true })
+        }
+        onScroll={handleListScroll}
+        scrollEventThrottle={100}
+        // Keeps whatever the user is currently looking at in place (rather
+        // than jumping) when an older page is prepended above it.
+        maintainVisibleContentPosition={{ minIndexForVisible: 0 }}
+        ListHeaderComponent={
+          loadingOlderMessages ? (
+            <View style={styles.loadingOlderContainer}>
+              <ActivityIndicator size="small" color={colors.textTertiary} />
+            </View>
+          ) : null
         }
         renderItem={({ item }) =>
           item.type === "separator" ? (
@@ -2145,6 +2264,7 @@ const createStyles = (colors: ThemeColors) =>
     headerStatus: { fontSize: 11, color: colors.textSecondary, marginTop: 1 },
     headerStatusOnline: { fontSize: 11, fontWeight: "500", color: colors.tickRead, marginTop: 1 },
     list: { padding: 12 },
+    loadingOlderContainer: { paddingVertical: 12, alignItems: "center" },
     dateSeparator: { alignItems: "center", marginVertical: 10 },
     dateSeparatorText: {
       fontSize: 12,
