@@ -419,6 +419,8 @@ export interface ConversationSummary extends ConversationRow {
   last_message_direction: "outgoing" | "incoming" | null;
   last_message_status: MessageStatus | null;
   unread_count: number;
+  // 0/1 — SQLite has no native boolean type; treat as truthy in TS.
+  is_blocked: number;
 }
 
 export function getConversationSummaries(): ConversationSummary[] {
@@ -430,7 +432,8 @@ export function getConversationSummaries(): ConversationSummary[] {
       (SELECT sent_at FROM messages m WHERE m.conversation_id = c.id ORDER BY m.sent_at DESC LIMIT 1) AS last_message_at,
       (SELECT direction FROM messages m WHERE m.conversation_id = c.id ORDER BY m.sent_at DESC LIMIT 1) AS last_message_direction,
       (SELECT status FROM messages m WHERE m.conversation_id = c.id ORDER BY m.sent_at DESC LIMIT 1) AS last_message_status,
-      (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id AND m.direction = 'incoming' AND m.read_at IS NULL) AS unread_count
+      (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id AND m.direction = 'incoming' AND m.read_at IS NULL) AS unread_count,
+      EXISTS(SELECT 1 FROM blocked_users b WHERE b.peer_id = c.id) AS is_blocked
     FROM conversations c
     ORDER BY COALESCE(last_message_at, c.created_at) DESC
   `);
@@ -557,6 +560,30 @@ export function getBlockedUserIds(): Set<string> {
   return new Set(
     db.getAllSync<{ peer_id: string }>(`SELECT peer_id FROM blocked_users`).map((row) => row.peer_id)
   );
+}
+
+export interface BlockedUserRow {
+  peer_id: string;
+  blocked_at: number;
+  // Cached from conversations, if a row for this peer still exists —
+  // blocking via a contact-request decline deletes the conversation row
+  // entirely (see contactRequests.ts), so these are frequently null and the
+  // Blocked Users screen falls back to a live lookup for display.
+  display_name: string | null;
+  avatar_url: string | null;
+}
+
+export function listBlockedUsers(): BlockedUserRow[] {
+  return db.getAllSync<BlockedUserRow>(
+    `SELECT b.peer_id, b.blocked_at, c.display_name, c.avatar_url
+     FROM blocked_users b
+     LEFT JOIN conversations c ON c.id = b.peer_id
+     ORDER BY b.blocked_at DESC`
+  );
+}
+
+export function unblockUser(peerId: string): void {
+  db.runSync(`DELETE FROM blocked_users WHERE peer_id = ?`, [peerId]);
 }
 
 export type CallDirection = "outgoing" | "incoming";

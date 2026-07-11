@@ -47,6 +47,7 @@ import {
   getPeerDevices,
   getUnreadIncomingMessages,
   insertMessage,
+  isUserBlocked,
   markMessageDelivered,
   markMessageDeletedEverywhere,
   markMessageFailed,
@@ -692,6 +693,31 @@ export default function ChatScreen({ route, navigation }: Props) {
     setConversation(getConversationById(conversationId));
   }, [conversationId]);
   const isTestBot = conversationId === TEST_BOT_CONVERSATION_ID;
+  // Re-read on every focus (see the useFocusEffect below) since blocking
+  // happens from ContactInfoScreen/the conversation list and this screen
+  // stays mounted underneath while that happens.
+  const [blocked, setBlocked] = useState(() => isUserBlocked(conversationId));
+  // Android-only: KeyboardAvoidingView's own padding/height compensation
+  // (verified via a live keyboardDidShow height of ~308dp) computes the right
+  // number but doesn't visibly reposition content in this Expo SDK 57 / RN
+  // 0.86 edge-to-edge setup — windowSoftInputMode="adjustResize" leaves the
+  // window frame full-screen (confirmed via `adb shell dumpsys window`), and
+  // KeyboardAvoidingView's internal paddingBottom doesn't end up pushing the
+  // composer above the IME overlay. Applying the same reported height
+  // directly as this View's own marginBottom (below) does work, so Android
+  // bypasses KeyboardAvoidingView's behavior entirely and self-manages this.
+  const [androidKeyboardHeight, setAndroidKeyboardHeight] = useState(0);
+  useEffect(() => {
+    if (Platform.OS !== "android") return;
+    const onShow = (e: { endCoordinates: { height: number } }) => setAndroidKeyboardHeight(e.endCoordinates.height);
+    const onHide = () => setAndroidKeyboardHeight(0);
+    const s1 = Keyboard.addListener("keyboardDidShow", onShow);
+    const s2 = Keyboard.addListener("keyboardDidHide", onHide);
+    return () => {
+      s1.remove();
+      s2.remove();
+    };
+  }, []);
 
   // Best-effort: refresh the peer's cached public key and profile (name,
   // avatar, contact number) when opening the chat. insertConversation only
@@ -865,6 +891,7 @@ export default function ChatScreen({ route, navigation }: Props) {
     const socket = getSocket();
     const onTypingUpdate = ({ userId, typing }: { userId: string; typing: boolean }) => {
       if (userId !== conversationId) return;
+      if (isUserBlocked(userId)) return;
       if (peerTypingTimeoutRef.current) {
         clearTimeout(peerTypingTimeoutRef.current);
         peerTypingTimeoutRef.current = null;
@@ -919,15 +946,18 @@ export default function ChatScreen({ route, navigation }: Props) {
             <ChatHeaderTitle
               name={name}
               avatarUrl={conversation?.avatar_url ?? null}
-              online={peerPresence?.online ?? false}
-              lastSeenAt={peerPresence?.lastSeenAt ?? null}
+              online={blocked ? false : peerPresence?.online ?? false}
+              lastSeenAt={blocked ? null : peerPresence?.lastSeenAt ?? null}
               onPress={() => navigation.navigate("ContactInfo", { conversationId })}
             />
           ),
       headerRight: isTestBot
         ? undefined
         : () => (
-            <ChatHeaderCallButtons conversationId={conversationId} disabled={conversation?.status !== "accepted"} />
+            <ChatHeaderCallButtons
+              conversationId={conversationId}
+              disabled={conversation?.status !== "accepted" || blocked}
+            />
           ),
     });
   }, [
@@ -936,6 +966,7 @@ export default function ChatScreen({ route, navigation }: Props) {
     conversation?.avatar_url,
     conversation?.status,
     isTestBot,
+    blocked,
     peerPresence,
     conversationId,
   ]);
@@ -964,6 +995,7 @@ export default function ChatScreen({ route, navigation }: Props) {
       if (isTestBot) cleanupExpiredTestBotMessages();
       setMessages(getMessages(conversationId));
       setCalls(getCallsForConversation(conversationId));
+      setBlocked(isUserBlocked(conversationId));
       markVisibleMessagesRead();
     }, [conversationId, isTestBot, markVisibleMessagesRead])
   );
@@ -1204,6 +1236,10 @@ export default function ChatScreen({ route, navigation }: Props) {
 
   const onRetry = useCallback(
     (message: MessageRow) => {
+      // Composer/call-button gating already keeps a blocked conversation from
+      // starting a new send, but a previously-failed message bubble is still
+      // tappable regardless — this is the actual choke point for that path.
+      if (isUserBlocked(conversationId)) return;
       const replyTo = message.reply_to_id
         ? { id: message.reply_to_id, preview: message.reply_preview ?? "" }
         : null;
@@ -1268,7 +1304,7 @@ export default function ChatScreen({ route, navigation }: Props) {
         void sendEncrypted(message.id, message.plaintext, replyTo);
       }
     },
-    [sendEncrypted, sendVoiceEncrypted, sendGifEncrypted, sendPayload, uploadThenSend, downloadMedia]
+    [conversationId, sendEncrypted, sendVoiceEncrypted, sendGifEncrypted, sendPayload, uploadThenSend, downloadMedia]
   );
 
   const onSend = useCallback(async () => {
@@ -1883,12 +1919,9 @@ export default function ChatScreen({ route, navigation }: Props) {
   return (
     <KeyboardAvoidingView
       style={styles.flex}
-      // "padding" on Android too: with edge-to-edge display (default since
-      // Expo SDK 54 / RN 0.86), the OS's adjustResize window-resize this used
-      // to lean on for Android no longer reliably shrinks the layout when the
-      // keyboard opens, which left the input row covered. Explicitly padding
-      // for the keyboard height works on both platforms regardless of that.
-      behavior="padding"
+      // iOS only — see androidKeyboardHeight above for why Android bypasses
+      // KeyboardAvoidingView's own compensation entirely.
+      behavior={Platform.OS === "ios" ? "padding" : undefined}
       keyboardVerticalOffset={Platform.OS === "ios" ? 90 : 0}
     >
       {pinnedMessage ? (
@@ -1908,6 +1941,7 @@ export default function ChatScreen({ route, navigation }: Props) {
 
       <FlatList
         ref={listRef}
+        style={styles.flex}
         data={listItems}
         keyExtractor={(item) => item.id}
         contentContainerStyle={styles.list}
@@ -1971,7 +2005,7 @@ export default function ChatScreen({ route, navigation }: Props) {
         </View>
       ) : null}
 
-      {peerRecording || peerTyping ? (
+      {!blocked && (peerRecording || peerTyping) ? (
         <View style={styles.peerStatusBar}>
           <Text style={styles.peerStatusText} numberOfLines={1}>
             {(conversation?.display_name ?? "Contact") + (peerRecording ? " is recording audio…" : " is typing…")}
@@ -1979,7 +2013,13 @@ export default function ChatScreen({ route, navigation }: Props) {
         </View>
       ) : null}
 
-      {conversation && conversation.status !== "accepted" ? (
+      {blocked ? (
+        <View style={styles.requestBanner}>
+          <Text style={styles.requestBannerText}>
+            You've blocked {conversation?.display_name ?? "this contact"}. Unblock them to send messages.
+          </Text>
+        </View>
+      ) : conversation && conversation.status !== "accepted" ? (
         <RequestActionBanner
           status={conversation.status}
           peerName={conversation.display_name ?? "This contact"}
@@ -1988,7 +2028,7 @@ export default function ChatScreen({ route, navigation }: Props) {
           onReject={onRejectRequest}
         />
       ) : (
-      <View style={[styles.inputRow, { paddingBottom: 8 + insets.bottom }]}>
+      <View style={[styles.inputRow, { paddingBottom: 8 + insets.bottom, marginBottom: androidKeyboardHeight }]}>
         {voiceRecorder.isRecording ? (
           <Animated.View
             style={[styles.recordingBar, { transform: [{ translateX: voiceRecorder.translateX }] }]}

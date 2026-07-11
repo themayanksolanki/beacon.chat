@@ -69,6 +69,18 @@ export default function SettingsScreen({ navigation }: Props) {
         </Pressable>
       </View>
       <Text style={styles.sectionFooter}>Manage sign-in and account deletion.</Text>
+
+      <Text style={styles.sectionHeader}>PRIVACY</Text>
+      <View style={styles.section}>
+        <Pressable style={styles.accountRow} onPress={() => navigation.navigate("BlockedUsers")}>
+          <View style={styles.accountRowLeft}>
+            <Ionicons name="hand-left-outline" size={20} color={colors.text} />
+            <Text style={styles.rowLabel}>Blocked Users</Text>
+          </View>
+          <Ionicons name="chevron-forward" size={20} color={colors.textTertiary} />
+        </Pressable>
+      </View>
+      <Text style={styles.sectionFooter}>Blocked users can't message or call you.</Text>
     </View>
   );
 }

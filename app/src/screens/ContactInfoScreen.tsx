@@ -10,7 +10,7 @@ import { useAuth } from "../auth/AuthContext";
 import { useCall } from "../calls/CallContext";
 import { clearConversation } from "../chat/clearConversation";
 import { deleteConversation } from "../chat/deleteConversation";
-import { blockUser, getConversationById, updateConversationProfile } from "../db/database";
+import { blockUser, getConversationById, isUserBlocked, unblockUser, updateConversationProfile } from "../db/database";
 import { usePresence } from "../presence/PresenceContext";
 import { TEST_BOT_CONVERSATION_ID } from "../testBot";
 import { useTheme } from "../ThemeContext";
@@ -36,6 +36,7 @@ export default function ContactInfoScreen({ route, navigation }: Props) {
   // conversation.created_at (which is when *this device* first talked to
   // them) — kept separate rather than overwriting that column's meaning.
   const [peerCreatedAt, setPeerCreatedAt] = useState<number | null>(null);
+  const [blocked, setBlocked] = useState(() => isUserBlocked(conversationId));
   const { colors } = useTheme();
   const styles = useMemo(() => createStyles(colors), [colors]);
   const { startCall } = useCall();
@@ -117,7 +118,20 @@ export default function ContactInfoScreen({ route, navigation }: Props) {
         style: "destructive",
         onPress: () => {
           blockUser(conversationId);
-          navigation.goBack();
+          setBlocked(true);
+        },
+      },
+    ]);
+  };
+
+  const confirmUnblockUser = () => {
+    Alert.alert("Unblock user", `Unblock ${name}? You'll be able to message and call them again.`, [
+      { text: "Cancel", style: "cancel" },
+      {
+        text: "Unblock",
+        onPress: () => {
+          unblockUser(conversationId);
+          setBlocked(false);
         },
       },
     ]);
@@ -150,17 +164,25 @@ export default function ContactInfoScreen({ route, navigation }: Props) {
             </View>
           )}
           <Text style={styles.name}>{name}</Text>
-          <Text style={styles.status}>{peerPresence?.online ? "Active now" : "Offline"}</Text>
+          <Text style={styles.status}>{!blocked && peerPresence?.online ? "Active now" : "Offline"}</Text>
         </View>
 
         <View style={styles.actionsRow}>
-          <Pressable style={styles.actionButton} onPress={() => startCall(conversationId, "audio")}>
-            <Ionicons name="call" size={20} color={colors.accent} />
-            <Text style={styles.actionLabel}>Audio</Text>
+          <Pressable
+            style={styles.actionButton}
+            onPress={() => startCall(conversationId, "audio")}
+            disabled={blocked}
+          >
+            <Ionicons name="call" size={20} color={blocked ? colors.textTertiary : colors.accent} />
+            <Text style={[styles.actionLabel, blocked && { color: colors.textTertiary }]}>Audio</Text>
           </Pressable>
-          <Pressable style={styles.actionButton} onPress={() => startCall(conversationId, "video")}>
-            <Ionicons name="videocam" size={20} color={colors.accent} />
-            <Text style={styles.actionLabel}>Video</Text>
+          <Pressable
+            style={styles.actionButton}
+            onPress={() => startCall(conversationId, "video")}
+            disabled={blocked}
+          >
+            <Ionicons name="videocam" size={20} color={blocked ? colors.textTertiary : colors.accent} />
+            <Text style={[styles.actionLabel, blocked && { color: colors.textTertiary }]}>Video</Text>
           </Pressable>
         </View>
       </View>
@@ -207,10 +229,17 @@ export default function ContactInfoScreen({ route, navigation }: Props) {
           <Ionicons name="trash-outline" size={20} color={colors.text} />
           <Text style={[styles.optionLabel, { color: colors.text }]}>Delete Chat</Text>
         </Pressable>
-        <Pressable style={[styles.optionRow, styles.optionRowDivider]} onPress={confirmBlockUser}>
-          <Ionicons name="ban-outline" size={20} color={colors.danger} />
-          <Text style={[styles.optionLabel, { color: colors.danger }]}>Block User</Text>
-        </Pressable>
+        {blocked ? (
+          <Pressable style={[styles.optionRow, styles.optionRowDivider]} onPress={confirmUnblockUser}>
+            <Ionicons name="checkmark-circle-outline" size={20} color={colors.text} />
+            <Text style={[styles.optionLabel, { color: colors.text }]}>Unblock User</Text>
+          </Pressable>
+        ) : (
+          <Pressable style={[styles.optionRow, styles.optionRowDivider]} onPress={confirmBlockUser}>
+            <Ionicons name="ban-outline" size={20} color={colors.danger} />
+            <Text style={[styles.optionLabel, { color: colors.danger }]}>Block User</Text>
+          </Pressable>
+        )}
         <Pressable style={styles.optionRow} onPress={confirmRemoveUser}>
           <Ionicons name="person-remove-outline" size={20} color={colors.text} />
           <Text style={[styles.optionLabel, { color: colors.text }]}>Remove User</Text>

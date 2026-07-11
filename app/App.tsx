@@ -19,6 +19,7 @@ import SettingsScreen from "./src/screens/SettingsScreen";
 import AccountScreen from "./src/screens/AccountScreen";
 import AppearanceScreen from "./src/screens/AppearanceScreen";
 import LinkedDevicesScreen from "./src/screens/LinkedDevicesScreen";
+import BlockedUsersScreen from "./src/screens/BlockedUsersScreen";
 import EditProfileScreen from "./src/screens/EditProfileScreen";
 import EmailEntryScreen from "./src/screens/EmailEntryScreen";
 import OtpScreen from "./src/screens/OtpScreen";
@@ -60,6 +61,7 @@ export type MainStackParamList = {
   Account: undefined;
   Appearance: undefined;
   LinkedDevices: undefined;
+  BlockedUsers: undefined;
   EditProfile: undefined;
   IncomingCall: undefined;
   ActiveCall: undefined;
@@ -174,6 +176,11 @@ function RootNavigator() {
         name="LinkedDevices"
         component={LinkedDevicesScreen}
         options={{ title: "Linked Devices" }}
+      />
+      <MainStack.Screen
+        name="BlockedUsers"
+        component={BlockedUsersScreen}
+        options={{ title: "Blocked Users" }}
       />
       <MainStack.Screen
         name="EditProfile"

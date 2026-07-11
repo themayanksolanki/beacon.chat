@@ -1,5 +1,6 @@
 import { createContext, useCallback, useContext, useRef, useState, type ReactNode } from "react";
 
+import { isUserBlocked } from "../db/database";
 import { getSocket } from "../network/socket";
 
 export interface PresenceInfo {
@@ -69,7 +70,11 @@ export function PresenceProvider({ children }: { children: ReactNode }) {
   const subscribe = useCallback(
     (userIds: string[]) => {
       ensureListeners();
-      const unseen = userIds.filter((id) => id && !subscribedIds.current.has(id));
+      // Blocked peers never get a presence subscription — this is the single
+      // choke point every screen's subscribe() call goes through, so it's
+      // enough to keep a blocked user's online dot/last-seen from ever
+      // appearing anywhere without each screen having to check separately.
+      const unseen = userIds.filter((id) => id && !subscribedIds.current.has(id) && !isUserBlocked(id));
       if (unseen.length === 0) return;
       unseen.forEach((id) => subscribedIds.current.add(id));
       requestSnapshot(unseen);

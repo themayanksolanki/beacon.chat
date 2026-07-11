@@ -81,9 +81,9 @@ export default function ActiveCallScreen() {
   return (
     <View style={styles.container}>
       {showRemotePrimary ? (
-        <RTCView streamURL={remoteStreamURL!} style={StyleSheet.absoluteFill} objectFit="cover" />
+        <RTCView streamURL={remoteStreamURL!} style={StyleSheet.absoluteFill} objectFit="cover" zOrder={0} />
       ) : showLocalPrimary ? (
-        <RTCView streamURL={localStreamURL!} style={StyleSheet.absoluteFill} objectFit="cover" mirror />
+        <RTCView streamURL={localStreamURL!} style={StyleSheet.absoluteFill} objectFit="cover" mirror zOrder={0} />
       ) : (
         <View style={styles.avatarBackdrop}>
           <Avatar name={call.peerName} avatarUrl={call.peerAvatarUrl} size={160} />
@@ -92,7 +92,11 @@ export default function ActiveCallScreen() {
 
       {showLocalPip ? (
         <View style={[styles.localPreview, { top: insets.top + 16 }]}>
-          <RTCView streamURL={localStreamURL!} style={StyleSheet.absoluteFill} objectFit="cover" mirror />
+          {/* zOrder=1 puts this PIP's SurfaceView above the fullscreen RTCView's —
+              on Android, RTCView renders via a real SurfaceView composited outside
+              normal view draw order, so two overlapping RTCViews left at the same
+              (default 0) zOrder z-fight/flicker against each other. */}
+          <RTCView streamURL={localStreamURL!} style={StyleSheet.absoluteFill} objectFit="cover" mirror zOrder={1} />
         </View>
       ) : null}
 

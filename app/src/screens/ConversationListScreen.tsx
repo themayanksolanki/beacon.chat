@@ -132,7 +132,10 @@ export default function ConversationListScreen({ navigation }: Props) {
           label: "Block User",
           icon: "ban-outline",
           destructive: true,
-          onPress: () => blockUser(conversationId),
+          onPress: () => {
+            blockUser(conversationId);
+            setConversations(getConversationSummaries());
+          },
         },
         {
           label: "Delete User",
@@ -170,7 +173,7 @@ export default function ConversationListScreen({ navigation }: Props) {
           renderItem={({ item }) => (
             <ConversationRow
               item={item}
-              isOnline={presence[item.id]?.online ?? false}
+              isOnline={item.is_blocked ? false : presence[item.id]?.online ?? false}
               colors={colors}
               styles={styles}
               onPress={() => navigation.navigate("Chat", { conversationId: item.id })}

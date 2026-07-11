@@ -379,7 +379,8 @@ export function MessagingProvider({ children }: { children: ReactNode }) {
       }
     };
 
-    const onReactionCleared = ({ messageId }: { messageId: string; senderId: string }) => {
+    const onReactionCleared = ({ messageId, senderId }: { messageId: string; senderId: string }) => {
+      if (isUserBlocked(senderId)) return;
       setPeerReaction(messageId, null);
       bump();
     };
@@ -428,9 +429,32 @@ export function MessagingProvider({ children }: { children: ReactNode }) {
       }
     };
 
-    const onContactAccepted = ({ peerId }: { peerId: string }) => {
+    const onContactAccepted = async ({ peerId }: { peerId: string }) => {
       setConversationStatus(peerId, "accepted");
       bump();
+      // The requester's own conversation stub was created (with whatever
+      // name/avatar was available) back when the request was first sent,
+      // then just sits there — this device stays on the same ChatScreen
+      // instance the whole time (startConversation navigates there
+      // immediately after sending), so its on-focus refresh never refires.
+      // Acceptance is exactly the moment worth re-checking, especially if
+      // the initial resolve came back null (e.g. the peer hadn't finished
+      // profile setup yet at request time).
+      try {
+        const existing = getConversationById(peerId);
+        if (!existing) return;
+        const peer = await getUserById(token, peerId);
+        const profileChanged =
+          peer.name !== existing.display_name ||
+          peer.avatarUrl !== existing.avatar_url ||
+          peer.contactNumber !== existing.contact_number;
+        if (profileChanged) {
+          updateConversationProfile(peerId, peer.name, peer.avatarUrl, peer.contactNumber);
+          bump();
+        }
+      } catch (err) {
+        console.warn("[messaging] failed to refresh accepted contact's profile", err);
+      }
     };
 
     const onContactDeclined = ({ peerId }: { peerId: string }) => {

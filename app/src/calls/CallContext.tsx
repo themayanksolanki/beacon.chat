@@ -8,7 +8,7 @@ import {
   useState,
   type ReactNode,
 } from "react";
-import { Alert, Platform, Vibration } from "react-native";
+import { Alert, PermissionsAndroid, Platform, Vibration, type Permission } from "react-native";
 import { StackActions } from "@react-navigation/native";
 import * as Crypto from "expo-crypto";
 import InCallManager from "react-native-incall-manager";
@@ -21,7 +21,14 @@ import {
   RTCSessionDescription,
 } from "react-native-webrtc";
 
-import { getConversationById, insertCall, updateCallOutcome, type CallKind, type CallStatus } from "../db/database";
+import {
+  getConversationById,
+  insertCall,
+  isUserBlocked,
+  updateCallOutcome,
+  type CallKind,
+  type CallStatus,
+} from "../db/database";
 import { getSocket } from "../network/socket";
 import { useAuth } from "../auth/AuthContext";
 import { dismissCallScreen, navigationRef } from "../navigation/navigationRef";
@@ -60,6 +67,27 @@ function getUserMediaErrorMessage(err: unknown): string {
     return "No camera or microphone was found on this device.";
   }
   return "Couldn't start the call. Please try again.";
+}
+
+// react-native-webrtc's own getUserMedia only rejects when *both* audio and
+// video permissions are denied (see its getUserMedia.ts) — for a video call
+// where the camera permission is already granted from an earlier call, a
+// denied RECORD_AUDIO silently gets dropped from the constraints instead,
+// resolving with a video-only stream. The call then proceeds to "connected"
+// with no audio track ever added to the peer connection and no error
+// anywhere — the other party just never hears the Android caller. Request
+// (and gate on) the exact permissions needed ourselves first, throwing the
+// same NotAllowedError shape getUserMediaErrorMessage already handles so
+// this reuses the existing catch/Alert wiring at each call site below.
+async function ensureAndroidCallPermissions(needsAudio: boolean, needsVideo: boolean): Promise<void> {
+  if (Platform.OS !== "android") return;
+  const permissions: Permission[] = [];
+  if (needsAudio) permissions.push(PermissionsAndroid.PERMISSIONS.RECORD_AUDIO);
+  if (needsVideo) permissions.push(PermissionsAndroid.PERMISSIONS.CAMERA);
+  if (permissions.length === 0) return;
+  const results = await PermissionsAndroid.requestMultiple(permissions);
+  const denied = permissions.some((p) => results[p] !== PermissionsAndroid.RESULTS.GRANTED);
+  if (denied) throw { name: "NotAllowedError", message: "camera/microphone permission denied" };
 }
 
 function safeCallKeep(action: () => void) {
@@ -185,6 +213,33 @@ export function CallProvider({ children }: { children: ReactNode }) {
     let cancelled = false;
     (async () => {
       try {
+        // Self-managed ConnectionService.createConnection() calls
+        // TelecomManager.getPhoneAccount() internally, which throws an
+        // uncaught SecurityException (crashing the whole app, not just the
+        // call) without READ_PHONE_NUMBERS actually *granted* — declaring it
+        // in the manifest (app.json's android.permissions) is necessary but
+        // not sufficient, and CallKeep's own `additionalPermissions` option
+        // does not reliably surface the runtime prompt in this dev-client/
+        // Bridgeless setup (verified: permission stayed ungranted with only
+        // that option set). Request explicitly and await the result so
+        // setup() never runs — and no call can be placed — with the
+        // permission still missing.
+        if (Platform.OS === "android") {
+          const results = await PermissionsAndroid.requestMultiple([
+            PermissionsAndroid.PERMISSIONS.READ_PHONE_STATE,
+            PermissionsAndroid.PERMISSIONS.READ_PHONE_NUMBERS,
+          ]);
+          const granted = Object.values(results).every((r) => r === PermissionsAndroid.RESULTS.GRANTED);
+          if (!granted) {
+            // Denied: leave callKeepReadyRef false so startCall/handleInvite fall
+            // back to the app-only call path (see performOutgoingCallSetup) rather
+            // than reaching RNCallKeep.startCall(), which is what triggers the
+            // native createConnection() crash without this permission.
+            console.warn("[call] phone permissions denied, falling back to app-only call handling");
+            return;
+          }
+        }
+        if (cancelled) return;
         await RNCallKeep.setup({
           ios: {
             appName: "Beacon",
@@ -197,6 +252,9 @@ export function CallProvider({ children }: { children: ReactNode }) {
             cancelButton: "Cancel",
             okButton: "OK",
             selfManaged: true,
+            // Permission is requested explicitly above — CallKeep's own
+            // handling of this option isn't reliable here (see above), but
+            // the type still requires the field.
             additionalPermissions: [],
             foregroundService: {
               channelId: "com.beaconchat.app.calls",
@@ -244,6 +302,7 @@ export function CallProvider({ children }: { children: ReactNode }) {
   const cleanup = useCallback(() => {
     clearRingTimeout();
     Vibration.cancel();
+    InCallManager.stopRingtone();
     peerConnectionRef.current?.close();
     peerConnectionRef.current = null;
     localStreamRef.current?.getTracks().forEach((t) => t.stop());
@@ -343,6 +402,7 @@ export function CallProvider({ children }: { children: ReactNode }) {
   const performOutgoingCallSetup = useCallback(
     async (callId: string, conversationId: string, kind: CallKind) => {
       try {
+        await ensureAndroidCallPermissions(true, kind === "video");
         const localStream = await mediaDevices.getUserMedia({
           audio: true,
           video: kind === "video" ? { facingMode: "user" } : false,
@@ -405,6 +465,7 @@ export function CallProvider({ children }: { children: ReactNode }) {
   const startCall = useCallback(
     async (conversationId: string, kind: CallKind) => {
       if (phaseRef.current !== "idle") return;
+      if (isUserBlocked(conversationId)) return;
       const conversation = getConversationById(conversationId);
       if (!conversation) return;
 
@@ -471,6 +532,13 @@ export function CallProvider({ children }: { children: ReactNode }) {
 
   const handleInvite = useCallback((payload: IncomingInvite) => {
     if (phaseRef.current !== "idle") return; // server already prevents this via busy tracking, belt & suspenders
+    if (isUserBlocked(payload.callerId)) {
+      // No server-side concept of blocking (see database.ts) — the caller's
+      // client still emits the invite, so silently decline it here rather
+      // than ringing/vibrating/showing the incoming-call screen.
+      getSocket().emit("call:reject", { callId: payload.callId });
+      return;
+    }
     const conversation = getConversationById(payload.callerId);
     incomingInviteRef.current = payload;
 
@@ -486,6 +554,13 @@ export function CallProvider({ children }: { children: ReactNode }) {
     setPhase("incoming-ringing");
     if (navigationRef.isReady()) navigationRef.navigate("IncomingCall");
     Vibration.vibrate([500, 1000, 500, 1000], true);
+    // CallKeep (below) would normally trigger the OS's own ringtone, but it's
+    // routinely unavailable (simulators, Expo Go, devices without a Telecom
+    // stack supporting self-managed connections — see the CallKeep setup
+    // effect) and silently no-ops when it is. Without this, those cases rang
+    // with vibration only and no audible sound at all. Empty vibrate_pattern
+    // here since Vibration.vibrate above already covers that cross-platform.
+    InCallManager.startRingtone("_DEFAULT_", [], "playAndRecord", 30);
 
     insertCall({
       id: payload.callId,
@@ -526,6 +601,7 @@ export function CallProvider({ children }: { children: ReactNode }) {
     if (!invite) return;
     clearRingTimeout();
     Vibration.cancel();
+    InCallManager.stopRingtone();
     setPhase("connecting");
     if (navigationRef.isReady()) {
       navigationRef.dispatch(StackActions.replace("ActiveCall"));
@@ -534,6 +610,7 @@ export function CallProvider({ children }: { children: ReactNode }) {
     if (callKeepReadyRef.current) safeCallKeep(() => RNCallKeep.answerIncomingCall(invite.callId));
 
     try {
+      await ensureAndroidCallPermissions(true, invite.kind === "video");
       const localStream = await mediaDevices.getUserMedia({
         audio: true,
         video: invite.kind === "video" ? { facingMode: "user" } : false,
@@ -880,6 +957,7 @@ export function CallProvider({ children }: { children: ReactNode }) {
     if (!pc || !localStream || !callId || renegotiatingRef.current) return;
     renegotiatingRef.current = true;
     try {
+      await ensureAndroidCallPermissions(false, true);
       const videoStream = await mediaDevices.getUserMedia({ video: { facingMode: "user" } });
       const videoTrack = videoStream.getVideoTracks()[0];
       if (!videoTrack) throw new Error("no video track from getUserMedia");
