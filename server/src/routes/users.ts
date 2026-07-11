@@ -3,7 +3,7 @@ import { prisma } from "../prisma";
 import { requireAuth, type AuthedRequest } from "../auth";
 import { listActiveDevices } from "../devices";
 import { sendInviteEmail } from "../email";
-import { isMongoConnected, profiles, resolveAvatarUrl } from "../mongo";
+import { resolveAvatarUrl } from "../s3";
 import { normalizeEmail } from "../util";
 
 export const usersRouter = Router();
@@ -44,18 +44,16 @@ usersRouter.get("/by-id/:id", requireAuth, async (req, res) => {
     return;
   }
 
-  const [profile, devices] = await Promise.all([
-    isMongoConnected() ? profiles().findOne({ userId: id }) : Promise.resolve(null),
-    listActiveDevices(id),
-  ]);
+  const devices = await listActiveDevices(id);
 
   res.json({
     userId: user.id,
     email: user.email,
     publicKey: user.publicKey,
     devices: devices.map((d) => ({ deviceId: d.id, publicKey: d.publicKey })),
-    name: profile?.name ?? null,
-    avatarUrl: profile ? resolveAvatarUrl(profile) : null,
+    name: user.name,
+    avatarUrl: resolveAvatarUrl(user.avatarKey),
+    about: user.about,
     contactNumber: user.contactNumber,
     createdAt: user.createdAt.getTime(),
   });
@@ -65,8 +63,8 @@ usersRouter.get("/by-id/:id", requireAuth, async (req, res) => {
  * Bulk email lookup: the app sends candidate emails (typed manually or read
  * from the device's address book) and gets back only the ones registered on
  * Beacon (with a public key, i.e. they've completed OTP verification at
- * least once), enriched with their Mongo-stored display name/avatar. Used to
- * distinguish "chat" vs "invite" in the add-by-email screen.
+ * least once), enriched with their display name/avatar. Used to distinguish
+ * "chat" vs "invite" in the add-by-email screen.
  */
 usersRouter.post("/lookup", requireAuth, async (req, res) => {
   const { emails } = req.body ?? {};
@@ -84,24 +82,17 @@ usersRouter.post("/lookup", requireAuth, async (req, res) => {
 
   const rows = await prisma.user.findMany({
     where: { email: { in: unique }, publicKey: { not: null } },
-    select: { id: true, email: true, publicKey: true },
+    select: { id: true, email: true, publicKey: true, name: true, avatarKey: true },
   });
 
-  const profileByUserId = isMongoConnected()
-    ? new Map((await profiles().find({ userId: { $in: rows.map((r) => r.id) } }).toArray()).map((p) => [p.userId, p]))
-    : new Map();
-
   res.json({
-    matches: rows.map((r) => {
-      const profile = profileByUserId.get(r.id);
-      return {
-        email: r.email,
-        userId: r.id,
-        publicKey: r.publicKey,
-        name: profile?.name ?? null,
-        avatarUrl: profile ? resolveAvatarUrl(profile) : null,
-      };
-    }),
+    matches: rows.map((r) => ({
+      email: r.email,
+      userId: r.id,
+      publicKey: r.publicKey,
+      name: r.name,
+      avatarUrl: resolveAvatarUrl(r.avatarKey),
+    })),
   });
 });
 
@@ -127,24 +118,17 @@ usersRouter.post("/lookup-by-phone", requireAuth, async (req, res) => {
 
   const rows = await prisma.user.findMany({
     where: { contactNumber: { in: unique }, publicKey: { not: null } },
-    select: { id: true, contactNumber: true, publicKey: true },
+    select: { id: true, contactNumber: true, publicKey: true, name: true, avatarKey: true },
   });
 
-  const profileByUserId = isMongoConnected()
-    ? new Map((await profiles().find({ userId: { $in: rows.map((r) => r.id) } }).toArray()).map((p) => [p.userId, p]))
-    : new Map();
-
   res.json({
-    matches: rows.map((r) => {
-      const profile = profileByUserId.get(r.id);
-      return {
-        phoneNumber: r.contactNumber,
-        userId: r.id,
-        publicKey: r.publicKey,
-        name: profile?.name ?? null,
-        avatarUrl: profile ? resolveAvatarUrl(profile) : null,
-      };
-    }),
+    matches: rows.map((r) => ({
+      phoneNumber: r.contactNumber,
+      userId: r.id,
+      publicKey: r.publicKey,
+      name: r.name,
+      avatarUrl: resolveAvatarUrl(r.avatarKey),
+    })),
   });
 });
 

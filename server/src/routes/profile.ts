@@ -1,33 +1,26 @@
 import { Router } from "express";
 import { prisma } from "../prisma";
 import { requireAuth, type AuthedRequest } from "../auth";
-import { isMongoConnected, profiles, resolveAvatarUrl } from "../mongo";
-import { createAvatarUploadPost, deleteAvatarObject, headAvatarObject, isS3Configured } from "../s3";
+import { createAvatarUploadPost, deleteAvatarObject, headAvatarObject, isS3Configured, resolveAvatarUrl } from "../s3";
 
 export const profileRouter = Router();
 
 const MAX_NAME_LENGTH = 80;
+const MAX_ABOUT_LENGTH = 140; // matches WhatsApp's About length cap
 // E.164-shaped: a leading '+', a non-zero first digit, then up to 14 more
 // digits (matches the ITU E.164 15-digit-total cap).
 const PHONE_REGEX = /^\+[1-9]\d{6,14}$/;
 
 profileRouter.get("/me", requireAuth, async (req: AuthedRequest, res) => {
-  // Phone lives in Postgres alongside email/publicKey (it's a search key,
-  // same role as email) rather than Mongo, so it's available regardless of
-  // whether the optional Mongo-backed name/avatar profile store is configured.
   const user = await prisma.user.findUnique({
     where: { id: req.user!.userId },
-    select: { contactNumber: true },
+    select: { name: true, avatarKey: true, about: true, contactNumber: true },
   });
-  const phoneNumber = user?.contactNumber ?? null;
 
-  if (!isMongoConnected()) {
-    res.json({ profile: null, phoneNumber });
-    return;
-  }
-
-  const doc = await profiles().findOne({ userId: req.user!.userId });
-  res.json({ profile: doc ? { name: doc.name, avatarUrl: resolveAvatarUrl(doc) } : null, phoneNumber });
+  res.json({
+    profile: user?.name ? { name: user.name, avatarUrl: resolveAvatarUrl(user.avatarKey), about: user.about } : null,
+    phoneNumber: user?.contactNumber ?? null,
+  });
 });
 
 /**
@@ -80,10 +73,14 @@ profileRouter.post("/avatar/upload-url", requireAuth, async (req: AuthedRequest,
 });
 
 profileRouter.put("/", requireAuth, async (req: AuthedRequest, res) => {
-  const { name, avatarKey } = req.body ?? {};
+  const { name, avatarKey, about } = req.body ?? {};
 
   if (typeof name !== "string" || !name.trim() || name.trim().length > MAX_NAME_LENGTH) {
     res.status(400).json({ error: "invalid_name" });
+    return;
+  }
+  if (about !== undefined && about !== null && (typeof about !== "string" || about.length > MAX_ABOUT_LENGTH)) {
+    res.status(400).json({ error: "invalid_about" });
     return;
   }
 
@@ -99,38 +96,28 @@ profileRouter.put("/", requireAuth, async (req: AuthedRequest, res) => {
     }
   }
 
-  if (!isMongoConnected()) {
-    res.status(503).json({ error: "profile_store_unavailable" });
-    return;
-  }
-
-  const user = await prisma.user.findUnique({
+  const previous = await prisma.user.findUnique({
     where: { id: req.user!.userId },
-    select: { id: true, email: true },
+    select: { avatarKey: true },
   });
-  if (!user) {
+  if (!previous) {
     res.status(404).json({ error: "user_not_found" });
     return;
   }
 
-  const previous = await profiles().findOne({ userId: user.id });
-
-  // Only touch avatarKey when the field was actually present in the
+  // Only touch avatarKey/about when the field was actually present in the
   // request body — an omitted field (e.g. a name-only edit) must leave the
-  // stored avatar untouched, not clobber it with undefined/null.
-  const update: Record<string, unknown> = {
-    userId: user.id,
-    email: user.email,
-    name: name.trim(),
-    updatedAt: Date.now(),
-  };
-  if (avatarKeyProvided) {
-    update.avatarKey = avatarKey ?? null;
-  }
+  // stored value untouched, not clobber it with undefined/null.
+  await prisma.user.update({
+    where: { id: req.user!.userId },
+    data: {
+      name: name.trim(),
+      ...(avatarKeyProvided ? { avatarKey: avatarKey ?? null } : {}),
+      ...(about !== undefined ? { about: about ?? null } : {}),
+    },
+  });
 
-  await profiles().updateOne({ userId: user.id }, { $set: update }, { upsert: true });
-
-  if (avatarKeyProvided && previous?.avatarKey && previous.avatarKey !== avatarKey) {
+  if (avatarKeyProvided && previous.avatarKey && previous.avatarKey !== avatarKey) {
     void deleteAvatarObject(previous.avatarKey);
   }
 

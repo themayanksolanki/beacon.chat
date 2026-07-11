@@ -16,6 +16,7 @@ import {
   setConversationStatus,
   setPeerReaction,
   updateConversationPeerKey,
+  updateConversationProfile,
   type ConversationRow,
   type MessageRow,
 } from "../db/database";
@@ -391,6 +392,22 @@ export function MessagingProvider({ children }: { children: ReactNode }) {
       const existing = getConversationById(requesterId);
       if (existing) {
         if (existing.status !== "accepted") setConversationStatus(requesterId, "pending_incoming");
+        // A stub conversation can already exist with a stale or never-resolved
+        // profile (e.g. an earlier resolve attempt raced a failed profile
+        // push and got back a null name) — refresh it here too instead of
+        // only ever fixing it up the very first time this request is seen,
+        // so the sender's real name/avatar can still surface before the
+        // request is accepted rather than staying stuck on one snapshot.
+        try {
+          const peer = await getUserById(token, requesterId);
+          const profileChanged =
+            peer.name !== existing.display_name ||
+            peer.avatarUrl !== existing.avatar_url ||
+            peer.contactNumber !== existing.contact_number;
+          if (profileChanged) updateConversationProfile(requesterId, peer.name, peer.avatarUrl, peer.contactNumber);
+        } catch (err) {
+          console.warn("[messaging] failed to refresh contact request sender", err);
+        }
         bump();
         return;
       }

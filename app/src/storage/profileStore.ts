@@ -27,7 +27,27 @@ function aliasesFor(accountKey: string) {
     phoneNumber: `beacon.profile.${key}.phoneNumber`,
     createdAt: `beacon.profile.${key}.createdAt`,
     photoFilename: `profile-photo-${key}.jpg`,
+    synced: `beacon.profile.${key}.synced`,
   };
+}
+
+/**
+ * Whether the last name/photo save actually reached the server. The push in
+ * AuthContext's pushRemoteProfile is fire-and-forget and swallows failures
+ * (so a flaky connection can't block onboarding) — without this flag, a
+ * failed push there was previously silent AND permanent: nothing ever
+ * retried it, so other users could be stuck seeing this account as
+ * "Unknown" forever. AuthContext retries the push on next app resume/login
+ * as long as this is false.
+ */
+export async function isProfileSynced(accountKey: string): Promise<boolean> {
+  const alias = aliasesFor(accountKey);
+  return (await SecureStore.getItemAsync(alias.synced, secureOptions)) === "true";
+}
+
+export async function markProfileSynced(accountKey: string, synced: boolean): Promise<void> {
+  const alias = aliasesFor(accountKey);
+  await SecureStore.setItemAsync(alias.synced, synced ? "true" : "false", secureOptions);
 }
 
 // The picker hands back a uri into a transient cache directory, so it's
@@ -59,6 +79,9 @@ export async function saveProfile(
   } else {
     await SecureStore.deleteItemAsync(alias.photoUri, secureOptions);
   }
+  // A fresh local edit hasn't reached the server yet — the caller pushes it
+  // right after this and marks it synced on success (see AuthContext).
+  await SecureStore.setItemAsync(alias.synced, "false", secureOptions);
 
   // Phone number isn't touched by this function (it's saved separately via
   // savePhoneNumber) — just read it back so the returned Profile reflects

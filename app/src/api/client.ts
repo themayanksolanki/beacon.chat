@@ -151,6 +151,9 @@ export interface UserLookup {
   devices: UserDevice[];
   name: string | null;
   avatarUrl: string | null;
+  // Status line, WhatsApp-style ("Hey there! I am using Beacon."). Not
+  // surfaced in any screen yet — no editor UI for it either.
+  about: string | null;
   contactNumber: string | null;
   createdAt: number;
 }

@@ -33,6 +33,15 @@ model User {
   // Postgres, like SQLite, does not enforce uniqueness across NULLs, so
   // this behaves the same as the old idx_users_contact_number.
   contactNumber       String?   @unique @map("contact_number")
+  // Display profile — formerly lived in a separate Mongo collection; folded
+  // in here since it's 1:1 with the user row anyway and Mongo held nothing
+  // else. avatarKey is an S3 object key (see s3.ts's publicAvatarUrl), not
+  // the URL itself. about is a free-text status line, WhatsApp-style
+  // ("Hey there! I am using Beacon.") — schema/API support only for now,
+  // no editor screen built yet.
+  name                String?
+  avatarKey           String?   @map("avatar_key")
+  about               String?
   createdAt           DateTime  @default(now()) @map("created_at")
   lastSeenAt          DateTime? @map("last_seen_at")
   deletionRequestedAt DateTime? @map("deletion_requested_at")

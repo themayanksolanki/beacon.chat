@@ -23,7 +23,15 @@ import {
   getOrCreateDeviceId,
   saveDeviceId,
 } from "../storage/secureKeyStore";
-import { clearProfile, loadProfile, savePhoneNumber, saveProfile, type Profile } from "../storage/profileStore";
+import {
+  clearProfile,
+  isProfileSynced,
+  loadProfile,
+  markProfileSynced,
+  savePhoneNumber,
+  saveProfile,
+  type Profile,
+} from "../storage/profileStore";
 import {
   clearSessionEmail,
   clearSessionToken,
@@ -55,6 +63,10 @@ const AuthContext = createContext<AuthContextValue | null>(null);
 // Other users need to see this profile, so it's pushed to the server too;
 // failures here are swallowed so a flaky connection can't block onboarding
 // or local profile edits (the local copy is what this device relies on).
+// Returns whether it actually succeeded so the caller can persist that via
+// markProfileSynced — a swallowed failure that's never retried is exactly
+// what used to leave other users permanently seeing this account as
+// "Unknown" even after accepting a contact request (see retrySyncIfNeeded).
 // photoChanged tells us whether photoUri is a newly-picked photo (needing a
 // fresh S3 upload) or just carried over unchanged from a name-only edit —
 // without it, every save would re-upload and delete-replace the same photo.
@@ -63,25 +75,40 @@ async function pushRemoteProfile(
   fullName: string,
   photoUri: string | null,
   photoChanged: boolean
-): Promise<void> {
+): Promise<boolean> {
   try {
     if (!photoChanged) {
       await api.updateRemoteProfile(token, fullName);
-      return;
+      return true;
     }
 
     if (!photoUri) {
       await api.updateRemoteProfile(token, fullName, null);
-      return;
+      return true;
     }
 
     const preparedUri = await prepareAvatarForUpload(photoUri);
     const target = await api.requestAvatarUploadUrl(token);
     await uploadAvatarToS3(target, preparedUri);
     await api.updateRemoteProfile(token, fullName, target.key);
+    return true;
   } catch (err) {
     console.warn("[profile] failed to sync profile to server", err);
+    return false;
   }
+}
+
+// Called whenever a session (re)establishes with a loaded local profile —
+// cold start, and every fresh login. If the last save never actually made
+// it to the server (see pushRemoteProfile), this retries it here instead of
+// leaving it stuck until the user happens to edit their profile again.
+// Fire-and-forget: shouldn't delay getting the signed-in UI up.
+function retrySyncIfNeeded(accountKey: string, token: string, localProfile: Profile): void {
+  void (async () => {
+    if (await isProfileSynced(accountKey)) return;
+    const succeeded = await pushRemoteProfile(token, localProfile.fullName, localProfile.photoUri, true);
+    if (succeeded) await markProfileSynced(accountKey, true);
+  })();
 }
 
 export function AuthProvider({ children }: { children: ReactNode }) {
@@ -135,6 +162,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         connectSocket(storedToken).on("session:revoked", signOutLocally);
         setProfile(localProfile);
         setStatus(localProfile ? "signed-in" : "needs-profile");
+        if (localProfile) retrySyncIfNeeded(session.email, storedToken, localProfile);
       } catch (err) {
         // A 401 means the server explicitly rejected this token (expired,
         // revoked by a login elsewhere, etc.) — that's a real sign-out.
@@ -159,6 +187,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         connectSocket(storedToken).on("session:revoked", signOutLocally);
         setProfile(localProfile);
         setStatus(localProfile ? "signed-in" : "needs-profile");
+        if (localProfile) retrySyncIfNeeded(cachedEmail, storedToken, localProfile);
       }
     })();
   }, [signOutLocally]);
@@ -182,6 +211,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       if (localProfile) {
         setProfile(localProfile);
         setStatus("signed-in");
+        retrySyncIfNeeded(emailAddress, newToken, localProfile);
       } else {
         setStatus("needs-profile");
       }
@@ -240,7 +270,9 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       setProfile(saved);
       setStatus("signed-in");
       // Onboarding: never previously synced, so always treat the photo (if any) as new.
-      if (token) await pushRemoteProfile(token, fullName, photoUri, true);
+      if (token && (await pushRemoteProfile(token, fullName, photoUri, true))) {
+        await markProfileSynced(email, true);
+      }
     },
     [email, token]
   );
@@ -253,7 +285,9 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       const photoChanged = photoUri !== profile?.photoUri;
       const saved = await saveProfile(email, fullName, photoUri);
       setProfile(saved);
-      if (token) await pushRemoteProfile(token, fullName, photoUri, photoChanged);
+      if (token && (await pushRemoteProfile(token, fullName, photoUri, photoChanged))) {
+        await markProfileSynced(email, true);
+      }
     },
     [email, token, profile]
   );

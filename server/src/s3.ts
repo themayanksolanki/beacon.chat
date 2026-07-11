@@ -35,6 +35,11 @@ export function publicAvatarUrl(key: string): string {
   return `https://${AWS_S3_BUCKET}.s3.${AWS_REGION}.amazonaws.com/${key}`;
 }
 
+/** Resolves a user's stored avatarKey to the URL clients should render. */
+export function resolveAvatarUrl(avatarKey: string | null): string | null {
+  return avatarKey ? publicAvatarUrl(avatarKey) : null;
+}
+
 /** Presigned POST policy: S3 itself enforces the content-type/size
  * conditions at upload time, and the key prefix scopes the upload to this
  * user (defense in depth against a client requesting/forging another
