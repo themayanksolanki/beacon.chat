@@ -4,7 +4,8 @@ import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { Ionicons } from "@expo/vector-icons";
 
 import { useCall } from "../calls/CallContext";
-import { colorForName, initialFor } from "../theme";
+import { colorForName } from "../theme";
+import Avatar from "../components/Avatar";
 
 // Always dark, regardless of the app's light/dark setting — matches the
 // system's own incoming-call/FaceTime treatment, which never switches to a
@@ -49,9 +50,7 @@ export default function IncomingCallScreen() {
             { backgroundColor: colorForName(call.peerName), opacity: ringOpacity, transform: [{ scale: ringScale }] },
           ]}
         />
-        <View style={[styles.avatar, { backgroundColor: colorForName(call.peerName) }]}>
-          <Text style={styles.avatarInitial}>{initialFor(call.peerName)}</Text>
-        </View>
+        <Avatar name={call.peerName} avatarUrl={call.peerAvatarUrl} size={140} />
       </View>
       <Text style={styles.name}>{call.peerName}</Text>
 
@@ -90,8 +89,6 @@ const styles = StyleSheet.create({
   kind: { color: palette.textSecondary, fontSize: 15, fontWeight: "500" },
   avatarWrap: { alignItems: "center", justifyContent: "center", width: 180, height: 180 },
   ring: { position: "absolute", width: 180, height: 180, borderRadius: 90 },
-  avatar: { width: 140, height: 140, borderRadius: 70, alignItems: "center", justifyContent: "center" },
-  avatarInitial: { fontSize: 52, fontWeight: "700", color: "#fff" },
   name: { color: palette.text, fontSize: 26, fontWeight: "700", marginTop: 20 },
   actions: { flexDirection: "row", justifyContent: "space-between", width: "100%", paddingHorizontal: 24 },
   actionColumn: { alignItems: "center", gap: 10 },

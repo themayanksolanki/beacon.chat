@@ -6,7 +6,9 @@ import { RTCView } from "react-native-webrtc";
 
 import ExpoCallPip from "../../modules/expo-call-pip";
 import { useCall } from "../calls/CallContext";
-import { colorForName, initialFor } from "../theme";
+import { statusText } from "../calls/callFormat";
+import { navigationRef } from "../navigation/navigationRef";
+import Avatar from "../components/Avatar";
 
 // A typical portrait-ish call view aspect ratio for the floating PiP window;
 // react-native-webrtc doesn't surface live track dimensions to this screen,
@@ -24,19 +26,6 @@ const palette = {
   end: "#FF3B30",
 };
 
-function formatDuration(totalSeconds: number): string {
-  const minutes = Math.floor(totalSeconds / 60);
-  const seconds = totalSeconds % 60;
-  return `${minutes}:${seconds.toString().padStart(2, "0")}`;
-}
-
-function statusText(phase: string, durationSec: number): string {
-  if (phase === "outgoing-ringing") return "Calling…";
-  if (phase === "connecting") return "Connecting…";
-  if (phase === "connected") return formatDuration(durationSec);
-  return "";
-}
-
 export default function ActiveCallScreen() {
   const insets = useSafeAreaInsets();
   const {
@@ -47,6 +36,7 @@ export default function ActiveCallScreen() {
     isMuted,
     isSpeakerOn,
     isCameraOff,
+    isRemoteCameraOff,
     callDurationSec,
     isSystemInterrupted,
     endCall,
@@ -68,9 +58,14 @@ export default function ActiveCallScreen() {
 
   if (!call) return null;
 
-  const showVideo = call.kind === "video" && !isCameraOff;
-  const primaryStreamURL = remoteStreamURL ?? localStreamURL;
-  const showLocalPip = showVideo && !!remoteStreamURL && !!localStreamURL;
+  // Remote and local video visibility are tracked independently: whether
+  // *my* camera is on shouldn't hide the peer's video on my own screen, and
+  // vice versa (isRemoteCameraOff comes from the peer's call:camera-state).
+  const remoteVideoActive = call.kind === "video" && !isRemoteCameraOff && !!remoteStreamURL;
+  const localVideoActive = call.kind === "video" && !isCameraOff && !!localStreamURL;
+  const showRemotePrimary = remoteVideoActive;
+  const showLocalPrimary = !showRemotePrimary && localVideoActive;
+  const showLocalPip = showRemotePrimary && localVideoActive;
 
   const minimizeToPip = () => {
     const entered = ExpoCallPip.enterPipMode(PIP_ASPECT_RATIO.width, PIP_ASPECT_RATIO.height);
@@ -79,15 +74,19 @@ export default function ActiveCallScreen() {
     }
   };
 
+  const minimizeToChat = () => {
+    if (navigationRef.isReady()) navigationRef.goBack();
+  };
+
   return (
     <View style={styles.container}>
-      {showVideo && primaryStreamURL ? (
-        <RTCView streamURL={primaryStreamURL} style={StyleSheet.absoluteFill} objectFit="cover" />
+      {showRemotePrimary ? (
+        <RTCView streamURL={remoteStreamURL!} style={StyleSheet.absoluteFill} objectFit="cover" />
+      ) : showLocalPrimary ? (
+        <RTCView streamURL={localStreamURL!} style={StyleSheet.absoluteFill} objectFit="cover" mirror />
       ) : (
         <View style={styles.avatarBackdrop}>
-          <View style={[styles.avatar, { backgroundColor: colorForName(call.peerName) }]}>
-            <Text style={styles.avatarInitial}>{initialFor(call.peerName)}</Text>
-          </View>
+          <Avatar name={call.peerName} avatarUrl={call.peerAvatarUrl} size={160} />
         </View>
       )}
 
@@ -98,8 +97,13 @@ export default function ActiveCallScreen() {
       ) : null}
 
       <View style={[styles.topOverlay, { paddingTop: insets.top + 16 }]}>
+        {phase === "connected" ? (
+          <Pressable style={styles.minimizeButton} onPress={minimizeToChat} hitSlop={8}>
+            <Ionicons name="chevron-down" size={20} color={palette.text} />
+          </Pressable>
+        ) : null}
         {pipSupported ? (
-          <Pressable style={styles.minimizeButton} onPress={minimizeToPip} hitSlop={8}>
+          <Pressable style={styles.pipButton} onPress={minimizeToPip} hitSlop={8}>
             <Ionicons name="contract-outline" size={20} color={palette.text} />
           </Pressable>
         ) : null}
@@ -121,16 +125,12 @@ export default function ActiveCallScreen() {
             active={isSpeakerOn}
             onPress={toggleSpeaker}
           />
-          {call.kind === "video" ? (
-            <>
-              <ControlButton
-                icon={isCameraOff ? "videocam-off" : "videocam"}
-                active={isCameraOff}
-                onPress={toggleCamera}
-              />
-              <ControlButton icon="camera-reverse" onPress={switchCamera} disabled={isCameraOff} />
-            </>
-          ) : null}
+          <ControlButton
+            icon={isCameraOff ? "videocam-off" : "videocam"}
+            active={isCameraOff}
+            onPress={toggleCamera}
+          />
+          <ControlButton icon="camera-reverse" onPress={switchCamera} disabled={isCameraOff} />
         </View>
         <Pressable style={styles.endButton} onPress={endCall}>
           <Ionicons name="call" size={28} color="#fff" style={styles.endIcon} />
@@ -165,8 +165,6 @@ function ControlButton({
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: palette.background },
   avatarBackdrop: { flex: 1, alignItems: "center", justifyContent: "center" },
-  avatar: { width: 160, height: 160, borderRadius: 80, alignItems: "center", justifyContent: "center" },
-  avatarInitial: { fontSize: 60, fontWeight: "700", color: "#fff" },
   localPreview: {
     position: "absolute",
     right: 16,
@@ -180,6 +178,17 @@ const styles = StyleSheet.create({
   },
   topOverlay: { position: "absolute", top: 0, left: 0, right: 0, alignItems: "center" },
   minimizeButton: {
+    position: "absolute",
+    top: 0,
+    left: 20,
+    width: 36,
+    height: 36,
+    borderRadius: 18,
+    alignItems: "center",
+    justifyContent: "center",
+    backgroundColor: "rgba(255,255,255,0.16)",
+  },
+  pipButton: {
     position: "absolute",
     top: 0,
     right: 20,

@@ -1,23 +1,36 @@
-import { useMemo, useState } from "react";
-import { StyleSheet, Text, TextInput, View } from "react-native";
+import { useEffect, useMemo, useState } from "react";
+import { ActivityIndicator, Pressable, StyleSheet, Text } from "react-native";
 import type { NativeStackScreenProps } from "@react-navigation/native-stack";
 
 import type { AuthStackParamList } from "../../App";
 import { useAuth } from "../auth/AuthContext";
+import AuthScreenLayout from "../components/AuthScreenLayout";
+import OtpCodeInput from "../components/OtpCodeInput";
 import PrimaryButton from "../components/PrimaryButton";
 import { useTheme } from "../ThemeContext";
 import type { ThemeColors } from "../theme";
 
 type Props = NativeStackScreenProps<AuthStackParamList, "Otp">;
 
-export default function OtpScreen({ route }: Props) {
+const CODE_LENGTH = 6;
+const RESEND_COOLDOWN_SEC = 30;
+
+export default function OtpScreen({ navigation, route }: Props) {
   const { colors } = useTheme();
   const styles = useMemo(() => createStyles(colors), [colors]);
   const { email } = route.params;
-  const { verifyOtp } = useAuth();
+  const { requestOtp, verifyOtp } = useAuth();
   const [code, setCode] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [resending, setResending] = useState(false);
+  const [resendCooldown, setResendCooldown] = useState(RESEND_COOLDOWN_SEC);
+
+  useEffect(() => {
+    if (resendCooldown <= 0) return;
+    const timer = setTimeout(() => setResendCooldown((s) => s - 1), 1000);
+    return () => clearTimeout(timer);
+  }, [resendCooldown]);
 
   const onSubmit = async () => {
     setError(null);
@@ -33,38 +46,62 @@ export default function OtpScreen({ route }: Props) {
     }
   };
 
+  const onResend = async () => {
+    if (resendCooldown > 0 || resending) return;
+    setError(null);
+    setResending(true);
+    try {
+      await requestOtp(email);
+      setResendCooldown(RESEND_COOLDOWN_SEC);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Couldn't resend the code");
+    } finally {
+      setResending(false);
+    }
+  };
+
   return (
-    <View style={styles.container}>
-      <Text style={styles.title}>Enter the code sent to{"\n"}{email}</Text>
-      <TextInput
-        style={styles.input}
-        placeholder="123456"
-        placeholderTextColor={colors.textTertiary}
-        keyboardType="number-pad"
-        maxLength={6}
+    <AuthScreenLayout
+      onBack={() => navigation.goBack()}
+      title="Check your email"
+      subtitle={`We sent a ${CODE_LENGTH}-digit code to ${email}`}
+      footer={
+        <PrimaryButton title="Verify" onPress={onSubmit} disabled={code.length !== CODE_LENGTH} loading={loading} />
+      }
+    >
+      <OtpCodeInput
+        length={CODE_LENGTH}
         value={code}
-        onChangeText={setCode}
+        onChange={(text) => {
+          setCode(text);
+          if (error) setError(null);
+        }}
+        autoFocus
       />
       {error ? <Text style={styles.error}>{error}</Text> : null}
-      <PrimaryButton title="Verify" onPress={onSubmit} disabled={code.length !== 6} loading={loading} />
-    </View>
+
+      <Pressable
+        onPress={onResend}
+        disabled={resendCooldown > 0 || resending}
+        style={styles.resendRow}
+        hitSlop={8}
+      >
+        {resending ? (
+          <ActivityIndicator size="small" color={colors.textTertiary} />
+        ) : (
+          <Text style={[styles.resendText, resendCooldown > 0 && styles.resendTextDisabled]}>
+            {resendCooldown > 0 ? `Resend code in ${resendCooldown}s` : "Didn't get a code? Resend"}
+          </Text>
+        )}
+      </Pressable>
+    </AuthScreenLayout>
   );
 }
 
 const createStyles = (colors: ThemeColors) =>
   StyleSheet.create({
-    container: { flex: 1, justifyContent: "center", padding: 24, backgroundColor: colors.background },
-    title: { fontSize: 20, fontWeight: "600", marginBottom: 16, color: colors.text },
-    input: {
-      borderWidth: 1,
-      borderColor: colors.border,
-      backgroundColor: colors.surface,
-      color: colors.text,
-      borderRadius: 10,
-      padding: 12,
-      fontSize: 16,
-      marginBottom: 16,
-      letterSpacing: 4,
-    },
-    error: { color: colors.danger, marginBottom: 12 },
+    error: { color: colors.danger, fontSize: 13, marginTop: -4 },
+    resendRow: { alignItems: "center", marginTop: 8 },
+    resendText: { color: colors.accent, fontSize: 14, fontWeight: "600" },
+    resendTextDisabled: { color: colors.textTertiary },
   });

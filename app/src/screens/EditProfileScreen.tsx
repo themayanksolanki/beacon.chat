@@ -103,15 +103,20 @@ export default function EditProfileScreen({ navigation }: Props) {
         </View>
       </Pressable>
       <Text style={styles.changePhotoLabel}>Change photo</Text>
+      <Text style={styles.photoHint}>This photo will be visible to your contacts.</Text>
 
-      <TextInput
-        style={styles.input}
-        placeholder="Full name"
-        placeholderTextColor={colors.textTertiary}
-        autoCapitalize="words"
-        value={fullName}
-        onChangeText={setFullName}
-      />
+      <View style={styles.nameField}>
+        <Text style={styles.fieldLabel}>NAME</Text>
+        <TextInput
+          style={styles.input}
+          placeholder="Full name"
+          placeholderTextColor={colors.textTertiary}
+          autoCapitalize="words"
+          value={fullName}
+          onChangeText={setFullName}
+        />
+        <Text style={styles.fieldHint}>This is the name your contacts will see.</Text>
+      </View>
 
       <View style={styles.phoneField}>
         <Text style={styles.fieldLabel}>Contact number (optional)</Text>
@@ -145,9 +150,11 @@ export default function EditProfileScreen({ navigation }: Props) {
 const createStyles = (colors: ThemeColors) =>
   StyleSheet.create({
     container: { flex: 1, alignItems: "center", padding: 24, paddingTop: 40, backgroundColor: colors.background },
+    nameField: { width: "100%", marginTop: 28 },
     phoneField: { width: "100%", marginTop: 20 },
     fieldLabel: { color: colors.textSecondary, fontSize: 13, fontWeight: "600", marginBottom: 6 },
     fieldHint: { color: colors.textTertiary, fontSize: 12, marginTop: 6 },
+    photoHint: { color: colors.textTertiary, fontSize: 12, marginTop: 4 },
     avatarWrap: { position: "relative" },
     preview: {
       width: 140,
@@ -180,7 +187,6 @@ const createStyles = (colors: ThemeColors) =>
       borderRadius: 10,
       padding: 12,
       fontSize: 16,
-      marginTop: 28,
     },
     memberSinceRow: { flexDirection: "row", alignItems: "center", gap: 4, marginTop: 12 },
     memberSince: { color: colors.textTertiary, fontSize: 13 },

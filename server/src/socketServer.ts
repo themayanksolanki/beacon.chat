@@ -428,6 +428,53 @@ export function createSocketServer(httpServer: HttpServer): Server {
       }
     });
 
+    // Camera on/off is purely local (track.enabled), so the other party has
+    // no way to know it happened without this — relayed so they can swap
+    // their remote video view for the peer's avatar instead of a frozen frame.
+    socket.on("call:camera-state", (payload: { callId: string; cameraOn: boolean }) => {
+      try {
+        const call = activeCalls.get(payload.callId);
+        if (!call || (call.callerId !== userId && call.calleeId !== userId)) return;
+        io!.to(otherParty(call, userId)).emit("call:camera-state", {
+          callId: payload.callId,
+          cameraOn: payload.cameraOn,
+        });
+      } catch (err) {
+        console.error("[socket] call:camera-state failed", err);
+      }
+    });
+
+    // Mid-call renegotiation (e.g. adding a video track to a call that
+    // started audio-only) — same relay-only shape as call:answer, but must
+    // not touch activeCalls/userActiveCall bookkeeping, which stays owned by
+    // the original invite/answer/end flow.
+    socket.on("call:renegotiate-offer", (payload: { callId: string; sdp: unknown; kind: "audio" | "video" }) => {
+      try {
+        const call = activeCalls.get(payload.callId);
+        if (!call || (call.callerId !== userId && call.calleeId !== userId)) return;
+        io!.to(otherParty(call, userId)).emit("call:renegotiate-offer", {
+          callId: payload.callId,
+          sdp: payload.sdp,
+          kind: payload.kind,
+        });
+      } catch (err) {
+        console.error("[socket] call:renegotiate-offer failed", err);
+      }
+    });
+
+    socket.on("call:renegotiate-answer", (payload: { callId: string; sdp: unknown }) => {
+      try {
+        const call = activeCalls.get(payload.callId);
+        if (!call || (call.callerId !== userId && call.calleeId !== userId)) return;
+        io!.to(otherParty(call, userId)).emit("call:renegotiate-answer", {
+          callId: payload.callId,
+          sdp: payload.sdp,
+        });
+      } catch (err) {
+        console.error("[socket] call:renegotiate-answer failed", err);
+      }
+    });
+
     socket.on("call:reject", (payload: { callId: string }) => {
       try {
         const call = activeCalls.get(payload.callId);

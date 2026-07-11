@@ -1,4 +1,4 @@
-import { ActivityIndicator, View } from "react-native";
+import { ActivityIndicator, StyleSheet, View } from "react-native";
 import { SafeAreaProvider } from "react-native-safe-area-context";
 import { StatusBar } from "expo-status-bar";
 import {
@@ -16,6 +16,8 @@ import ChatScreen from "./src/screens/ChatScreen";
 import ContactsScreen from "./src/screens/ContactsScreen";
 import ContactInfoScreen from "./src/screens/ContactInfoScreen";
 import SettingsScreen from "./src/screens/SettingsScreen";
+import AccountScreen from "./src/screens/AccountScreen";
+import AppearanceScreen from "./src/screens/AppearanceScreen";
 import EditProfileScreen from "./src/screens/EditProfileScreen";
 import EmailEntryScreen from "./src/screens/EmailEntryScreen";
 import OtpScreen from "./src/screens/OtpScreen";
@@ -23,8 +25,9 @@ import NameEntryScreen from "./src/screens/NameEntryScreen";
 import ProfilePhotoScreen from "./src/screens/ProfilePhotoScreen";
 import IncomingCallScreen from "./src/screens/IncomingCallScreen";
 import ActiveCallScreen from "./src/screens/ActiveCallScreen";
-import HeaderAvatarButton from "./src/components/HeaderAvatarButton";
+import ActiveCallBanner from "./src/components/ActiveCallBanner";
 import HeaderAddButton from "./src/components/HeaderAddButton";
+import TabBarAvatar from "./src/components/TabBarAvatar";
 import { AuthProvider, useAuth } from "./src/auth/AuthContext";
 import { MessagingProvider } from "./src/messaging/MessagingContext";
 import { PresenceProvider } from "./src/presence/PresenceContext";
@@ -45,6 +48,7 @@ export type ProfileStackParamList = {
 export type MainTabParamList = {
   Chats: undefined;
   CallHistory: undefined;
+  Settings: undefined;
 };
 
 export type MainStackParamList = {
@@ -52,7 +56,8 @@ export type MainStackParamList = {
   Chat: { conversationId: string };
   Contacts: undefined;
   ContactInfo: { conversationId: string };
-  Settings: undefined;
+  Account: undefined;
+  Appearance: undefined;
   EditProfile: undefined;
   IncomingCall: undefined;
   ActiveCall: undefined;
@@ -69,9 +74,14 @@ function MainTabs() {
   return (
     <Tab.Navigator
       screenOptions={{
-        headerLeft: () => <HeaderAvatarButton />,
         tabBarActiveTintColor: colors.accent,
         tabBarInactiveTintColor: colors.tabInactive,
+        tabBarStyle: {
+          backgroundColor: colors.surface,
+          borderTopColor: colors.border,
+          borderTopWidth: StyleSheet.hairlineWidth,
+        },
+        tabBarLabelStyle: { fontSize: 11, fontWeight: "500" },
       }}
     >
       <Tab.Screen
@@ -79,6 +89,7 @@ function MainTabs() {
         component={ConversationListScreen}
         options={{
           title: "Beacon Chat",
+          tabBarLabel: "Chats",
           headerRight: () => <HeaderAddButton />,
           tabBarIcon: ({ focused, color, size }) => (
             <Ionicons name={focused ? "chatbubbles" : "chatbubbles-outline"} size={size} color={color} />
@@ -90,9 +101,19 @@ function MainTabs() {
         component={CallHistoryScreen}
         options={{
           title: "Call History",
+          tabBarLabel: "Calls",
           tabBarIcon: ({ focused, color, size }) => (
             <Ionicons name={focused ? "call" : "call-outline"} size={size} color={color} />
           ),
+        }}
+      />
+      <Tab.Screen
+        name="Settings"
+        component={SettingsScreen}
+        options={{
+          title: "Settings",
+          tabBarLabel: "Settings",
+          tabBarIcon: ({ focused, color, size }) => <TabBarAvatar focused={focused} color={color} size={size} />,
         }}
       />
     </Tab.Navigator>
@@ -112,30 +133,18 @@ function RootNavigator() {
 
   if (status === "signed-out") {
     return (
-      <AuthStack.Navigator>
-        <AuthStack.Screen
-          name="EmailEntry"
-          component={EmailEntryScreen}
-          options={{ title: "Sign in" }}
-        />
-        <AuthStack.Screen name="Otp" component={OtpScreen} options={{ title: "Verify code" }} />
+      <AuthStack.Navigator screenOptions={{ headerShown: false }}>
+        <AuthStack.Screen name="EmailEntry" component={EmailEntryScreen} />
+        <AuthStack.Screen name="Otp" component={OtpScreen} />
       </AuthStack.Navigator>
     );
   }
 
   if (status === "needs-profile") {
     return (
-      <ProfileStack.Navigator>
-        <ProfileStack.Screen
-          name="NameEntry"
-          component={NameEntryScreen}
-          options={{ title: "Your name" }}
-        />
-        <ProfileStack.Screen
-          name="ProfilePhoto"
-          component={ProfilePhotoScreen}
-          options={{ title: "Your photo" }}
-        />
+      <ProfileStack.Navigator screenOptions={{ headerShown: false }}>
+        <ProfileStack.Screen name="NameEntry" component={NameEntryScreen} />
+        <ProfileStack.Screen name="ProfilePhoto" component={ProfilePhotoScreen} />
       </ProfileStack.Navigator>
     );
   }
@@ -153,7 +162,12 @@ function RootNavigator() {
         component={ContactInfoScreen}
         options={{ title: "Contact Info" }}
       />
-      <MainStack.Screen name="Settings" component={SettingsScreen} options={{ title: "Settings" }} />
+      <MainStack.Screen name="Account" component={AccountScreen} options={{ title: "Account" }} />
+      <MainStack.Screen
+        name="Appearance"
+        component={AppearanceScreen}
+        options={{ title: "Appearance" }}
+      />
       <MainStack.Screen
         name="EditProfile"
         component={EditProfileScreen}
@@ -183,6 +197,7 @@ function ThemedNavigationContainer() {
       theme={scheme === "dark" ? NavDarkTheme : NavDefaultTheme}
     >
       <RootNavigator />
+      <ActiveCallBanner />
       <StatusBar style={scheme === "dark" ? "light" : "dark"} />
     </NavigationContainer>
   );

@@ -81,6 +81,7 @@ export interface CallInfo {
   callId: string;
   conversationId: string;
   peerName: string;
+  peerAvatarUrl: string | null;
   kind: CallKind;
   direction: "outgoing" | "incoming";
 }
@@ -100,6 +101,7 @@ interface CallContextValue {
   isMuted: boolean;
   isSpeakerOn: boolean;
   isCameraOff: boolean;
+  isRemoteCameraOff: boolean;
   callDurationSec: number;
   // True while the OS has taken the audio session away from this call for
   // another one (e.g. a cellular call rang mid-call) — the local mic/camera
@@ -127,6 +129,7 @@ export function CallProvider({ children }: { children: ReactNode }) {
   const [isMuted, setIsMuted] = useState(false);
   const [isSpeakerOn, setIsSpeakerOn] = useState(false);
   const [isCameraOff, setIsCameraOff] = useState(false);
+  const [isRemoteCameraOff, setIsRemoteCameraOff] = useState(false);
   const [callDurationSec, setCallDurationSec] = useState(0);
   const [isSystemInterrupted, setIsSystemInterrupted] = useState(false);
 
@@ -155,6 +158,11 @@ export function CallProvider({ children }: { children: ReactNode }) {
   // didReceiveStartCallAction listener, which is when CallKit/ConnectionService
   // has actually accepted the call attempt (see performOutgoingCallSetup).
   const pendingOutgoingRef = useRef<{ callId: string; conversationId: string; kind: CallKind } | null>(null);
+  // Guards against two concurrent renegotiations (e.g. both sides tapping
+  // the camera button at once) — this app has no perfect-negotiation/glare
+  // handling, so a simple "skip if one is already in flight" is the extent
+  // of the protection rather than queueing/rollback.
+  const renegotiatingRef = useRef(false);
 
   useEffect(() => {
     callRef.current = call;
@@ -248,12 +256,14 @@ export function CallProvider({ children }: { children: ReactNode }) {
       durationIntervalRef.current = null;
     }
     connectedAtRef.current = null;
+    renegotiatingRef.current = false;
     InCallManager.stop();
     setLocalStreamURL(null);
     setRemoteStreamURL(null);
     setIsMuted(false);
     setIsSpeakerOn(false);
-    setIsCameraOff(false);
+    setIsCameraOff(true);
+    setIsRemoteCameraOff(true);
     setCallDurationSec(0);
     setCall(null);
     setPhase("idle");
@@ -339,6 +349,8 @@ export function CallProvider({ children }: { children: ReactNode }) {
         });
         localStreamRef.current = localStream;
         setLocalStreamURL(localStream.toURL());
+        setIsCameraOff(kind !== "video");
+        setIsRemoteCameraOff(kind !== "video");
         InCallManager.start({ media: kind === "video" ? "video" : "audio" });
 
         const pc = createPeerConnection(callId);
@@ -401,6 +413,7 @@ export function CallProvider({ children }: { children: ReactNode }) {
         callId,
         conversationId,
         peerName: conversation.display_name ?? "Unknown",
+        peerAvatarUrl: conversation.avatar_url,
         kind,
         direction: "outgoing",
       };
@@ -465,6 +478,7 @@ export function CallProvider({ children }: { children: ReactNode }) {
       callId: payload.callId,
       conversationId: payload.callerId,
       peerName: conversation?.display_name ?? "Unknown",
+      peerAvatarUrl: conversation?.avatar_url ?? null,
       kind: payload.kind,
       direction: "incoming",
     };
@@ -526,6 +540,8 @@ export function CallProvider({ children }: { children: ReactNode }) {
       });
       localStreamRef.current = localStream;
       setLocalStreamURL(localStream.toURL());
+      setIsCameraOff(invite.kind !== "video");
+      setIsRemoteCameraOff(invite.kind !== "video");
       InCallManager.start({ media: invite.kind === "video" ? "video" : "audio" });
 
       const pc = createPeerConnection(invite.callId);
@@ -606,6 +622,47 @@ export function CallProvider({ children }: { children: ReactNode }) {
     []
   );
 
+  const handleRemoteCameraState = useCallback((payload: { callId: string; cameraOn: boolean }) => {
+    if (callRef.current?.callId !== payload.callId) return;
+    setIsRemoteCameraOff(!payload.cameraOn);
+  }, []);
+
+  // The peer just added a video track to a call that didn't have one from
+  // them before (audio-only call, or their first time enabling camera) —
+  // apply their offer and answer back, same SDP dance as acceptIncomingCall/
+  // handleAnswer but without any of the ringing/phase bookkeeping.
+  const handleRenegotiateOffer = useCallback(
+    async (payload: { callId: string; sdp: { type: string; sdp: string }; kind: CallKind }) => {
+      const pc = peerConnectionRef.current;
+      if (!pc || callRef.current?.callId !== payload.callId) return;
+      try {
+        setCall((prev) => (prev ? { ...prev, kind: payload.kind } : prev));
+        if (payload.kind === "video") setIsRemoteCameraOff(false);
+        await pc.setRemoteDescription(new RTCSessionDescription(payload.sdp));
+        remoteDescriptionSetRef.current = true;
+        await flushPendingCandidates(pc);
+        const answer = await pc.createAnswer();
+        await pc.setLocalDescription(answer);
+        getSocket().emit("call:renegotiate-answer", { callId: payload.callId, sdp: pc.localDescription!.toJSON() });
+      } catch (err) {
+        console.warn("[call] failed to apply renegotiate offer", err);
+      }
+    },
+    [flushPendingCandidates]
+  );
+
+  const handleRenegotiateAnswer = useCallback(async (payload: { callId: string; sdp: { type: string; sdp: string } }) => {
+    const pc = peerConnectionRef.current;
+    if (!pc || callRef.current?.callId !== payload.callId) return;
+    try {
+      await pc.setRemoteDescription(new RTCSessionDescription(payload.sdp));
+    } catch (err) {
+      console.warn("[call] failed to apply renegotiate answer", err);
+    } finally {
+      renegotiatingRef.current = false;
+    }
+  }, []);
+
   const handleRemoteEnd = useCallback(
     (payload: { callId: string; reason: string }) => {
       if (callRef.current?.callId !== payload.callId) return;
@@ -635,13 +692,28 @@ export function CallProvider({ children }: { children: ReactNode }) {
     socket.on("call:answer", handleAnswer);
     socket.on("call:ice-candidate", handleRemoteIceCandidate);
     socket.on("call:end", handleRemoteEnd);
+    socket.on("call:camera-state", handleRemoteCameraState);
+    socket.on("call:renegotiate-offer", handleRenegotiateOffer);
+    socket.on("call:renegotiate-answer", handleRenegotiateAnswer);
     return () => {
       socket.off("call:invite", handleInvite);
       socket.off("call:answer", handleAnswer);
       socket.off("call:ice-candidate", handleRemoteIceCandidate);
       socket.off("call:end", handleRemoteEnd);
+      socket.off("call:camera-state", handleRemoteCameraState);
+      socket.off("call:renegotiate-offer", handleRenegotiateOffer);
+      socket.off("call:renegotiate-answer", handleRenegotiateAnswer);
     };
-  }, [token, handleInvite, handleAnswer, handleRemoteIceCandidate, handleRemoteEnd]);
+  }, [
+    token,
+    handleInvite,
+    handleAnswer,
+    handleRemoteIceCandidate,
+    handleRemoteEnd,
+    handleRemoteCameraState,
+    handleRenegotiateOffer,
+    handleRenegotiateAnswer,
+  ]);
 
   // Mirrors the system's own mute button (car Bluetooth, CallKit's lock
   // screen card) back into our WebRTC track/UI state.
@@ -681,6 +753,16 @@ export function CallProvider({ children }: { children: ReactNode }) {
     return () => listener.remove();
   }, [rejectIncomingCall, endCall]);
 
+  // Tells the peer our outgoing video just turned on/off so they can swap
+  // between our live video and our avatar — shared by the manual camera
+  // toggle and the system-interruption pause/resume below, since both flip
+  // the same track.enabled flag.
+  const emitCameraState = useCallback((cameraOn: boolean) => {
+    const callId = callRef.current?.callId;
+    if (!callId) return;
+    getSocket().emit("call:camera-state", { callId, cameraOn });
+  }, []);
+
   // The core "gracefully manage camera/mic as system resources become
   // available" behavior: when the OS hands our audio session to another
   // call (e.g. a cellular call rings mid-Beacon-call), pause our local
@@ -695,7 +777,11 @@ export function CallProvider({ children }: { children: ReactNode }) {
       wasMutedBeforeInterruptionRef.current = audioTrack ? !audioTrack.enabled : false;
       wasCameraOffBeforeInterruptionRef.current = videoTrack ? !videoTrack.enabled : false;
       if (audioTrack) audioTrack.enabled = false;
-      if (videoTrack) videoTrack.enabled = false;
+      if (videoTrack && videoTrack.enabled) {
+        videoTrack.enabled = false;
+        setIsCameraOff(true);
+        emitCameraState(false);
+      }
       setIsSystemInterrupted(true);
     };
 
@@ -708,7 +794,11 @@ export function CallProvider({ children }: { children: ReactNode }) {
       const audioTrack = localStreamRef.current?.getAudioTracks()[0];
       const videoTrack = localStreamRef.current?.getVideoTracks()[0];
       if (audioTrack && !wasMutedBeforeInterruptionRef.current) audioTrack.enabled = true;
-      if (videoTrack && !wasCameraOffBeforeInterruptionRef.current) videoTrack.enabled = true;
+      if (videoTrack && !wasCameraOffBeforeInterruptionRef.current) {
+        videoTrack.enabled = true;
+        setIsCameraOff(false);
+        emitCameraState(true);
+      }
       setIsSystemInterrupted(false);
     };
 
@@ -718,7 +808,7 @@ export function CallProvider({ children }: { children: ReactNode }) {
       deactivatedListener.remove();
       activatedListener.remove();
     };
-  }, []);
+  }, [emitCameraState]);
 
   const toggleMute = useCallback(() => {
     const track = localStreamRef.current?.getAudioTracks()[0];
@@ -744,12 +834,48 @@ export function CallProvider({ children }: { children: ReactNode }) {
     });
   }, []);
 
-  const toggleCamera = useCallback(() => {
-    const track = localStreamRef.current?.getVideoTracks()[0];
-    if (!track) return;
-    track.enabled = !track.enabled;
-    setIsCameraOff(!track.enabled);
-  }, []);
+  // Two cases: a video call's camera already has a track — just flip
+  // enabled (fast path, unchanged from before). Or this call started
+  // audio-only and has no outgoing video track yet — acquire the camera and
+  // renegotiate to add it, which is also how an audio call becomes a video
+  // call (either side can do this independently).
+  const toggleCamera = useCallback(async () => {
+    const existingTrack = localStreamRef.current?.getVideoTracks()[0];
+    if (existingTrack) {
+      existingTrack.enabled = !existingTrack.enabled;
+      setIsCameraOff(!existingTrack.enabled);
+      emitCameraState(existingTrack.enabled);
+      return;
+    }
+
+    const pc = peerConnectionRef.current;
+    const localStream = localStreamRef.current;
+    const callId = callRef.current?.callId;
+    if (!pc || !localStream || !callId || renegotiatingRef.current) return;
+    renegotiatingRef.current = true;
+    try {
+      const videoStream = await mediaDevices.getUserMedia({ video: { facingMode: "user" } });
+      const videoTrack = videoStream.getVideoTracks()[0];
+      if (!videoTrack) throw new Error("no video track from getUserMedia");
+      localStream.addTrack(videoTrack);
+      pc.addTrack(videoTrack, localStream);
+
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+      getSocket().emit("call:renegotiate-offer", {
+        callId,
+        sdp: pc.localDescription!.toJSON(),
+        kind: "video",
+      });
+
+      setIsCameraOff(false);
+      setCall((prev) => (prev ? { ...prev, kind: "video" } : prev));
+    } catch (err) {
+      console.warn("[call] failed to enable camera", err);
+      Alert.alert("Can't turn on camera", getUserMediaErrorMessage(err));
+      renegotiatingRef.current = false;
+    }
+  }, [emitCameraState]);
 
   const switchCamera = useCallback(() => {
     const track = localStreamRef.current?.getVideoTracks()[0];
@@ -766,6 +892,7 @@ export function CallProvider({ children }: { children: ReactNode }) {
       isMuted,
       isSpeakerOn,
       isCameraOff,
+      isRemoteCameraOff,
       callDurationSec,
       isSystemInterrupted,
       startCall,
@@ -785,6 +912,7 @@ export function CallProvider({ children }: { children: ReactNode }) {
       isMuted,
       isSpeakerOn,
       isCameraOff,
+      isRemoteCameraOff,
       callDurationSec,
       isSystemInterrupted,
       startCall,
