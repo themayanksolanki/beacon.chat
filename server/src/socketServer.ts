@@ -528,9 +528,17 @@ export function createSocketServer(httpServer: HttpServer): Server {
           // io.to(calleeId).emit(...) below is a silent no-op if the callee
           // has zero connected devices — historically that meant no ring,
           // no record anywhere, and the caller just sat through the full
-          // 45s ring timeout before finding out. Persist it instead, so the
-          // callee's device can show a missed-call entry once it reconnects
-          // (see flushMissedCalls) and the caller finds out immediately.
+          // 45s ring timeout before finding out. Persist it as a best-effort
+          // side record so the callee's device can show a missed-call entry
+          // once it reconnects (see flushMissedCalls) — but deliberately
+          // doesn't short-circuit the call itself: isUserOnline is a
+          // presence *heuristic* (keyed off each socket's deviceId bookkeeping),
+          // not a guarantee, and a false negative here used to hard-reject a
+          // call to someone who was actually reachable. Worst case now if
+          // they truly are offline is the caller waits out the same 45s
+          // ring timeout as before this feature existed, instead of an
+          // instant "offline" notice — a much safer failure mode than
+          // rejecting calls to people who are actually online.
           if (!isUserOnline(payload.calleeId)) {
             await recordMissedCall({
               callId: payload.callId,
@@ -538,8 +546,6 @@ export function createSocketServer(httpServer: HttpServer): Server {
               calleeId: payload.calleeId,
               kind: payload.kind,
             });
-            ack?.({ ok: false, error: "recipient_offline" });
-            return;
           }
 
           activeCalls.set(payload.callId, {

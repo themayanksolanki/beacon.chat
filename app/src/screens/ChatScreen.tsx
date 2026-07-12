@@ -517,7 +517,8 @@ interface MessageBubbleProps {
   onCancelSend: (message: MessageRow) => void;
   onSaveMedia: (message: MessageRow) => void;
   onDownload: (message: MessageRow) => void;
-  onOpenMedia: (media: ViewerMedia) => void;
+  /** Opens the full-screen gallery (see MediaViewerModal) — items is every viewable item in this bubble's batch (just 1 for a non-grouped bubble), initialIndex is which one was tapped. */
+  onOpenMedia: (items: ViewerMedia[], initialIndex: number) => void;
   /** Fraction 0..1 of an in-flight attachment upload for this message, if any. */
   uploadProgress?: number;
 }
@@ -654,7 +655,7 @@ function MessageBubble({
                   }
                   onPress={
                     message.image_uri
-                      ? () => onOpenMedia({ type: "image", uri: message.image_uri! })
+                      ? () => onOpenMedia([{ type: "image", uri: message.image_uri! }], 0)
                       : undefined
                   }
                 />
@@ -669,7 +670,9 @@ function MessageBubble({
                       isOutgoing && message.status === "pending" ? () => onCancelSend(message) : undefined
                     }
                     onPress={
-                      message.gif_url ? () => onOpenMedia({ type: "image", uri: message.gif_url! }) : undefined
+                      message.gif_url
+                        ? () => onOpenMedia([{ type: "image", uri: message.gif_url! }], 0)
+                        : undefined
                     }
                   />
                   {/* GIPHY's terms require attribution wherever their content is
@@ -694,7 +697,7 @@ function MessageBubble({
                   }
                   onExpand={
                     message.video_uri
-                      ? () => onOpenMedia({ type: "video", uri: message.video_uri! })
+                      ? () => onOpenMedia([{ type: "video", uri: message.video_uri! }], 0)
                       : undefined
                   }
                 />
@@ -764,7 +767,8 @@ interface AlbumBubbleProps {
   onCancelSend: (message: MessageRow) => void;
   onSaveMedia: (message: MessageRow) => void;
   onDownload: (message: MessageRow) => void;
-  onOpenMedia: (media: ViewerMedia) => void;
+  /** Opens the full-screen gallery (see MediaViewerModal) — items is every viewable item in this bubble's batch (just 1 for a non-grouped bubble), initialIndex is which one was tapped. */
+  onOpenMedia: (items: ViewerMedia[], initialIndex: number) => void;
   /** Fraction 0..1 per in-flight attachment upload, keyed by message id — same map ChatScreen keeps for single bubbles. */
   uploadProgressById: Record<string, number>;
 }
@@ -803,6 +807,22 @@ function AlbumBubble({
   const anyFailedToSend = messages.some((m) => m.status === "failed");
   const anyFailedToDownload = messages.some((m) => m.media_status === "download_failed");
 
+  // Every viewable item in this batch, not just the up-to-4 shown in the grid
+  // — the gallery (see MediaViewerModal) needs the full set so tapping the
+  // grid's "+N" overflow cell (or any cell) can still swipe to every image/
+  // video that was sent together, not just the ones visible on screen.
+  const readyItems: ViewerMedia[] = [];
+  const readyIndexByMessageId = new Map<string, number>();
+  for (const message of messages) {
+    if (message.deleted_at) continue;
+    const itemKind: "image" | "video" = message.kind === "video" ? "video" : "image";
+    const itemUri =
+      message.kind === "video" ? message.video_uri : message.kind === "gif" ? message.gif_url : message.image_uri;
+    if (!itemUri) continue;
+    readyIndexByMessageId.set(message.id, readyItems.length);
+    readyItems.push({ type: itemKind, uri: itemUri });
+  }
+
   const cells: AlbumCellData[] = messages.map((message, index) => {
     const isDeleted = !!message.deleted_at;
     const kind: "image" | "video" = message.kind === "video" ? "video" : "image";
@@ -814,13 +834,14 @@ function AlbumBubble({
           ? message.gif_url
           : message.image_uri;
     const isSending = isOutgoing && message.status === "pending";
+    const readyIndex = readyIndexByMessageId.get(message.id);
 
     const onPress = isDeleted
       ? undefined
       : kind === "video" && !message.video_uri
         ? () => onDownload(message)
-        : uri
-          ? () => onOpenMedia({ type: kind, uri })
+        : uri && readyIndex !== undefined
+          ? () => onOpenMedia(readyItems, readyIndex)
           : undefined;
 
     const onLongPress = isDeleted
@@ -1244,10 +1265,16 @@ export default function ChatScreen({ route, navigation }: Props) {
     actions: MessageAction[];
     anchor: MessageMenuAnchor;
   } | null>(null);
-  // Full-screen image/video viewer opened by tapping a media bubble — see
-  // MediaViewerModal.
-  const [viewerMedia, setViewerMedia] = useState<ViewerMedia | null>(null);
-  const onOpenMedia = useCallback((media: ViewerMedia) => setViewerMedia(media), []);
+  // Full-screen gallery opened by tapping a media bubble or album cell — see
+  // MediaViewerModal. items is every viewable item in that bubble's batch
+  // (just 1 for a non-grouped bubble), so the gallery can swipe across an
+  // entire album regardless of how many of its cells are actually visible in
+  // the grid.
+  const [viewerGallery, setViewerGallery] = useState<{ items: ViewerMedia[]; initialIndex: number } | null>(null);
+  const onOpenMedia = useCallback(
+    (items: ViewerMedia[], initialIndex: number) => setViewerGallery({ items, initialIndex }),
+    []
+  );
   const listRef = useRef<FlatList<ListItem>>(null);
   const readSentRef = useRef<Set<string>>(new Set());
 
@@ -2523,7 +2550,11 @@ export default function ChatScreen({ route, navigation }: Props) {
         onClose={() => setMenu(null)}
       />
 
-      <MediaViewerModal media={viewerMedia} onClose={() => setViewerMedia(null)} />
+      <MediaViewerModal
+        items={viewerGallery?.items ?? []}
+        initialIndex={viewerGallery?.initialIndex ?? 0}
+        onClose={() => setViewerGallery(null)}
+      />
 
       {replyingTo ? (
         <View style={styles.replyBanner}>
