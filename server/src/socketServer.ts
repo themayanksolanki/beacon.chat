@@ -6,7 +6,9 @@ import {
   deleteMessageForEveryone,
   getUndeliveredMessages,
   getUndeliveredReactions,
+  getUnsyncedMessageStatus,
   markDelivered,
+  markMessageStatusSynced,
   markReactionDelivered,
   markRead,
   setReactions,
@@ -14,6 +16,7 @@ import {
   userExists,
   type OutgoingEnvelope,
 } from "./messages";
+import { getUnsyncedMissedCalls, markMissedCallsSynced, recordMissedCall } from "./calls";
 import { getLastSeen, setLastSeen } from "./presence";
 import { setDeviceLastSeen } from "./devices";
 import { acceptContact, isAcceptedContact, rejectContact, requestContact, type RejectAction } from "./contacts";
@@ -40,13 +43,32 @@ interface ActiveCall {
 const activeCalls = new Map<string, ActiveCall>();
 const userActiveCall = new Map<string, string>();
 
+// How long an in-progress call is given to survive a signaling-socket
+// disconnect before it's actually torn down — see the disconnect handler
+// below for why this exists. Long enough to ride out a brief network blip
+// (switching WiFi/cellular, the OS briefly suspending the socket in the
+// background) without either side noticing; short enough that a genuinely
+// dead client doesn't leave the other party's UI hung, and doesn't leave
+// userActiveCall's "busy" flag stuck for long if the call really is over.
+const CALL_DISCONNECT_GRACE_MS = 8000;
+const pendingCallDisconnectTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
 function otherParty(call: ActiveCall, userId: string): string {
   return userId === call.callerId ? call.calleeId : call.callerId;
+}
+
+function clearPendingCallDisconnect(callId: string): void {
+  const timer = pendingCallDisconnectTimers.get(callId);
+  if (timer) {
+    clearTimeout(timer);
+    pendingCallDisconnectTimers.delete(callId);
+  }
 }
 
 function endActiveCall(callId: string, io: Server, reason: string, notify: string[]): void {
   const call = activeCalls.get(callId);
   if (!call) return;
+  clearPendingCallDisconnect(callId);
   activeCalls.delete(callId);
   userActiveCall.delete(call.callerId);
   userActiveCall.delete(call.calleeId);
@@ -97,6 +119,41 @@ async function flushUndelivered(socket: AuthedSocket, deviceId: string): Promise
     socket.emit("reaction:set", reaction);
     void markReactionDelivered(reaction.message_id, reaction.sender_id, reaction.recipient_device_id);
   }
+}
+
+/**
+ * Delivery/read receipts this user's messages picked up while THEY were the
+ * one offline — the live emit in message:delivered/message:read below is a
+ * no-op if the sender has no connected socket at that instant, and unlike
+ * flushUndelivered's messages there's no per-device targeting here, so any
+ * one of the sender's devices reconnecting is enough to catch this back up.
+ * Re-emits the exact same event shape as the live path, so the client's
+ * existing onDelivered/onRead handlers need no changes.
+ */
+async function flushMessageStatus(socket: AuthedSocket, userId: string): Promise<void> {
+  const updates = await getUnsyncedMessageStatus(userId);
+  for (const update of updates) {
+    if (update.readAt !== null) {
+      socket.emit("message:read", { id: update.id, readAt: update.readAt });
+    } else if (update.deliveredAt !== null) {
+      socket.emit("message:delivered", { id: update.id, deliveredAt: update.deliveredAt });
+    }
+  }
+  if (updates.length > 0) await markMessageStatusSynced(userId);
+}
+
+/**
+ * Calls placed while this user had zero connected devices (see
+ * recordMissedCall at call:invite below) — same resync-on-reconnect shape as
+ * flushUndelivered/flushMessageStatus, so the callee's device gets a missed-
+ * call entry for it once they're back online instead of never at all.
+ */
+async function flushMissedCalls(socket: AuthedSocket, userId: string): Promise<void> {
+  const missed = await getUnsyncedMissedCalls(userId);
+  for (const call of missed) {
+    socket.emit("call:missed", call);
+  }
+  if (missed.length > 0) await markMissedCallsSynced(userId);
 }
 
 export function createSocketServer(httpServer: HttpServer): Server {
@@ -155,6 +212,13 @@ export function createSocketServer(httpServer: HttpServer): Server {
       }
     }
 
+    // Reconnecting mid-call (see the disconnect handler's grace window)
+    // cancels the pending teardown outright rather than waiting for it to
+    // expire and no-op — the call just carries on as if the blip never
+    // happened.
+    const activeCallId = userActiveCall.get(userId);
+    if (activeCallId) clearPendingCallDisconnect(activeCallId);
+
     // Fire-and-forget, deliberately not awaited: every socket.on(...) listener
     // below must be registered synchronously, in this same tick, before
     // control ever yields to the event loop. Awaiting here first would leave
@@ -162,6 +226,8 @@ export function createSocketServer(httpServer: HttpServer): Server {
     // exist — where anything the client emits immediately (as a fast test or
     // a real client racing to reconnect might) is silently dropped.
     if (socket.deviceId) void flushUndelivered(socket, socket.deviceId);
+    void flushMessageStatus(socket, userId);
+    void flushMissedCalls(socket, userId);
 
     socket.on(
       "message:send",
@@ -213,7 +279,7 @@ export function createSocketServer(httpServer: HttpServer): Server {
     socket.on("message:delivered", async (payload: { id: string }) => {
       try {
         if (!socket.deviceId) return;
-        const result = await markDelivered(payload.id, socket.deviceId, userId);
+        const result = await markDelivered(payload.id, socket.deviceId, userId, isUserOnline);
         if (!result.ok) return;
         io!.to(result.senderId).emit("message:delivered", { id: payload.id, deliveredAt: result.at });
       } catch (err) {
@@ -224,7 +290,7 @@ export function createSocketServer(httpServer: HttpServer): Server {
     socket.on("message:read", async (payload: { id: string }) => {
       try {
         if (!socket.deviceId) return;
-        const result = await markRead(payload.id, socket.deviceId, userId);
+        const result = await markRead(payload.id, socket.deviceId, userId, isUserOnline);
         if (!result.ok) return;
         io!.to(result.senderId).emit("message:read", { id: payload.id, readAt: result.at });
       } catch (err) {
@@ -459,6 +525,22 @@ export function createSocketServer(httpServer: HttpServer): Server {
             ack?.({ ok: false, error: "busy" });
             return;
           }
+          // io.to(calleeId).emit(...) below is a silent no-op if the callee
+          // has zero connected devices — historically that meant no ring,
+          // no record anywhere, and the caller just sat through the full
+          // 45s ring timeout before finding out. Persist it instead, so the
+          // callee's device can show a missed-call entry once it reconnects
+          // (see flushMissedCalls) and the caller finds out immediately.
+          if (!isUserOnline(payload.calleeId)) {
+            await recordMissedCall({
+              callId: payload.callId,
+              callerId: userId,
+              calleeId: payload.calleeId,
+              kind: payload.kind,
+            });
+            ack?.({ ok: false, error: "recipient_offline" });
+            return;
+          }
 
           activeCalls.set(payload.callId, {
             callId: payload.callId,
@@ -607,10 +689,28 @@ export function createSocketServer(httpServer: HttpServer): Server {
     });
 
     socket.on("disconnect", () => {
+      // Ending the call synchronously here on every disconnect used to mean
+      // a plain signaling-socket blip (switching WiFi/cellular, the OS
+      // suspending the socket briefly in the background — both routine on
+      // Android mid-call) killed the call outright, even though the actual
+      // WebRTC media session doesn't depend on this socket staying up once
+      // negotiated. Worse, on a multi-device account this fired from ANY of
+      // the user's sockets dropping, including one that had nothing to do
+      // with the call in progress on another device. Give it a grace window
+      // instead — only actually end the call if this user is still not back
+      // online (any device) once it elapses; a reconnect within that window
+      // (below, in the connection handler) cancels it outright.
       const callId = userActiveCall.get(userId);
-      if (callId) {
-        const call = activeCalls.get(callId);
-        if (call) endActiveCall(callId, io!, "disconnected", [otherParty(call, userId)]);
+      if (callId && !pendingCallDisconnectTimers.has(callId)) {
+        const disconnectedUserId = userId;
+        const timer = setTimeout(() => {
+          pendingCallDisconnectTimers.delete(callId);
+          const call = activeCalls.get(callId);
+          if (!call) return; // already ended normally (call:end/call:reject) in the meantime
+          if (isUserOnline(disconnectedUserId)) return; // reconnected in time — let the call continue
+          endActiveCall(callId, io!, "disconnected", [otherParty(call, disconnectedUserId)]);
+        }, CALL_DISCONNECT_GRACE_MS);
+        pendingCallDisconnectTimers.set(callId, timer);
       }
 
       if (!socket.deviceId) return;

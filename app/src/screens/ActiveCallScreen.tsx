@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { Alert, Pressable, StyleSheet, Text, View } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { Ionicons } from "@expo/vector-icons";
@@ -58,16 +58,28 @@ export default function ActiveCallScreen() {
     }
   });
 
-  if (!call) return null;
-
   // Remote and local video visibility are tracked independently: whether
   // *my* camera is on shouldn't hide the peer's video on my own screen, and
   // vice versa (isRemoteCameraOff comes from the peer's call:camera-state).
-  const remoteVideoActive = call.kind === "video" && !isRemoteCameraOff && !!remoteStreamURL;
-  const localVideoActive = call.kind === "video" && !isCameraOff && !!localStreamURL;
-  const showRemotePrimary = remoteVideoActive;
-  const showLocalPrimary = !showRemotePrimary && localVideoActive;
-  const showLocalPip = showRemotePrimary && localVideoActive;
+  const remoteVideoActive = call?.kind === "video" && !isRemoteCameraOff && !!remoteStreamURL;
+  const localVideoActive = call?.kind === "video" && !isCameraOff && !!localStreamURL;
+  // Only meaningful to swap which side is "big" when both feeds are actually
+  // on screen — with only one active there's nothing to swap it with.
+  const bothVideoActive = remoteVideoActive && localVideoActive;
+
+  // Which feed is currently shown big vs. as the small tappable preview —
+  // starts (and resets) at "peer big, me small" every time both feeds become
+  // available, so a swap from earlier in the call doesn't linger once the
+  // other side's camera toggles off and back on.
+  const [swapped, setSwapped] = useState(false);
+  useEffect(() => {
+    if (!bothVideoActive) setSwapped(false);
+  }, [bothVideoActive]);
+
+  if (!call) return null;
+
+  const showRemotePrimary = bothVideoActive ? !swapped : remoteVideoActive;
+  const showLocalPrimary = bothVideoActive ? swapped : !remoteVideoActive && localVideoActive;
 
   const minimizeToPip = () => {
     const entered = ExpoCallPip.enterPipMode(PIP_ASPECT_RATIO.width, PIP_ASPECT_RATIO.height);
@@ -76,8 +88,21 @@ export default function ActiveCallScreen() {
     }
   };
 
-  const minimizeToChat = () => {
-    if (navigationRef.isReady()) navigationRef.goBack();
+  // Pops back to whatever screen was underneath (Chat, a conversation list,
+  // etc.) — the call itself lives in CallContext, independent of this
+  // screen's mount state, so it keeps running behind that screen and the
+  // floating widget (see FloatingCallWidget) takes over as the way back in.
+  // Falls back to the main tabs on the rare cold-start path where this
+  // screen has no history behind it (e.g. a CallKeep-answered call launched
+  // the app directly into it) — without this, goBack() would silently no-op
+  // and the button would look broken.
+  const minimize = () => {
+    if (!navigationRef.isReady()) return;
+    if (navigationRef.canGoBack()) {
+      navigationRef.goBack();
+    } else {
+      navigationRef.navigate("MainTabs");
+    }
   };
 
   return (
@@ -98,30 +123,37 @@ export default function ActiveCallScreen() {
         </View>
       )}
 
-      {showLocalPip ? (
-        <View style={[styles.localPreview, { top: insets.top + 16 }]}>
+      {bothVideoActive ? (
+        <Pressable
+          style={[styles.localPreview, { top: insets.top + 16 }]}
+          onPress={() => setSwapped((prev) => !prev)}
+        >
           {/* zOrder=1 puts this PIP's SurfaceView above the fullscreen RTCView's —
               on Android, RTCView renders via a real SurfaceView composited outside
               normal view draw order, so two overlapping RTCViews left at the same
               (default 0) zOrder z-fight/flicker against each other. */}
-          <RTCView
-            streamURL={localStreamURL!}
-            style={StyleSheet.absoluteFill}
-            objectFit="cover"
-            mirror={isFrontCamera}
-            zOrder={1}
-          />
-        </View>
+          {swapped ? (
+            <RTCView streamURL={remoteStreamURL!} style={StyleSheet.absoluteFill} objectFit="cover" zOrder={1} />
+          ) : (
+            <RTCView
+              streamURL={localStreamURL!}
+              style={StyleSheet.absoluteFill}
+              objectFit="cover"
+              mirror={isFrontCamera}
+              zOrder={1}
+            />
+          )}
+        </Pressable>
       ) : null}
 
       <View style={[styles.topOverlay, { paddingTop: insets.top + 16 }]}>
         {phase === "connected" ? (
-          <Pressable style={styles.minimizeButton} onPress={minimizeToChat} hitSlop={8}>
+          <Pressable style={[styles.minimizeButton, { top: insets.top + 16 }]} onPress={minimize} hitSlop={8}>
             <Ionicons name="chevron-down" size={20} color={palette.text} />
           </Pressable>
         ) : null}
         {pipSupported ? (
-          <Pressable style={styles.pipButton} onPress={minimizeToPip} hitSlop={8}>
+          <Pressable style={[styles.pipButton, { top: insets.top + 16 }]} onPress={minimizeToPip} hitSlop={8}>
             <Ionicons name="contract-outline" size={20} color={palette.text} />
           </Pressable>
         ) : null}
@@ -193,7 +225,7 @@ const styles = StyleSheet.create({
     position: "absolute",
     right: 16,
     width: 96,
-    height: 140,
+    height: 170,
     borderRadius: 12,
     overflow: "hidden",
     backgroundColor: "#000",
@@ -203,7 +235,6 @@ const styles = StyleSheet.create({
   topOverlay: { position: "absolute", top: 0, left: 0, right: 0, alignItems: "center" },
   minimizeButton: {
     position: "absolute",
-    top: 20,
     left: 20,
     width: 36,
     height: 36,
@@ -214,10 +245,9 @@ const styles = StyleSheet.create({
   },
   pipButton: {
     position: "absolute",
-    top: 0,
     right: 20,
     width: 36,
-    height: 36,
+    height: 80,
     borderRadius: 18,
     alignItems: "center",
     justifyContent: "center",

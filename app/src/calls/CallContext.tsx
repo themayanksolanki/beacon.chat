@@ -24,16 +24,34 @@ import {
 import {
   getConversationById,
   insertCall,
+  insertCallIfAbsent,
   isUserBlocked,
   updateCallOutcome,
   type CallKind,
   type CallStatus,
 } from "../db/database";
+import { notifyConversationActivity } from "../chat/conversationActivity";
 import { getSocket } from "../network/socket";
 import { useAuth } from "../auth/AuthContext";
 import { dismissCallScreen, navigationRef } from "../navigation/navigationRef";
 
-const ICE_SERVERS = [{ urls: "stun:stun.l.google.com:19302" }, { urls: "stun:stun1.l.google.com:19302" }];
+// STUN alone only gets two peers connected directly when at least one side's
+// NAT allows it — very common failure mode on Android is a carrier's
+// cellular network doing symmetric/CGNAT-style NAT, where STUN can't
+// discover a usable public mapping at all and ICE gathering just comes up
+// empty (the call then times out or connects one-way). A TURN server relays
+// media through itself as a fallback for exactly that case — optional here
+// since it needs real infrastructure/credentials (a provider like Twilio,
+// Xirsys, or a self-hosted coturn), added to the ICE server list only if
+// configured so the STUN-only default is unchanged without it.
+const TURN_URL = process.env.EXPO_PUBLIC_TURN_URL;
+const TURN_USERNAME = process.env.EXPO_PUBLIC_TURN_USERNAME;
+const TURN_CREDENTIAL = process.env.EXPO_PUBLIC_TURN_CREDENTIAL;
+const ICE_SERVERS = [
+  { urls: "stun:stun.l.google.com:19302" },
+  { urls: "stun:stun1.l.google.com:19302" },
+  ...(TURN_URL ? [{ urls: TURN_URL, username: TURN_USERNAME, credential: TURN_CREDENTIAL }] : []),
+];
 const RING_TIMEOUT_MS = 45000;
 // Some environments (e.g. Android with a self-managed phone account the user
 // hasn't authorized yet) accept RNCallKeep.startCall() without ever firing
@@ -306,6 +324,9 @@ export function CallProvider({ children }: { children: ReactNode }) {
     } else {
       updateCallOutcome(info.callId, status, null, now);
     }
+    // The finalized outcome/duration can change what the conversation list
+    // shows as this conversation's last activity — see conversationActivity.ts.
+    notifyConversationActivity();
   }, []);
 
   const cleanup = useCallback(() => {
@@ -503,6 +524,7 @@ export function CallProvider({ children }: { children: ReactNode }) {
         answered_at: null,
         ended_at: null,
       });
+      notifyConversationActivity();
 
       if (!callKeepReadyRef.current) {
         void performOutgoingCallSetup(callId, conversationId, kind);
@@ -588,6 +610,7 @@ export function CallProvider({ children }: { children: ReactNode }) {
       answered_at: null,
       ended_at: null,
     });
+    notifyConversationActivity();
 
     // Registers the call with CallKit/ConnectionService so the OS is aware
     // of it — this is what makes a simultaneous cellular call (or another
@@ -806,6 +829,31 @@ export function CallProvider({ children }: { children: ReactNode }) {
     [cleanup, clearRingTimeout, logCallOutcome]
   );
 
+  // A call placed while we had zero connected devices — the caller's
+  // call:invite never reached us live (see socketServer.ts's call:invite
+  // handler and the Call model comment in schema.prisma), so there's no
+  // ringing/CallKit/phase to drive here, just backfilling the log entry we
+  // missed. Guarded with insertCallIfAbsent (not insertCall) since the
+  // server may legitimately re-deliver this if more than one of our devices
+  // reconnects around the same time.
+  const handleMissedCall = useCallback(
+    (payload: { call_id: string; caller_id: string; kind: CallKind; created_at: number }) => {
+      if (isUserBlocked(payload.caller_id)) return;
+      insertCallIfAbsent({
+        id: payload.call_id,
+        conversation_id: payload.caller_id,
+        direction: "incoming",
+        kind: payload.kind,
+        status: "missed",
+        started_at: payload.created_at,
+        answered_at: null,
+        ended_at: payload.created_at,
+      });
+      notifyConversationActivity();
+    },
+    []
+  );
+
   useEffect(() => {
     if (!token) return;
     const socket = getSocket();
@@ -818,6 +866,7 @@ export function CallProvider({ children }: { children: ReactNode }) {
     socket.on("call:mute-state", handleRemoteMuteState);
     socket.on("call:renegotiate-offer", handleRenegotiateOffer);
     socket.on("call:renegotiate-answer", handleRenegotiateAnswer);
+    socket.on("call:missed", handleMissedCall);
     return () => {
       socket.off("call:invite", handleInvite);
       socket.off("call:answer", handleAnswer);
@@ -828,6 +877,7 @@ export function CallProvider({ children }: { children: ReactNode }) {
       socket.off("call:mute-state", handleRemoteMuteState);
       socket.off("call:renegotiate-offer", handleRenegotiateOffer);
       socket.off("call:renegotiate-answer", handleRenegotiateAnswer);
+      socket.off("call:missed", handleMissedCall);
     };
   }, [
     token,
@@ -840,6 +890,7 @@ export function CallProvider({ children }: { children: ReactNode }) {
     handleRemoteMuteState,
     handleRenegotiateOffer,
     handleRenegotiateAnswer,
+    handleMissedCall,
   ]);
 
   // Tells the peer our mic just muted/unmuted — shared by the in-app mute

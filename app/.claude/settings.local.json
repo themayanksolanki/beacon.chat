@@ -27,7 +27,9 @@
       "Bash(adb logcat *)",
       "Bash(echo \"started logcat capture in background, pid $!\")",
       "Bash(kill %1)",
-      "Bash(lsof -i :8081 -sTCP:LISTEN)"
+      "Bash(lsof -i :8081 -sTCP:LISTEN)",
+      "Bash(python3 -c \"import json,sys; d=json.load\\(sys.stdin\\); print\\('\\\\n'.join\\(sorted\\(list\\(d.get\\('dependencies',{}\\).keys\\(\\)\\)\\)\\)\\)\")",
+      "Bash(grep -iE \"^react-native-gesture-handler$|^react-native-reanimated$\")"
     ]
   }
 }

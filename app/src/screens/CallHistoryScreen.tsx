@@ -1,4 +1,4 @@
-import { useCallback, useMemo, useState } from "react";
+import { useCallback, useMemo, useRef, useState } from "react";
 import { FlatList, Pressable, StyleSheet, Text, View } from "react-native";
 import { useFocusEffect } from "@react-navigation/native";
 import type { BottomTabScreenProps } from "@react-navigation/bottom-tabs";
@@ -8,7 +8,8 @@ import { Ionicons } from "@expo/vector-icons";
 
 import type { MainStackParamList, MainTabParamList } from "../../App";
 import { useCall } from "../calls/CallContext";
-import { getCallHistory, type CallHistoryEntry } from "../db/database";
+import { deleteCall, getCallHistory, type CallHistoryEntry } from "../db/database";
+import MessageActionMenu, { type MessageAction, type MessageMenuAnchor } from "../components/MessageActionMenu";
 import { useTheme } from "../ThemeContext";
 import { colorForName, initialFor, type ThemeColors } from "../theme";
 
@@ -60,11 +61,48 @@ export default function CallHistoryScreen({ navigation }: Props) {
   const themedStyles = useMemo(() => createStyles(colors), [colors]);
   const { startCall } = useCall();
   const [history, setHistory] = useState<CallHistoryEntry[]>([]);
+  const rowRefs = useRef<Map<string, View>>(new Map());
+  const [menu, setMenu] = useState<{
+    entry: CallHistoryEntry;
+    actions: MessageAction[];
+    anchor: MessageMenuAnchor;
+  } | null>(null);
 
   useFocusEffect(
     useCallback(() => {
       setHistory(getCallHistory());
     }, [])
+  );
+
+  const openMenuFor = useCallback(
+    (entry: CallHistoryEntry) => {
+      const row = rowRefs.current.get(entry.id);
+      row?.measureInWindow((x, y, width, height) => {
+        const actions: MessageAction[] = [
+          {
+            label: "Call",
+            icon: entry.kind === "video" ? "videocam-outline" : "call-outline",
+            onPress: () => startCall(entry.conversation_id, entry.kind),
+          },
+          {
+            label: "Message",
+            icon: "chatbubble-outline",
+            onPress: () => navigation.navigate("Chat", { conversationId: entry.conversation_id }),
+          },
+          {
+            label: "Delete",
+            icon: "trash-outline",
+            destructive: true,
+            onPress: () => {
+              deleteCall(entry.id);
+              setHistory((prev) => prev.filter((row) => row.id !== entry.id));
+            },
+          },
+        ];
+        setMenu({ entry, actions, anchor: { x, y, width, height } });
+      });
+    },
+    [navigation, startCall]
   );
 
   return (
@@ -84,8 +122,13 @@ export default function CallHistoryScreen({ navigation }: Props) {
             const isMissedLike = item.status === "missed" || item.status === "declined" || item.status === "failed";
             return (
               <Pressable
+                ref={(el) => {
+                  if (el) rowRefs.current.set(item.id, el);
+                  else rowRefs.current.delete(item.id);
+                }}
                 style={themedStyles.row}
                 onPress={() => navigation.navigate("Chat", { conversationId: item.conversation_id })}
+                onLongPress={() => openMenuFor(item)}
               >
                 <View style={[themedStyles.avatar, { backgroundColor: colorForName(name) }]}>
                   <Text style={themedStyles.avatarText}>{initialFor(name)}</Text>
@@ -118,6 +161,14 @@ export default function CallHistoryScreen({ navigation }: Props) {
           }}
         />
       )}
+
+      <MessageActionMenu
+        visible={!!menu}
+        anchor={menu?.anchor ?? null}
+        actions={menu?.actions ?? []}
+        align="left"
+        onClose={() => setMenu(null)}
+      />
     </View>
   );
 }

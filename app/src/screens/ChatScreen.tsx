@@ -37,7 +37,9 @@ import AttachmentSheet from "../components/AttachmentSheet";
 import Avatar from "../components/Avatar";
 import FileMessageBubble from "../components/FileMessageBubble";
 import EmojiGifTray from "../components/EmojiGifTray";
+import AlbumGrid, { type AlbumCellData } from "../components/AlbumGrid";
 import ImageMessageBubble from "../components/ImageMessageBubble";
+import MediaViewerModal, { type ViewerMedia } from "../components/MediaViewerModal";
 import MessageActionMenu, { type MessageAction, type MessageMenuAnchor } from "../components/MessageActionMenu";
 import VideoMessageBubble from "../components/VideoMessageBubble";
 import VoiceMessageBubble from "../components/VoiceMessageBubble";
@@ -131,6 +133,10 @@ const NO_MEDIA_FIELDS = {
   media_key: null,
   media_nonce: null,
   media_status: "ready",
+  // Only ever set on a multi-select image/video batch (see
+  // pickAndSendAttachment) — none of the kinds this is spread into
+  // (text/voice/gif/legacy inline image) can be part of one.
+  album_id: null,
 } as const;
 
 type Props = NativeStackScreenProps<MainStackParamList, "Chat">;
@@ -314,6 +320,7 @@ function RequestActionBanner({
 type ListItem =
   | { type: "separator"; id: string; label: string }
   | { type: "message"; id: string; message: MessageRow; isGroupEnd: boolean }
+  | { type: "album"; id: string; messages: MessageRow[]; isGroupEnd: boolean }
   | { type: "call"; id: string; call: CallRow };
 
 type ChatEntry =
@@ -323,12 +330,19 @@ type ChatEntry =
 /**
  * Consecutive messages from the same side are visually grouped (tighter
  * spacing, tail corner only on the last one) — a day boundary, a call log
- * entry, or a change in direction always ends a group.
+ * entry, or a change in direction always ends a group. Separately, a run of
+ * 2+ consecutive messages sharing the same non-null album_id (a multi-select
+ * image/video batch — see pickAndSendAttachment) collapses into one "album"
+ * item so it renders as a single WhatsApp-style grid bubble (see
+ * AlbumBubble) instead of one bubble per file. A lone message that happens
+ * to carry an album_id (e.g. the rest of its batch got deleted) just renders
+ * as a normal single bubble.
  */
 function buildListItems(entries: ChatEntry[]): ListItem[] {
   const items: ListItem[] = [];
   let lastLabel: string | null = null;
-  for (let i = 0; i < entries.length; i++) {
+  let i = 0;
+  while (i < entries.length) {
     const entry = entries[i];
     const label = dayLabel(entry.ts);
     if (label !== lastLabel) {
@@ -337,15 +351,37 @@ function buildListItems(entries: ChatEntry[]): ListItem[] {
     }
     if (entry.kind === "call") {
       items.push({ type: "call", id: entry.call.id, call: entry.call });
+      i++;
       continue;
     }
-    const next = entries[i + 1];
+
+    const albumId = entry.message.album_id;
+    let runEnd = i + 1;
+    if (albumId) {
+      while (
+        runEnd < entries.length &&
+        entries[runEnd].kind === "message" &&
+        (entries[runEnd] as { kind: "message"; ts: number; message: MessageRow }).message.album_id === albumId
+      ) {
+        runEnd++;
+      }
+    }
+    const runLength = runEnd - i;
+
+    const next = entries[runEnd];
     const isGroupEnd =
       !next ||
       next.kind !== "message" ||
       next.message.direction !== entry.message.direction ||
       dayLabel(next.ts) !== label;
-    items.push({ type: "message", id: entry.message.id, message: entry.message, isGroupEnd });
+
+    if (albumId && runLength > 1) {
+      const messages = entries.slice(i, runEnd).map((e) => (e as { kind: "message"; message: MessageRow }).message);
+      items.push({ type: "album", id: `album-${albumId}`, messages, isGroupEnd });
+    } else {
+      items.push({ type: "message", id: entry.message.id, message: entry.message, isGroupEnd });
+    }
+    i = runEnd;
   }
   return items;
 }
@@ -417,6 +453,56 @@ function StatusTicks({ status }: { status: MessageRow["status"] }) {
   return <Ionicons name="checkmark-done" size={15} color={colors.tickRead} />;
 }
 
+/**
+ * Builds the long-press action list for a single message — shared by
+ * MessageBubble (one bubble) and AlbumBubble (one grid cell per message, see
+ * below) so both get the same Reply/Copy/Save/Info/Pin/Delete set.
+ */
+function buildMessageActions(
+  message: MessageRow,
+  callbacks: {
+    onReply: (message: MessageRow) => void;
+    onCopy: (message: MessageRow) => void;
+    onSaveMedia: (message: MessageRow) => void;
+    onPin: (message: MessageRow) => void;
+    onUnpin: (message: MessageRow) => void;
+    onDeleteForEveryone: (message: MessageRow) => void;
+    onDelete: (message: MessageRow) => void;
+  }
+): MessageAction[] {
+  const { onReply, onCopy, onSaveMedia, onPin, onUnpin, onDeleteForEveryone, onDelete } = callbacks;
+  const isOutgoing = message.direction === "outgoing";
+  const isPinned = !!message.pinned_at;
+  const canDeleteForEveryone =
+    isOutgoing && !message.deleted_at && Date.now() - message.sent_at <= DELETE_FOR_EVERYONE_WINDOW_MS;
+
+  const actions: MessageAction[] = [
+    { label: "Reply", icon: "arrow-undo-outline", onPress: () => onReply(message) },
+    { label: "Copy", icon: "copy-outline", onPress: () => onCopy(message) },
+  ];
+  if (message.kind !== "text" && isDownloadAvailable()) {
+    actions.push({ label: "Save to device", icon: "download-outline", onPress: () => onSaveMedia(message) });
+  }
+  if (isOutgoing) {
+    actions.push({ label: "Info", icon: "information-circle-outline", onPress: () => showTimingInfo(message) });
+  }
+  actions.push({
+    label: isPinned ? "Unpin" : "Pin",
+    icon: isPinned ? "pin" : "pin-outline",
+    onPress: () => (isPinned ? onUnpin(message) : onPin(message)),
+  });
+  if (canDeleteForEveryone) {
+    actions.push({
+      label: "Delete for everyone",
+      icon: "trash-outline",
+      destructive: true,
+      onPress: () => onDeleteForEveryone(message),
+    });
+  }
+  actions.push({ label: "Delete for me", icon: "trash-outline", destructive: true, onPress: () => onDelete(message) });
+  return actions;
+}
+
 interface MessageBubbleProps {
   message: MessageRow;
   isGroupEnd: boolean;
@@ -431,6 +517,7 @@ interface MessageBubbleProps {
   onCancelSend: (message: MessageRow) => void;
   onSaveMedia: (message: MessageRow) => void;
   onDownload: (message: MessageRow) => void;
+  onOpenMedia: (media: ViewerMedia) => void;
   /** Fraction 0..1 of an in-flight attachment upload for this message, if any. */
   uploadProgress?: number;
 }
@@ -449,6 +536,7 @@ function MessageBubble({
   onCancelSend,
   onSaveMedia,
   onDownload,
+  onOpenMedia,
   uploadProgress,
 }: MessageBubbleProps) {
   const { colors } = useTheme();
@@ -485,51 +573,20 @@ function MessageBubble({
   const isOutgoing = message.direction === "outgoing";
   const isDeleted = !!message.deleted_at;
   const isPinned = !!message.pinned_at;
-  const canDeleteForEveryone =
-    isOutgoing && !isDeleted && Date.now() - message.sent_at <= DELETE_FOR_EVERYONE_WINDOW_MS;
   const hasReaction = !isDeleted && !!(message.reaction_mine || message.reaction_peer);
 
   const onLongPress = isDeleted
     ? undefined
     : () => {
-        const actions: MessageAction[] = [
-          { label: "Reply", icon: "arrow-undo-outline", onPress: () => onReply(message) },
-          { label: "Copy", icon: "copy-outline", onPress: () => onCopy(message) },
-        ];
-        if (message.kind !== "text" && isDownloadAvailable()) {
-          actions.push({
-            label: "Save to device",
-            icon: "download-outline",
-            onPress: () => onSaveMedia(message),
-          });
-        }
-        if (isOutgoing) {
-          actions.push({
-            label: "Info",
-            icon: "information-circle-outline",
-            onPress: () => showTimingInfo(message),
-          });
-        }
-        actions.push({
-          label: isPinned ? "Unpin" : "Pin",
-          icon: isPinned ? "pin" : "pin-outline",
-          onPress: () => (isPinned ? onUnpin(message) : onPin(message)),
+        const actions = buildMessageActions(message, {
+          onReply,
+          onCopy,
+          onSaveMedia,
+          onPin,
+          onUnpin,
+          onDeleteForEveryone,
+          onDelete,
         });
-        if (canDeleteForEveryone) {
-          actions.push({
-            label: "Delete for everyone",
-            icon: "trash-outline",
-            destructive: true,
-            onPress: () => onDeleteForEveryone(message),
-          });
-        }
-        actions.push({
-          label: "Delete for me",
-          icon: "trash-outline",
-          destructive: true,
-          onPress: () => onDelete(message),
-        });
-
         bubbleRef.current?.measureInWindow((x, y, width, height) => {
           onOpenMenu(message, actions, { x, y, width, height });
         });
@@ -595,6 +652,11 @@ function MessageBubble({
                   onCancelSend={
                     isOutgoing && message.status === "pending" ? () => onCancelSend(message) : undefined
                   }
+                  onPress={
+                    message.image_uri
+                      ? () => onOpenMedia({ type: "image", uri: message.image_uri! })
+                      : undefined
+                  }
                 />
               ) : message.kind === "gif" ? (
                 <View>
@@ -605,6 +667,9 @@ function MessageBubble({
                     isSending={isOutgoing && message.status === "pending"}
                     onCancelSend={
                       isOutgoing && message.status === "pending" ? () => onCancelSend(message) : undefined
+                    }
+                    onPress={
+                      message.gif_url ? () => onOpenMedia({ type: "image", uri: message.gif_url! }) : undefined
                     }
                   />
                   {/* GIPHY's terms require attribution wherever their content is
@@ -626,6 +691,11 @@ function MessageBubble({
                   onDownload={!isOutgoing ? () => onDownload(message) : undefined}
                   onCancelSend={
                     isOutgoing && message.status === "pending" ? () => onCancelSend(message) : undefined
+                  }
+                  onExpand={
+                    message.video_uri
+                      ? () => onOpenMedia({ type: "video", uri: message.video_uri! })
+                      : undefined
                   }
                 />
               ) : message.kind === "file" ? (
@@ -677,6 +747,143 @@ function MessageBubble({
         ) : null}
       </View>
     </Animated.View>
+  );
+}
+
+interface AlbumBubbleProps {
+  messages: MessageRow[];
+  isGroupEnd: boolean;
+  onReply: (message: MessageRow) => void;
+  onCopy: (message: MessageRow) => void;
+  onDelete: (message: MessageRow) => void;
+  onRetry: (message: MessageRow) => void;
+  onPin: (message: MessageRow) => void;
+  onUnpin: (message: MessageRow) => void;
+  onDeleteForEveryone: (message: MessageRow) => void;
+  onOpenMenu: (message: MessageRow, actions: MessageAction[], anchor: MessageMenuAnchor) => void;
+  onCancelSend: (message: MessageRow) => void;
+  onSaveMedia: (message: MessageRow) => void;
+  onDownload: (message: MessageRow) => void;
+  onOpenMedia: (media: ViewerMedia) => void;
+  /** Fraction 0..1 per in-flight attachment upload, keyed by message id — same map ChatScreen keeps for single bubbles. */
+  uploadProgressById: Record<string, number>;
+}
+
+/**
+ * A run of 2+ consecutive same-batch images/videos (see buildListItems'
+ * album_id grouping) rendered as one WhatsApp-style grid — up to 4 visible
+ * cells, the 4th overlaid with "+N" when the batch has more. Each cell still
+ * maps to its own MessageRow, so tap/long-press/retry/download all operate
+ * on that specific item exactly like a standalone bubble would.
+ */
+function AlbumBubble({
+  messages,
+  isGroupEnd,
+  onReply,
+  onCopy,
+  onDelete,
+  onRetry,
+  onPin,
+  onUnpin,
+  onDeleteForEveryone,
+  onOpenMenu,
+  onCancelSend,
+  onSaveMedia,
+  onDownload,
+  onOpenMedia,
+  uploadProgressById,
+}: AlbumBubbleProps) {
+  const { colors } = useTheme();
+  const styles = useMemo(() => createStyles(colors), [colors]);
+  const gridWrapRef = useRef<View>(null);
+
+  const first = messages[0];
+  const isOutgoing = first.direction === "outgoing";
+  const last = messages[messages.length - 1];
+  const anyFailedToSend = messages.some((m) => m.status === "failed");
+  const anyFailedToDownload = messages.some((m) => m.media_status === "download_failed");
+
+  const cells: AlbumCellData[] = messages.map((message, index) => {
+    const isDeleted = !!message.deleted_at;
+    const kind: "image" | "video" = message.kind === "video" ? "video" : "image";
+    const uri = isDeleted
+      ? null
+      : message.kind === "video"
+        ? message.video_uri
+        : message.kind === "gif"
+          ? message.gif_url
+          : message.image_uri;
+    const isSending = isOutgoing && message.status === "pending";
+
+    const onPress = isDeleted
+      ? undefined
+      : kind === "video" && !message.video_uri
+        ? () => onDownload(message)
+        : uri
+          ? () => onOpenMedia({ type: kind, uri })
+          : undefined;
+
+    const onLongPress = isDeleted
+      ? undefined
+      : () => {
+          const actions = buildMessageActions(message, {
+            onReply,
+            onCopy,
+            onSaveMedia,
+            onPin,
+            onUnpin,
+            onDeleteForEveryone,
+            onDelete,
+          });
+          gridWrapRef.current?.measureInWindow((x, y, width, height) => {
+            onOpenMenu(message, actions, { x, y, width, height });
+          });
+        };
+
+    return {
+      id: message.id,
+      kind,
+      uri,
+      isSending,
+      uploadProgress: isSending ? uploadProgressById[message.id] : undefined,
+      onPress,
+      onLongPress,
+      onCancelSend: isSending ? () => onCancelSend(message) : undefined,
+      extraCount: index === 3 && messages.length > 4 ? messages.length - 4 : undefined,
+    };
+  });
+
+  return (
+    <View
+      style={[
+        isGroupEnd ? styles.bubbleRowSpaced : styles.bubbleRowTight,
+        { alignSelf: isOutgoing ? "flex-end" : "flex-start" },
+      ]}
+    >
+      <View ref={gridWrapRef} collapsable={false} style={styles.albumWrap}>
+        <AlbumGrid cells={cells} />
+        <View style={styles.albumMetaBadge} pointerEvents="box-none">
+          <Pressable
+            style={styles.albumMetaBadgeInner}
+            onPress={() => {
+              for (const m of messages) {
+                if (m.status === "failed" || m.media_status === "download_failed") onRetry(m);
+              }
+            }}
+            disabled={!anyFailedToSend && !anyFailedToDownload}
+          >
+            <Text style={styles.albumMetaBadgeText}>
+              {anyFailedToSend
+                ? "Not sent · tap to retry"
+                : anyFailedToDownload
+                  ? "Couldn't load · tap to retry"
+                  : formatTime(last.sent_at)}
+            </Text>
+            {isOutgoing ? <StatusTicks status={last.status} /> : null}
+          </Pressable>
+        </View>
+      </View>
+    </View>
   );
 }
 
@@ -1037,6 +1244,10 @@ export default function ChatScreen({ route, navigation }: Props) {
     actions: MessageAction[];
     anchor: MessageMenuAnchor;
   } | null>(null);
+  // Full-screen image/video viewer opened by tapping a media bubble — see
+  // MediaViewerModal.
+  const [viewerMedia, setViewerMedia] = useState<ViewerMedia | null>(null);
+  const onOpenMedia = useCallback((media: ViewerMedia) => setViewerMedia(media), []);
   const listRef = useRef<FlatList<ListItem>>(null);
   const readSentRef = useRef<Set<string>>(new Set());
 
@@ -1395,7 +1606,8 @@ export default function ChatScreen({ route, navigation }: Props) {
       plaintextUri: string,
       kind: AttachmentKind,
       meta: { width?: number; height?: number; durationMs?: number; name?: string; mime?: string },
-      replyTo: ReplyTarget | null
+      replyTo: ReplyTarget | null,
+      albumId?: string | null
     ) => {
       if (!token) return;
       try {
@@ -1417,6 +1629,7 @@ export default function ChatScreen({ route, navigation }: Props) {
             height: meta.height ?? 0,
             size: prepared.plaintextSize,
             replyTo: replyTo ?? undefined,
+            albumId: albumId ?? undefined,
           });
         } else if (kind === "video") {
           void sendPayload(id, {
@@ -1429,6 +1642,7 @@ export default function ChatScreen({ route, navigation }: Props) {
             durationMs: meta.durationMs ?? 0,
             size: prepared.plaintextSize,
             replyTo: replyTo ?? undefined,
+            albumId: albumId ?? undefined,
           });
         } else {
           void sendPayload(id, {
@@ -1767,15 +1981,24 @@ export default function ChatScreen({ route, navigation }: Props) {
   // same as before), inserts an optimistic 'uploading' row for immediate
   // preview, then hands off to uploadThenSend. Shared by the camera button
   // and the attachment menu's Images/Video/Audio options.
+  //
+  // replyToOverride lets a multi-image batch (see pickAndSendAttachment)
+  // control the reply-to per item itself — the composer's reply banner
+  // should only attach to the first image sent, not be re-read (already
+  // cleared) or reapplied to every item in the batch. Single-attachment
+  // callers omit it entirely and get the original behavior: read whatever
+  // is currently in the composer, then clear it.
   const sendAttachment = useCallback(
     async (
       sourceUri: string,
       kind: AttachmentKind,
-      meta: { width?: number; height?: number; durationMs?: number; name?: string; mime?: string }
+      meta: { width?: number; height?: number; durationMs?: number; name?: string; mime?: string },
+      replyToOverride?: ReplyTarget | null,
+      albumId?: string | null
     ) => {
       if (!conversation) return;
-      const activeReply = replyingTo;
-      setReplyingTo(null);
+      const activeReply = replyToOverride !== undefined ? replyToOverride : replyingTo;
+      if (replyToOverride === undefined) setReplyingTo(null);
 
       const id = Crypto.randomUUID();
       try {
@@ -1836,6 +2059,7 @@ export default function ChatScreen({ route, navigation }: Props) {
           media_key: null,
           media_nonce: null,
           media_status: "uploading",
+          album_id: albumId ?? null,
         };
         insertMessage(outgoing);
         setMessages((prev) => [...prev, outgoing]);
@@ -1852,7 +2076,8 @@ export default function ChatScreen({ route, navigation }: Props) {
           plaintextUri,
           kind,
           { width, height, durationMs: meta.durationMs, name: meta.name, mime: meta.mime },
-          activeReply
+          activeReply,
+          albumId
         );
       } catch (err) {
         console.warn("[chat] failed to prepare attachment for sending", err);
@@ -1906,20 +2131,36 @@ export default function ChatScreen({ route, navigation }: Props) {
       const result = await ImagePicker.launchImageLibraryAsync({
         mediaTypes: kind === "image" ? ["images"] : ["videos"],
         quality: 0.9,
+        allowsMultipleSelection: true,
+        orderedSelection: true,
       });
-      if (result.canceled || !result.assets[0]) return;
-      const asset = result.assets[0];
-      if (kind === "image") {
-        await sendAttachment(asset.uri, "image", { width: asset.width, height: asset.height });
-      } else {
-        await sendAttachment(asset.uri, "video", {
-          width: asset.width,
-          height: asset.height,
-          durationMs: asset.duration ?? undefined,
-        });
+      if (result.canceled || result.assets.length === 0) return;
+
+      // A batch of 2+ shares one album id (see the album_id migration) so
+      // ChatScreen can render them as a single WhatsApp-style grid bubble
+      // instead of one bubble per file — see buildListItems/AlbumBubble.
+      // Only the first item inherits whatever the composer was replying to
+      // (see sendAttachment's replyToOverride); the rest send with no reply.
+      const albumId = result.assets.length > 1 ? Crypto.randomUUID() : null;
+      const activeReply = replyingTo;
+      setReplyingTo(null);
+      for (let i = 0; i < result.assets.length; i++) {
+        const asset = result.assets[i];
+        const replyTo = i === 0 ? activeReply : null;
+        if (kind === "image") {
+          await sendAttachment(asset.uri, "image", { width: asset.width, height: asset.height }, replyTo, albumId);
+        } else {
+          await sendAttachment(
+            asset.uri,
+            "video",
+            { width: asset.width, height: asset.height, durationMs: asset.duration ?? undefined },
+            replyTo,
+            albumId
+          );
+        }
       }
     },
-    [conversation, sendAttachment]
+    [conversation, replyingTo, sendAttachment]
   );
 
   // Unlike sendAttachment, there's no compression/local-persistence/upload
@@ -2233,6 +2474,24 @@ export default function ChatScreen({ route, navigation }: Props) {
             </View>
           ) : item.type === "call" ? (
             <CallBubble call={item.call} onRedial={onRedial} />
+          ) : item.type === "album" ? (
+            <AlbumBubble
+              messages={item.messages}
+              isGroupEnd={item.isGroupEnd}
+              onReply={onReply}
+              onCopy={onCopy}
+              onDelete={onDelete}
+              onRetry={onRetry}
+              onPin={onPin}
+              onUnpin={onUnpin}
+              onDeleteForEveryone={onDeleteForEveryone}
+              onOpenMenu={openMenu}
+              onCancelSend={onCancelSend}
+              onSaveMedia={onSaveMedia}
+              onDownload={downloadMedia}
+              onOpenMedia={onOpenMedia}
+              uploadProgressById={uploadProgressById}
+            />
           ) : (
             <MessageBubble
               message={item.message}
@@ -2248,6 +2507,7 @@ export default function ChatScreen({ route, navigation }: Props) {
               onCancelSend={onCancelSend}
               onSaveMedia={onSaveMedia}
               onDownload={downloadMedia}
+              onOpenMedia={onOpenMedia}
               uploadProgress={uploadProgressById[item.message.id]}
             />
           )
@@ -2262,6 +2522,8 @@ export default function ChatScreen({ route, navigation }: Props) {
         onReact={menu ? (emoji) => onReact(menu.message, emoji) : undefined}
         onClose={() => setMenu(null)}
       />
+
+      <MediaViewerModal media={viewerMedia} onClose={() => setViewerMedia(null)} />
 
       {replyingTo ? (
         <View style={styles.replyBanner}>
@@ -2431,6 +2693,18 @@ const createStyles = (colors: ThemeColors) =>
     bubbleRowSpaced: { marginBottom: 10 },
     bubbleRowTight: { marginBottom: 2 },
     bubbleRowReacted: { marginBottom: 18 },
+    albumWrap: { position: "relative" },
+    albumMetaBadge: { position: "absolute", right: 6, bottom: 6 },
+    albumMetaBadgeInner: {
+      flexDirection: "row",
+      alignItems: "center",
+      gap: 4,
+      paddingHorizontal: 6,
+      paddingVertical: 3,
+      borderRadius: 8,
+      backgroundColor: "rgba(0,0,0,0.55)",
+    },
+    albumMetaBadgeText: { fontSize: 11, color: "#fff" },
     callBubble: {
       maxWidth: "80%",
       flexDirection: "row",

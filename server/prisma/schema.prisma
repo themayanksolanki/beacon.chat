@@ -55,6 +55,8 @@ model User {
   contactsAsB       Contact[]  @relation("ContactUserB")
   reportsFiled      Report[]   @relation("ReportFiledBy")
   reportsReceived   Report[]   @relation("ReportAgainst")
+  callsMade         Call[]     @relation("CallCaller")
+  callsMissed       Call[]     @relation("CallCallee")
 
   @@map("users")
 }
@@ -141,6 +143,15 @@ model Message {
   createdAt          DateTime  @default(now()) @map("created_at")
   deliveredAt        DateTime? @map("delivered_at")
   readAt             DateTime? @map("read_at")
+  // Set once the sender has actually been told about deliveredAt/readAt (via
+  // a live emit while their socket was open) — NOT the same moment as
+  // deliveredAt/readAt itself, since io.to(senderId).emit(...) is a silent
+  // no-op if the sender has no connected socket right then. Left null in
+  // that case so flushMessageStatus (socketServer.ts) can find and re-emit
+  // it once the sender reconnects, the same way undelivered messages
+  // themselves are recovered via getUndeliveredMessages.
+  deliveredSyncedAt DateTime? @map("delivered_synced_at")
+  readSyncedAt      DateTime? @map("read_synced_at")
 
   sender          User    @relation("MessageSender", fields: [senderId], references: [id])
   recipient       User    @relation("MessageRecipient", fields: [recipientId], references: [id])
@@ -215,4 +226,34 @@ model Report {
   reported User @relation("ReportAgainst", fields: [reportedId], references: [id])
 
   @@map("reports")
+}
+
+enum CallKind {
+  audio
+  video
+}
+
+// Call history itself is deliberately local-only/per-device (see calls
+// table comment in app/src/db/database.ts) — this table does NOT mirror
+// that. It exists solely to cover the one gap local-only history can't:
+// call:invite is a live signaling relay only (see socketServer.ts's
+// activeCalls comment), so if the callee has zero connected devices when
+// the invite fires, nothing is ever recorded for them. One row is written
+// here only for that specific case, so the callee's device can be told
+// about the missed call once it reconnects (flushMissedCalls) — same
+// resync-on-reconnect shape as flushUndelivered for messages.
+model Call {
+  id        String    @id @default(uuid())
+  callId    String    @unique @map("call_id")
+  callerId  String    @map("caller_id")
+  calleeId  String    @map("callee_id")
+  kind      CallKind
+  createdAt DateTime  @default(now()) @map("created_at")
+  syncedAt  DateTime? @map("synced_at")
+
+  caller User @relation("CallCaller", fields: [callerId], references: [id])
+  callee User @relation("CallCallee", fields: [calleeId], references: [id])
+
+  @@index([calleeId, syncedAt])
+  @@map("calls")
 }

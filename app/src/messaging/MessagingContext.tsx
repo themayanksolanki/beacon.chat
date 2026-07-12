@@ -4,6 +4,7 @@ import sodium from "react-native-libsodium";
 import { getUserById } from "../api/client";
 import { useAuth } from "../auth/AuthContext";
 import { writeVoiceMessageBase64 } from "../audio/voiceStorage";
+import { subscribeConversationActivity } from "../chat/conversationActivity";
 import { decryptMessage, getOrCreateIdentity } from "../crypto/identity";
 import {
   getConversationById,
@@ -63,6 +64,10 @@ export type MessagePayload =
       height: number;
       size: number;
       replyTo?: ReplyRef;
+      // Shared across a multi-select batch (see ChatScreen's
+      // pickAndSendAttachment) so the recipient groups them into the same
+      // grid bubble the sender sees — see the album_id column/MessageRow field.
+      albumId?: string;
     }
   | { kind: "gif"; url: string; width: number; height: number; replyTo?: ReplyRef }
   | {
@@ -75,6 +80,7 @@ export type MessagePayload =
       durationMs: number;
       size: number;
       replyTo?: ReplyRef;
+      albumId?: string;
     }
   | {
       kind: "file";
@@ -133,6 +139,16 @@ const MessagingContext = createContext<MessagingContextValue>({ revision: 0 });
 export function MessagingProvider({ children }: { children: ReactNode }) {
   const { token, email } = useAuth();
   const [revision, setRevision] = useState(0);
+  const bump = () => setRevision((r) => r + 1);
+
+  // Call activity (a call starting or its outcome/duration being finalized)
+  // also counts as conversation activity for ordering/refresh purposes — see
+  // conversationActivity.ts for why this is a plain subscription rather than
+  // CallContext importing this context directly. Kept unconditional (not
+  // gated on token/email like the socket effect below) so it's live for as
+  // long as this provider is mounted.
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- bump only ever closes over the stable setRevision updater, so the subscription never needs to be re-created
+  useEffect(() => subscribeConversationActivity(bump), []);
 
   useEffect(() => {
     if (!token) return;
@@ -157,7 +173,6 @@ export function MessagingProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     if (!token || !email) return;
     const socket = getSocket();
-    const bump = () => setRevision((r) => r + 1);
 
     // Messages/reactions only ever carry the sender's id. If we don't have a
     // local conversation for them yet (they added us before we added them
@@ -306,6 +321,10 @@ export function MessagingProvider({ children }: { children: ReactNode }) {
           media_key: isS3Media ? payload.keyB64 : null,
           media_nonce: isS3Media ? payload.nonceB64 : null,
           media_status: payload.kind === "video" ? "idle" : isS3Media ? "downloading" : "ready",
+          album_id:
+            (payload.kind === "image" && payload.transport === "s3") || payload.kind === "video"
+              ? (payload.albumId ?? null)
+              : null,
         };
         insertMessage(row);
         getSocket().emit("message:delivered", { id: message.id });

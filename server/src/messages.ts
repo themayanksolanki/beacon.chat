@@ -142,25 +142,105 @@ export type MarkResult =
  * up by (clientId, requesterDeviceId) since each recipient device acks its
  * own copy independently; the sender to notify is read back from the row
  * rather than trusted from the client for the same reason.
+ *
+ * isSenderOnline is the caller's (socketServer.ts) way of checking whether
+ * the sender has a live socket right now — it's a callback rather than a
+ * plain boolean because the sender's id isn't known until after the lookup
+ * below. The live io.to(senderId).emit(...) that follows this call is a
+ * silent no-op if the sender isn't connected, so deliveredSyncedAt/
+ * readSyncedAt are only set when there's an actual socket to have received
+ * it; left null otherwise so flushMessageStatus can find and re-emit it once
+ * the sender reconnects instead of the receipt being lost for good.
  */
-export async function markDelivered(clientId: string, requesterDeviceId: string, requesterId: string): Promise<MarkResult> {
+export async function markDelivered(
+  clientId: string,
+  requesterDeviceId: string,
+  requesterId: string,
+  isSenderOnline: (senderId: string) => boolean
+): Promise<MarkResult> {
   const message = await prisma.message.findFirst({ where: { clientId, recipientDeviceId: requesterDeviceId } });
   if (!message) return { ok: false, error: "not_found" };
   if (message.recipientId !== requesterId) return { ok: false, error: "not_recipient" };
 
   const deliveredAt = new Date();
-  await prisma.message.update({ where: { id: message.id }, data: { deliveredAt } });
+  const senderOnline = isSenderOnline(message.senderId);
+  await prisma.message.update({
+    where: { id: message.id },
+    data: { deliveredAt, deliveredSyncedAt: senderOnline ? deliveredAt : null },
+  });
   return { ok: true, senderId: message.senderId, at: deliveredAt.getTime() };
 }
 
-export async function markRead(clientId: string, requesterDeviceId: string, requesterId: string): Promise<MarkResult> {
+export async function markRead(
+  clientId: string,
+  requesterDeviceId: string,
+  requesterId: string,
+  isSenderOnline: (senderId: string) => boolean
+): Promise<MarkResult> {
   const message = await prisma.message.findFirst({ where: { clientId, recipientDeviceId: requesterDeviceId } });
   if (!message) return { ok: false, error: "not_found" };
   if (message.recipientId !== requesterId) return { ok: false, error: "not_recipient" };
 
   const readAt = new Date();
-  await prisma.message.update({ where: { id: message.id }, data: { readAt } });
+  const senderOnline = isSenderOnline(message.senderId);
+  await prisma.message.update({
+    where: { id: message.id },
+    data: {
+      readAt,
+      readSyncedAt: senderOnline ? readAt : null,
+      // A read receipt implies delivery — set/sync deliveredAt too so
+      // flushMessageStatus doesn't separately (and redundantly) re-emit a
+      // stale "delivered" event after the sender already has "read".
+      // Preserve deliveredSyncedAt if it was already set by an earlier,
+      // successfully-synced delivered receipt.
+      deliveredAt: message.deliveredAt ?? readAt,
+      deliveredSyncedAt: message.deliveredSyncedAt ?? (senderOnline ? readAt : null),
+    },
+  });
   return { ok: true, senderId: message.senderId, at: readAt.getTime() };
+}
+
+export interface MessageStatusUpdate {
+  id: string;
+  deliveredAt: number | null;
+  readAt: number | null;
+}
+
+/**
+ * Delivery/read receipts a sender missed while offline (mirrors
+ * getUndeliveredMessages, but for the receipt going back to the sender
+ * rather than the message going to the recipient) — see markDelivered/
+ * markRead above for how deliveredSyncedAt/readSyncedAt get set.
+ */
+export async function getUnsyncedMessageStatus(senderId: string): Promise<MessageStatusUpdate[]> {
+  const rows = await prisma.message.findMany({
+    where: {
+      senderId,
+      OR: [
+        { deliveredAt: { not: null }, deliveredSyncedAt: null },
+        { readAt: { not: null }, readSyncedAt: null },
+      ],
+    },
+    select: { clientId: true, deliveredAt: true, readAt: true },
+    orderBy: { createdAt: "asc" },
+  });
+  return rows.map((row) => ({
+    id: row.clientId,
+    deliveredAt: row.deliveredAt?.getTime() ?? null,
+    readAt: row.readAt?.getTime() ?? null,
+  }));
+}
+
+export async function markMessageStatusSynced(senderId: string): Promise<void> {
+  const now = new Date();
+  await prisma.message.updateMany({
+    where: { senderId, deliveredAt: { not: null }, deliveredSyncedAt: null },
+    data: { deliveredSyncedAt: now },
+  });
+  await prisma.message.updateMany({
+    where: { senderId, readAt: { not: null }, readSyncedAt: null },
+    data: { readSyncedAt: now },
+  });
 }
 
 export const DELETE_FOR_EVERYONE_WINDOW_MS = 2 * 60 * 60 * 1000;

@@ -61,6 +61,7 @@ function createIntroMessage(): MessageRow {
     media_key: null,
     media_nonce: null,
     media_status: "ready",
+    album_id: null,
   };
 }
 

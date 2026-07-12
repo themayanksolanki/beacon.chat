@@ -27,7 +27,7 @@ import NameEntryScreen from "./src/screens/NameEntryScreen";
 import ProfilePhotoScreen from "./src/screens/ProfilePhotoScreen";
 import IncomingCallScreen from "./src/screens/IncomingCallScreen";
 import ActiveCallScreen from "./src/screens/ActiveCallScreen";
-import ActiveCallBanner from "./src/components/ActiveCallBanner";
+import FloatingCallWidget from "./src/components/FloatingCallWidget";
 import HeaderAddButton from "./src/components/HeaderAddButton";
 import TabBarAvatar from "./src/components/TabBarAvatar";
 import { AuthProvider, useAuth } from "./src/auth/AuthContext";
@@ -211,7 +211,7 @@ function ThemedNavigationContainer() {
       theme={scheme === "dark" ? NavDarkTheme : NavDefaultTheme}
     >
       <RootNavigator />
-      <ActiveCallBanner />
+      <FloatingCallWidget />
       <StatusBar style={scheme === "dark" ? "light" : "dark"} />
     </NavigationContainer>
   );

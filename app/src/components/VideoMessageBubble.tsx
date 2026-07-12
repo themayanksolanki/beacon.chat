@@ -22,6 +22,9 @@ interface Props {
   uploadProgress?: number;
   onDownload?: () => void;
   onCancelSend?: () => void;
+  /** Opens the video full-screen to actually play it (see MediaViewerModal)
+   * — the in-bubble thumbnail is a static, non-interactive preview frame. */
+  onExpand?: () => void;
 }
 
 function formatDuration(ms: number): string {
@@ -50,6 +53,7 @@ export default function VideoMessageBubble({
   uploadProgress,
   onDownload,
   onCancelSend,
+  onExpand,
 }: Props) {
   const { colors } = useTheme();
   const styles = useMemo(() => createStyles(colors), [colors]);
@@ -72,12 +76,21 @@ export default function VideoMessageBubble({
 
   if (videoUri) {
     return (
-      <View style={containerStyle}>
-        <VideoView player={player} style={styles.video} nativeControls contentFit="cover" />
+      <Pressable
+        style={containerStyle}
+        onPress={!isSending ? onExpand : undefined}
+        disabled={isSending || !onExpand}
+      >
+        <VideoView player={player} style={styles.video} nativeControls={false} contentFit="cover" />
         {!isSending ? (
-          <View style={styles.durationBadge} pointerEvents="none">
-            <Text style={styles.durationText}>{formatDuration(durationMs)}</Text>
-          </View>
+          <>
+            <View style={styles.playOverlay} pointerEvents="none">
+              <Ionicons name="play-circle" size={44} color="rgba(255,255,255,0.9)" />
+            </View>
+            <View style={styles.durationBadge} pointerEvents="none">
+              <Text style={styles.durationText}>{formatDuration(durationMs)}</Text>
+            </View>
+          </>
         ) : null}
         {isSending ? (
           <View style={styles.overlay} pointerEvents="box-none">
@@ -92,7 +105,7 @@ export default function VideoMessageBubble({
             ) : null}
           </View>
         ) : null}
-      </View>
+      </Pressable>
     );
   }
 
@@ -156,4 +169,9 @@ const createStyles = (colors: ThemeColors) =>
       backgroundColor: "rgba(0,0,0,0.55)",
     },
     durationText: { color: "#fff", fontSize: 11, fontWeight: "700" },
+    playOverlay: {
+      ...StyleSheet.absoluteFill,
+      alignItems: "center",
+      justifyContent: "center",
+    },
   });

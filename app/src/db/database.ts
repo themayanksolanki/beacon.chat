@@ -147,6 +147,12 @@ function runMigrations() {
     ["media_key", "ALTER TABLE messages ADD COLUMN media_key TEXT"],
     ["media_nonce", "ALTER TABLE messages ADD COLUMN media_nonce TEXT"],
     ["media_status", "ALTER TABLE messages ADD COLUMN media_status TEXT NOT NULL DEFAULT 'ready'"],
+    // Shared client-generated id for a batch of images/videos picked together
+    // in one attachment-menu selection (see ChatScreen's pickAndSendAttachment)
+    // — null for anything sent on its own. Lets the chat UI group them into a
+    // single WhatsApp-style grid bubble (see buildListItems) instead of one
+    // bubble per file, without needing to guess groupings from timestamps.
+    ["album_id", "ALTER TABLE messages ADD COLUMN album_id TEXT"],
   ];
   for (const [column, statement] of migrations) {
     if (!existingColumns.has(column)) {
@@ -237,13 +243,15 @@ export interface MessageRow {
   media_key: string | null;
   media_nonce: string | null;
   media_status: MediaStatus;
+  /** Shared id for a batch of images/videos picked together in one send — see the album_id migration above. Null outside of a multi-select batch. */
+  album_id: string | null;
 }
 
 export function insertMessage(message: MessageRow) {
   db.runSync(
     `INSERT INTO messages
-       (id, conversation_id, direction, plaintext, sent_at, status, delivered_at, read_at, reply_to_id, reply_preview, pinned_at, deleted_at, reaction_mine, reaction_peer, kind, audio_uri, duration_ms, waveform, image_uri, image_width, image_height, gif_url, gif_width, gif_height, video_uri, video_width, video_height, video_duration_ms, video_size, file_uri, file_name, file_mime, file_size, media_url, media_key, media_nonce, media_status)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       (id, conversation_id, direction, plaintext, sent_at, status, delivered_at, read_at, reply_to_id, reply_preview, pinned_at, deleted_at, reaction_mine, reaction_peer, kind, audio_uri, duration_ms, waveform, image_uri, image_width, image_height, gif_url, gif_width, gif_height, video_uri, video_width, video_height, video_duration_ms, video_size, file_uri, file_name, file_mime, file_size, media_url, media_key, media_nonce, media_status, album_id)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [
       message.id,
       message.conversation_id,
@@ -282,6 +290,7 @@ export function insertMessage(message: MessageRow) {
       message.media_key,
       message.media_nonce,
       message.media_status,
+      message.album_id,
     ]
   );
 }
@@ -453,8 +462,18 @@ export interface ConversationSummary extends ConversationRow {
   unread_count: number;
   // 0/1 — SQLite has no native boolean type; treat as truthy in TS.
   is_blocked: number;
+  /** Most recent call logged for this conversation (any status/direction), regardless of whether a message exists — see getConversationSummaries' ordering. */
+  last_call_at: number | null;
 }
 
+// Ordered by whichever of (last message, last call, conversation creation)
+// is most recent — a call with no accompanying message (e.g. unanswered)
+// still counts as activity and bumps the conversation to the top, matching
+// WhatsApp. ORDER BY reuses the last_message_at/last_call_at aliases defined
+// in the SELECT list rather than repeating those subqueries. SQLite's
+// multi-arg max() returns NULL if any argument is NULL, so both are coalesced
+// to 0 before comparing (c.created_at is itself never null, so it's the
+// floor when neither a message nor a call exists yet).
 export function getConversationSummaries(): ConversationSummary[] {
   return db.getAllSync<ConversationSummary>(`
     SELECT
@@ -465,9 +484,10 @@ export function getConversationSummaries(): ConversationSummary[] {
       (SELECT direction FROM messages m WHERE m.conversation_id = c.id ORDER BY m.sent_at DESC LIMIT 1) AS last_message_direction,
       (SELECT status FROM messages m WHERE m.conversation_id = c.id ORDER BY m.sent_at DESC LIMIT 1) AS last_message_status,
       (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id AND m.direction = 'incoming' AND m.read_at IS NULL) AS unread_count,
-      EXISTS(SELECT 1 FROM blocked_users b WHERE b.peer_id = c.id) AS is_blocked
+      EXISTS(SELECT 1 FROM blocked_users b WHERE b.peer_id = c.id) AS is_blocked,
+      (SELECT started_at FROM calls WHERE calls.conversation_id = c.id ORDER BY started_at DESC LIMIT 1) AS last_call_at
     FROM conversations c
-    ORDER BY COALESCE(last_message_at, c.created_at) DESC
+    ORDER BY MAX(COALESCE(last_message_at, 0), COALESCE(last_call_at, 0), c.created_at) DESC
   `);
 }
 
@@ -648,6 +668,35 @@ export function insertCall(call: CallRow): void {
       call.ended_at,
     ]
   );
+}
+
+/**
+ * Same as insertCall but tolerant of the row already existing — used for
+ * call:missed (see CallContext.tsx), which the server can legitimately
+ * re-deliver (e.g. two of this account's devices reconnecting around the
+ * same moment both trigger a flush) since it isn't keyed to a single
+ * socket/device the way live call:invite is.
+ */
+export function insertCallIfAbsent(call: CallRow): void {
+  db.runSync(
+    `INSERT OR IGNORE INTO calls (id, conversation_id, direction, kind, status, started_at, answered_at, ended_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    [
+      call.id,
+      call.conversation_id,
+      call.direction,
+      call.kind,
+      call.status,
+      call.started_at,
+      call.answered_at,
+      call.ended_at,
+    ]
+  );
+}
+
+/** "Delete for me" for a logged call — local-only, same as deleteMessage; nothing to tell the peer or server since call history is already per-device. */
+export function deleteCall(id: string): void {
+  db.runSync(`DELETE FROM calls WHERE id = ?`, [id]);
 }
 
 export function updateCallOutcome(
