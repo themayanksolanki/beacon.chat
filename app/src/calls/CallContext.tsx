@@ -35,30 +35,49 @@ import { notifyConversationActivity } from "../chat/conversationActivity";
 import { getSocket } from "../network/socket";
 import { useAuth } from "../auth/AuthContext";
 import { dismissCallScreen, navigationRef } from "../navigation/navigationRef";
+import { getTurnCredentials, type IceServerConfig } from "../api/client";
 
 // STUN alone only gets two peers connected directly when at least one side's
 // NAT allows it — very common failure mode on Android is a carrier's
 // cellular network doing symmetric/CGNAT-style NAT, where STUN can't
 // discover a usable public mapping at all and ICE gathering just comes up
 // empty (the call then times out or connects one-way). A TURN server relays
-// media through itself as a fallback for exactly that case — optional here
-// since it needs real infrastructure/credentials (a provider like Twilio,
-// Xirsys, or a self-hosted coturn), added to the ICE server list only if
-// configured so the STUN-only default is unchanged without it.
-const TURN_URL = process.env.EXPO_PUBLIC_TURN_URL;
-const TURN_USERNAME = process.env.EXPO_PUBLIC_TURN_USERNAME;
-const TURN_CREDENTIAL = process.env.EXPO_PUBLIC_TURN_CREDENTIAL;
-const ICE_SERVERS = [
+// media through itself as a fallback for exactly that case.
+const STUN_SERVERS: IceServerConfig[] = [
   { urls: "stun:stun.l.google.com:19302" },
   { urls: "stun:stun1.l.google.com:19302" },
-  ...(TURN_URL ? [{ urls: TURN_URL, username: TURN_USERNAME, credential: TURN_CREDENTIAL }] : []),
 ];
+
+// Fetched fresh per call rather than read from a static bundled value (see
+// api/client.ts's getTurnCredentials) — Twilio mints a short-lived
+// username/password per request, so nothing long-lived ever ships in the
+// app. Falls back to STUN-only (unchanged prior behavior) if the server
+// hasn't got Twilio configured, or the request fails for any reason — a
+// missing/broken TURN fetch should degrade the call's NAT-traversal odds,
+// never block placing or answering one.
+async function buildIceServers(token: string | null): Promise<IceServerConfig[]> {
+  if (!token) return STUN_SERVERS;
+  try {
+    const { iceServers } = await getTurnCredentials(token);
+    return [...STUN_SERVERS, ...iceServers];
+  } catch (err) {
+    console.warn("[call] failed to fetch TURN credentials, falling back to STUN-only", err);
+    return STUN_SERVERS;
+  }
+}
 const RING_TIMEOUT_MS = 45000;
 // Some environments (e.g. Android with a self-managed phone account the user
 // hasn't authorized yet) accept RNCallKeep.startCall() without ever firing
 // didReceiveStartCallAction — this bounds how long we wait for it before
 // falling back to placing the call directly, same as the try/catch below.
 const CALLKEEP_START_TIMEOUT_MS = 4000;
+// How long to wait, once the peer connection goes "disconnected"/"failed",
+// for an ICE restart to bring it back before treating the call as truly
+// over — long enough to cover a real reconnection round-trip (restartIce ->
+// negotiationneeded -> offer/answer over the signaling socket -> new ICE
+// checks), short enough not to leave the UI looking "connected" over dead
+// air for too long.
+const ICE_RECOVERY_GRACE_MS = 10000;
 
 // The concrete signal that the camera/mic hardware is already held by
 // another app or call (WhatsApp, a cellular call, etc.) rather than some
@@ -229,6 +248,25 @@ export function CallProvider({ children }: { children: ReactNode }) {
   // handling, so a simple "skip if one is already in flight" is the extent
   // of the protection rather than queueing/rollback.
   const renegotiatingRef = useRef(false);
+  // A second incoming renegotiate-offer can arrive while the first is still
+  // being processed (e.g. the peer's own connectionstatechange flapping
+  // disconnected/failed more than once for the same blip, each independently
+  // calling restartIce()) — processing two concurrently on this side alone
+  // reproduces the exact "Called in wrong state: stable" crash the
+  // politeness check below handles for the offer-vs-offer case, just
+  // without a peer-side offer in flight to make it a "collision" by that
+  // check's definition. This is a plain reentrancy guard, unconditional on
+  // politeness: a second offer arriving mid-processing is simply dropped.
+  const applyingRenegotiateOfferRef = useRef(false);
+  // Grace-period timer between the peer connection going "disconnected"/
+  // "failed" and actually ending the call (see connectionstatechange below)
+  // — gives a same-network blip (Wi-Fi<->cellular handoff, a brief signal
+  // drop) a chance to recover via ICE restart instead of hanging up on the
+  // first hiccup, the way a plain STUN-only connection otherwise would.
+  const iceRecoveryTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Only attempt one restartIce() per disconnection episode — cleared once
+  // the connection actually recovers (back to connected/completed).
+  const iceRestartAttemptedRef = useRef(false);
 
   useEffect(() => {
     callRef.current = call;
@@ -342,6 +380,11 @@ export function CallProvider({ children }: { children: ReactNode }) {
 
   const cleanup = useCallback(() => {
     clearRingTimeout();
+    if (iceRecoveryTimeoutRef.current) {
+      clearTimeout(iceRecoveryTimeoutRef.current);
+      iceRecoveryTimeoutRef.current = null;
+    }
+    iceRestartAttemptedRef.current = false;
     Vibration.cancel();
     InCallManager.stopRingtone();
     peerConnectionRef.current?.close();
@@ -387,8 +430,14 @@ export function CallProvider({ children }: { children: ReactNode }) {
   }, []);
 
   const createPeerConnection = useCallback(
-    (callId: string) => {
-      const pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
+    async (callId: string) => {
+      const iceServers = await buildIceServers(token);
+      const pc = new RTCPeerConnection({
+        iceServers,
+        bundlePolicy: "max-bundle",
+        rtcpMuxPolicy: "require",
+        iceCandidatePoolSize: 10,
+      });
       // react-native-webrtc's RTCPeerConnection typings don't resolve cleanly
       // through Expo's "bundler" moduleResolution (event-target-shim's
       // package.json doesn't export the "/index" subpath its own .d.ts
@@ -400,6 +449,9 @@ export function CallProvider({ children }: { children: ReactNode }) {
           listener: (event: { streams: MediaStream[]; track: MediaStreamTrack }) => void
         ): void;
         addEventListener(type: "connectionstatechange", listener: () => void): void;
+        addEventListener(type: "iceconnectionstatechange", listener: () => void): void;
+        
+        addEventListener(type: "negotiationneeded", listener: () => void): void;
       };
 
       events.addEventListener("icecandidate", (event) => {
@@ -409,39 +461,40 @@ export function CallProvider({ children }: { children: ReactNode }) {
       });
 
       events.addEventListener("track", (event) => {
-        // react-native-webrtc's Android build doesn't always populate
-        // event.streams (a long-standing upstream gap) even though the
-        // track itself always arrives — silently bailing out here used to
-        // mean the peer's video (and sometimes audio) never made it into
-        // remoteStreamURL at all, Android-only.
-        let stream = event.streams[0];
-        if (!stream) {
-          // Audio and video normally arrive as two separate track events, so
-          // this has to accumulate — but NOT by mutating one persistent
-          // MediaStream and re-emitting the same stream.toURL() each time.
-          // Android's native RTCView (WebRTCView.java's setStreamURL) only
-          // re-resolves which VideoTrack to render when the streamURL PROP
-          // STRING actually changes, and toURL() returns a stream's id,
-          // which is stable for the life of that MediaStream object — so if
-          // audio arrives first (binding to an audio-only stream, no video
-          // yet) and video arrives later added to that *same* stream
-          // instance, the prop never changes and the native view never
-          // re-binds to the now-available video track: black video,
-          // forever, on Android specifically (this exact bug — reproduced
-          // and confirmed against the WebRTCView.java source). Building a
-          // brand-new MediaStream (fresh id) with everything accumulated so
-          // far, every time, guarantees the prop changes and Android
-          // re-resolves the video track. The old wrapper is released (not
-          // its tracks, which are still owned by the peer connection) once
-          // superseded.
-          if (!remoteTracksRef.current.includes(event.track)) {
-            remoteTracksRef.current = [...remoteTracksRef.current, event.track];
-          }
-          const previous = remoteStreamAccumulatorRef.current;
-          stream = new MediaStream(remoteTracksRef.current);
-          remoteStreamAccumulatorRef.current = stream;
-          previous?.release(false);
+        // Audio and video normally arrive as two separate track events —
+        // this has to accumulate, but NOT by reusing one persistent
+        // MediaStream and re-emitting the same stream.toURL() each time.
+        // Android's native RTCView (WebRTCView.java's setStreamURL) only
+        // re-resolves which VideoTrack to render when the streamURL PROP
+        // STRING actually changes, and toURL() returns a stream's id, which
+        // is stable for the life of that MediaStream object. That holds
+        // whether or not event.streams itself came back empty (a
+        // long-standing react-native-webrtc Android gap): even when
+        // event.streams[0] IS populated, react-native-webrtc's own
+        // RTCPeerConnection reuses the SAME MediaStream instance (keyed by
+        // streamId) for every track event sharing one msid — the ordinary
+        // case for a bundled audio+video SDP — so if audio arrives first
+        // (binding to that stream, no video yet) and video arrives later
+        // added to that *same* instance, the prop never changes and the
+        // native view never re-binds to the now-available video track:
+        // black video, forever, on Android specifically (reproduced and
+        // confirmed against both the WebRTCView.java and
+        // RTCPeerConnection.ts source — restarting the app only "fixes" it
+        // by getting lucky on event-ordering, not by fixing the cause).
+        // Building a brand-new MediaStream (fresh id) with everything
+        // accumulated so far, every time a new track shows up, guarantees
+        // the prop changes and Android re-resolves the video track — this
+        // is done unconditionally, ignoring event.streams entirely, rather
+        // than only as a fallback for the empty case. The old wrapper is
+        // released (not its tracks, which are still owned by the peer
+        // connection) once superseded.
+        if (!remoteTracksRef.current.includes(event.track)) {
+          remoteTracksRef.current = [...remoteTracksRef.current, event.track];
         }
+        const previous = remoteStreamAccumulatorRef.current;
+        const stream = new MediaStream(remoteTracksRef.current);
+        remoteStreamAccumulatorRef.current = stream;
+        previous?.release(false);
         setRemoteStreamURL(stream.toURL());
         if (phaseRef.current !== "connected") {
           connectedAtRef.current = Date.now();
@@ -454,35 +507,159 @@ export function CallProvider({ children }: { children: ReactNode }) {
         }
       });
 
-      events.addEventListener("connectionstatechange", () => {
-        if (pc.connectionState === "failed" || pc.connectionState === "closed") {
-          if (phaseRef.current !== "idle") {
-            // Every other self-initiated way a call ends (endCall,
-            // rejectIncomingCall, both ring-timeouts, the acceptIncomingCall/
-            // performOutgoingCallSetup catch blocks) tells the server via
-            // call:end so it clears activeCalls/userActiveCall — this path
-            // was the one exception, silently cleaning up only the local
-            // React state. The server's bookkeeping was left stuck "in a
-            // call" indefinitely (nothing else was ever going to clear it —
-            // the peer's socket is still perfectly connected), so the very
-            // next call attempt to or from either party got hard-rejected
-            // as "busy"/"That person is on another call" even though the
-            // call had genuinely ended on this device.
-            getSocket().emit("call:end", { callId });
-            logCallOutcome(phaseRef.current === "connected" ? "completed" : "failed");
-            if (callKeepReadyRef.current) {
-              safeCallKeep(() => RNCallKeep.reportEndCallWithUUID(callId, CK_CONSTANTS.END_CALL_REASONS.FAILED));
-            }
-            dismissCallScreen();
-            cleanup();
-          }
+      // The actual end-the-call side effects, factored out so both the
+      // immediate "closed" path and the ICE-recovery grace-period timeout
+      // below (connectionstatechange) can share it.
+      const endCallForConnectionFailure = () => {
+        if (phaseRef.current === "idle") return;
+        // Every other self-initiated way a call ends (endCall,
+        // rejectIncomingCall, both ring-timeouts, the acceptIncomingCall/
+        // performOutgoingCallSetup catch blocks) tells the server via
+        // call:end so it clears activeCalls/userActiveCall — this path
+        // was the one exception, silently cleaning up only the local
+        // React state. The server's bookkeeping was left stuck "in a
+        // call" indefinitely (nothing else was ever going to clear it —
+        // the peer's socket is still perfectly connected), so the very
+        // next call attempt to or from either party got hard-rejected
+        // as "busy"/"That person is on another call" even though the
+        // call had genuinely ended on this device.
+        getSocket().emit("call:end", { callId });
+        logCallOutcome(phaseRef.current === "connected" ? "completed" : "failed");
+        if (callKeepReadyRef.current) {
+          safeCallKeep(() => RNCallKeep.reportEndCallWithUUID(callId, CK_CONSTANTS.END_CALL_REASONS.FAILED));
         }
+        dismissCallScreen();
+        cleanup();
+      };
+
+      events.addEventListener("iceconnectionstatechange", () => {
+        console.log("ICE:", pc.iceConnectionState);
+
+        switch (pc.iceConnectionState) {
+          case "failed":
+            console.log("ICE failed");
+            break;
+
+          case "disconnected":
+            console.log("ICE disconnected");
+            break;
+
+          case "connected":
+          case "completed":
+            console.log("ICE connected");
+            break;
+        }
+      });
+
+      events.addEventListener("connectionstatechange", async () => {
+        const state = pc.connectionState;
+
+        if (state === "connected") {
+          // Recovered from a "disconnected"/"failed" blip (or this is the
+          // first time connecting) — cancel any pending grace-period
+          // teardown and allow a future disconnection to try its own
+          // restart again.
+          if (iceRecoveryTimeoutRef.current) {
+            clearTimeout(iceRecoveryTimeoutRef.current);
+            iceRecoveryTimeoutRef.current = null;
+          }
+          iceRestartAttemptedRef.current = false;
+          return;
+        }
+
+        if (state === "disconnected" || state === "failed") {
+          if (phaseRef.current === "idle") return;
+          // A recovery window is already running for this episode.
+          if (iceRecoveryTimeoutRef.current) return;
+
+          if (!iceRestartAttemptedRef.current) {
+            // With STUN-only ICE (no TURN configured — see ICE_SERVERS
+            // above), a same-network blip (Wi-Fi<->cellular handoff, a
+            // brief signal drop, especially common on Android mobile data)
+            // used to end the call immediately on the very first "failed"
+            // state instead of trying to recover, the way a real calling
+            // app (WhatsApp/Signal) would. restartIce() triggers a
+            // "negotiationneeded" event (handled below), which redoes the
+            // offer/answer exchange over the existing signaling socket —
+            // this can only recover a transient blip, not a genuinely
+            // unreachable network path (that still needs a TURN relay).
+            iceRestartAttemptedRef.current = true;
+            console.warn(`[call] connection ${state}, attempting ICE restart`);
+            try {
+                pc.restartIce();
+
+                const offer = await pc.createOffer({
+                    iceRestart: true,
+                });
+
+                await pc.setLocalDescription(offer);
+                const info = callRef.current;
+                getSocket().emit("call:renegotiate-offer", {
+                    callId,
+                    sdp: pc.localDescription!.toJSON(),
+                    kind: info?.kind,
+                });
+
+            } catch (err) {
+                console.warn(err);
+            }
+          }
+
+          iceRecoveryTimeoutRef.current = setTimeout(() => {
+            iceRecoveryTimeoutRef.current = null;
+            const finalState = pc.connectionState;
+            if (finalState !== "connected") {
+              endCallForConnectionFailure();
+            }
+          }, ICE_RECOVERY_GRACE_MS);
+          return;
+        }
+
+        if (state === "closed") {
+          // The connection was explicitly torn down (by either side) —
+          // nothing left to restart, so no grace period, unlike above.
+          if (iceRecoveryTimeoutRef.current) {
+            clearTimeout(iceRecoveryTimeoutRef.current);
+            iceRecoveryTimeoutRef.current = null;
+          }
+          endCallForConnectionFailure();
+        }
+      });
+
+      // Fires after restartIce() (recovering from a disconnected/failed
+      // state above), and also after toggleCamera's addTrack — guarded by
+      // the same renegotiatingRef that flow already sets before this could
+      // fire, so it won't double-send an offer for that case. Ignored
+      // before the call has actually connected once: the initial
+      // offer/answer is created explicitly by performOutgoingCallSetup/
+      // acceptIncomingCall, not through this generic path.
+      events.addEventListener("negotiationneeded", () => {
+        if (phaseRef.current !== "connected" || renegotiatingRef.current) return;
+        const info = callRef.current;
+        if (!info || info.callId !== callId) return;
+        renegotiatingRef.current = true;
+        (async () => {
+          try {
+            const offer = await pc.createOffer();
+            await pc.setLocalDescription(offer);
+            getSocket().emit("call:renegotiate-offer", {
+              callId,
+              sdp: pc.localDescription!.toJSON(),
+              kind: info.kind,
+            });
+            // renegotiatingRef is cleared once the peer's answer arrives —
+            // see handleRenegotiateAnswer — not here, same as toggleCamera.
+          } catch (err) {
+            console.warn("[call] ICE-restart renegotiation failed", err);
+            renegotiatingRef.current = false;
+          }
+        })();
       });
 
       peerConnectionRef.current = pc;
       return pc;
     },
-    [cleanup, logCallOutcome]
+    [cleanup, logCallOutcome, token]
   );
 
   // The actual media acquisition + signaling for an outgoing call — split
@@ -502,7 +679,22 @@ export function CallProvider({ children }: { children: ReactNode }) {
         await ensureAndroidCallPermissions(true, kind === "video");
         const localStream = await mediaDevices.getUserMedia({
           audio: true,
-          video: kind === "video" ? { facingMode: "user" } : false,
+          video:
+            kind === "video"
+              ? {
+                  facingMode: "user",
+                  width: {
+                    ideal: 640,
+                  },
+                  height: {
+                    ideal: 480,
+                  },
+                  frameRate: {
+                    ideal: 24,
+                    max: 30,
+                  },
+                }
+              : false,
         });
 
         // The user can hang up (endCall -> cleanup) while permissions/
@@ -526,7 +718,16 @@ export function CallProvider({ children }: { children: ReactNode }) {
         setIsRemoteCameraOff(kind !== "video");
         InCallManager.start({ media: kind === "video" ? "video" : "audio" });
 
-        const pc = createPeerConnection(callId);
+        const pc = await createPeerConnection(callId);
+
+        // The user can hang up while the TURN-credential fetch above was
+        // still in flight — same race as the getUserMedia check below, just
+        // one step earlier now that peer connection creation is async too.
+        if (callRef.current?.callId !== callId) {
+          pc.close();
+          return;
+        }
+
         localStream.getTracks().forEach((track) => pc.addTrack(track, localStream));
 
         const offer = await pc.createOffer();
@@ -740,7 +941,22 @@ export function CallProvider({ children }: { children: ReactNode }) {
       await ensureAndroidCallPermissions(true, invite.kind === "video");
       const localStream = await mediaDevices.getUserMedia({
         audio: true,
-        video: invite.kind === "video" ? { facingMode: "user" } : false,
+        video:
+          invite.kind === "video"
+            ? {
+                facingMode: "user",
+                width: {
+                  ideal: 640,
+                },
+                height: {
+                  ideal: 480,
+                },
+                frameRate: {
+                  ideal: 24,
+                  max: 30,
+                },
+              }
+            : false,
       });
 
       // Same race as performOutgoingCallSetup's callRef check: the caller
@@ -759,7 +975,15 @@ export function CallProvider({ children }: { children: ReactNode }) {
       setIsRemoteCameraOff(invite.kind !== "video");
       InCallManager.start({ media: invite.kind === "video" ? "video" : "audio" });
 
-      const pc = createPeerConnection(invite.callId);
+      const pc = await createPeerConnection(invite.callId);
+
+      // Same race, one step earlier — the caller could have cancelled while
+      // the TURN-credential fetch inside createPeerConnection was in flight.
+      if (callRef.current?.callId !== invite.callId) {
+        pc.close();
+        return;
+      }
+
       localStream.getTracks().forEach((track) => pc.addTrack(track, localStream));
 
       await pc.setRemoteDescription(new RTCSessionDescription(invite.sdp));
@@ -861,7 +1085,34 @@ export function CallProvider({ children }: { children: ReactNode }) {
   const handleRenegotiateOffer = useCallback(
     async (payload: { callId: string; sdp: { type: string; sdp: string }; kind: CallKind }) => {
       const pc = peerConnectionRef.current;
-      if (!pc || callRef.current?.callId !== payload.callId) return;
+      const info = callRef.current;
+      if (!pc || info?.callId !== payload.callId) return;
+      // Glare: both sides can independently notice the same disconnect and
+      // each call restartIce() around the same time (see
+      // connectionstatechange's ICE-restart above) — each then has its own
+      // offer in flight when the peer's offer arrives here. Naively
+      // accepting it on both sides corrupts the exchange (reproduced:
+      // "Failed to set local answer sdp: Called in wrong state: stable",
+      // because the OTHER side's createAnswer/setLocalDescription already
+      // completed and returned signalingState to "stable" by the time this
+      // side's own concurrent attempt tried to finish). Resolved the
+      // standard WebRTC "perfect negotiation" way: politeness is derived
+      // from call direction, which is fixed for a call's whole lifetime and
+      // already opposite on the two ends — the original callee is "polite"
+      // (accepts the incoming offer, implicitly rolling back its own
+      // pending one) and the original caller is "impolite" (ignores an
+      // incoming offer while it has one of its own in flight, and waits for
+      // its own to be answered instead). Only one side needs the special
+      // case for this to resolve correctly.
+      // Dropped regardless of politeness: a second incoming offer arriving
+      // while the first is still mid-flight (no local offer of ours
+      // involved at all — see applyingRenegotiateOfferRef's declaration)
+      // hits the same "wrong state: stable" crash once the first finishes.
+      if (applyingRenegotiateOfferRef.current) return;
+      const isPolite = info.direction === "incoming";
+      const collision = renegotiatingRef.current || pc.signalingState !== "stable";
+      if (collision && !isPolite) return;
+      applyingRenegotiateOfferRef.current = true;
       try {
         setCall((prev) => (prev ? { ...prev, kind: payload.kind } : prev));
         if (payload.kind === "video") setIsRemoteCameraOff(false);
@@ -871,8 +1122,15 @@ export function CallProvider({ children }: { children: ReactNode }) {
         const answer = await pc.createAnswer();
         await pc.setLocalDescription(answer);
         getSocket().emit("call:renegotiate-answer", { callId: payload.callId, sdp: pc.localDescription!.toJSON() });
+        // We just answered — any offer WE had in flight was either already
+        // done, or (the collision/polite case) just got implicitly rolled
+        // back by the setRemoteDescription above, so it has no answer
+        // coming. Either way this side is no longer the offerer.
+        renegotiatingRef.current = false;
       } catch (err) {
         console.warn("[call] failed to apply renegotiate offer", err);
+      } finally {
+        applyingRenegotiateOfferRef.current = false;
       }
     },
     [flushPendingCandidates]
@@ -1150,7 +1408,21 @@ export function CallProvider({ children }: { children: ReactNode }) {
     renegotiatingRef.current = true;
     try {
       await ensureAndroidCallPermissions(false, true);
-      const videoStream = await mediaDevices.getUserMedia({ video: { facingMode: "user" } });
+      const videoStream = await mediaDevices.getUserMedia({
+        video: {
+          facingMode: "user",
+          width: {
+            ideal: 640,
+          },
+          height: {
+            ideal: 480,
+          },
+          frameRate: {
+            ideal: 24,
+            max: 30,
+          },
+        },
+      });
       const videoTrack = videoStream.getVideoTracks()[0];
       if (!videoTrack) throw new Error("no video track from getUserMedia");
       localStream.addTrack(videoTrack);

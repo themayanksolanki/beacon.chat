@@ -7,6 +7,7 @@ import { usersRouter } from "./routes/users";
 import { profileRouter } from "./routes/profile";
 import { mediaRouter } from "./routes/media";
 import { devicesRouter } from "./routes/devices";
+import { callsRouter } from "./routes/calls";
 
 export function createApp() {
   const app = express();
@@ -29,6 +30,7 @@ export function createApp() {
   app.use("/profile", profileRouter);
   app.use("/media", mediaRouter);
   app.use("/devices", devicesRouter);
+  app.use("/calls", callsRouter);
 
   return app;
 }

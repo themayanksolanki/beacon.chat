@@ -307,3 +307,17 @@ export function requestChatMediaUploadUrl(token: string, messageId: string, kind
     body: JSON.stringify({ messageId, kind }),
   });
 }
+
+export interface IceServerConfig {
+  urls: string;
+  username?: string;
+  credential?: string;
+}
+
+// Fetched fresh before each call (see CallContext.tsx) rather than read from
+// a static bundled value — these are short-lived (Twilio's default TTL is
+// 24h) and minted server-side, so the app never holds a long-lived TURN
+// credential that could be pulled out of the APK/IPA and abused.
+export function getTurnCredentials(token: string) {
+  return request<{ iceServers: IceServerConfig[] }>("/calls/turn-credentials", { token });
+}
