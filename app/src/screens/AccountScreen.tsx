@@ -13,7 +13,7 @@ type Props = NativeStackScreenProps<MainStackParamList, "Account">;
 export default function AccountScreen({ navigation }: Props) {
   const { colors } = useTheme();
   const styles = useMemo(() => createStyles(colors), [colors]);
-  const { email, logout, deleteAccount } = useAuth();
+  const { email, phoneNumber, logout, deleteAccount } = useAuth();
   const [deleting, setDeleting] = useState(false);
 
   const confirmDeleteAccount = useCallback(() => {
@@ -39,30 +39,51 @@ export default function AccountScreen({ navigation }: Props) {
     );
   }, [deleteAccount]);
 
-  const openUpdateEmail = useCallback(() => {
-    Alert.alert("Coming soon", "Updating your email address isn't supported yet.");
-  }, []);
-
   return (
     <View style={styles.container}>
-      <Text style={styles.sectionHeader}>EMAIL</Text>
+      <Text style={styles.sectionHeader}>LOGIN DETAILS</Text>
       <View style={styles.section}>
         <View style={styles.row}>
           <View style={styles.rowLeft}>
             <Ionicons name="mail-outline" size={20} color={colors.text} />
-            <Text style={styles.emailLabel}>{email}</Text>
+            <Text style={styles.emailLabel}>{email ?? "No email added"}</Text>
           </View>
         </View>
+        {!email ? (
+          <>
+            <View style={styles.divider} />
+            <Pressable style={styles.row} onPress={() => navigation.navigate("AddContactMethod", { method: "email" })}>
+              <View style={styles.rowLeft}>
+                <Ionicons name="add-circle-outline" size={20} color={colors.accent} />
+                <Text style={styles.addLabel}>Add email address</Text>
+              </View>
+              <Ionicons name="chevron-forward" size={20} color={colors.textTertiary} />
+            </Pressable>
+          </>
+        ) : null}
         <View style={styles.divider} />
-        <Pressable style={styles.row} onPress={openUpdateEmail}>
+        <View style={styles.row}>
           <View style={styles.rowLeft}>
-            <Ionicons name="pencil-outline" size={20} color={colors.text} />
-            <Text style={styles.rowLabel}>Update email</Text>
+            <Ionicons name="call-outline" size={20} color={colors.text} />
+            <Text style={styles.emailLabel}>{phoneNumber ?? "No mobile number added"}</Text>
           </View>
-          <Ionicons name="chevron-forward" size={20} color={colors.textTertiary} />
-        </Pressable>
+        </View>
+        {!phoneNumber ? (
+          <>
+            <View style={styles.divider} />
+            <Pressable style={styles.row} onPress={() => navigation.navigate("AddContactMethod", { method: "phone" })}>
+              <View style={styles.rowLeft}>
+                <Ionicons name="add-circle-outline" size={20} color={colors.accent} />
+                <Text style={styles.addLabel}>Add mobile number</Text>
+              </View>
+              <Ionicons name="chevron-forward" size={20} color={colors.textTertiary} />
+            </Pressable>
+          </>
+        ) : null}
       </View>
-      <Text style={styles.sectionFooter}>This is the email address associated with your account.</Text>
+      <Text style={styles.sectionFooter}>
+        You can sign in with either your email or mobile number, once both are added.
+      </Text>
 
       <Text style={styles.sectionHeader}>SESSION</Text>
       <View style={styles.section}>
@@ -147,4 +168,5 @@ const createStyles = (colors: ThemeColors) =>
     rowLabel: { fontSize: 16, color: colors.text },
     destructiveLabel: { fontSize: 16, color: colors.danger },
     emailLabel: { fontSize: 15, color: colors.textSecondary },
+    addLabel: { fontSize: 16, color: colors.accent },
   });

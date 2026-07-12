@@ -1,7 +1,13 @@
 import { useMemo, useRef, useState } from "react";
 import { StyleSheet, TextInput, View, type NativeSyntheticEvent } from "react-native";
 import { Ionicons } from "@expo/vector-icons";
-import { GiphyContent, GiphyGridView, type GiphyContentRequest, type GiphyMedia } from "@giphy/react-native-sdk";
+import {
+  GiphyContent,
+  GiphyGridView,
+  GiphyMediaType,
+  type GiphyContentRequest,
+  type GiphyMedia,
+} from "@giphy/react-native-sdk";
 
 import { mediaToPickedGif, type PickedGif } from "../media/gifPicker";
 import { useTheme } from "../ThemeContext";
@@ -9,29 +15,46 @@ import type { ThemeColors } from "../theme";
 
 export interface GifTrayProps {
   height: number;
+  /** Which GIPHY catalog to browse — a sticker is fetched/sent through the
+   * exact same PickedGif shape and message pipeline as a GIF (see
+   * ChatScreen's sendGif), just a different content type in the picker. */
+  mediaType: "gif" | "sticker";
   onSelectGif: (gif: PickedGif) => void;
 }
 
 const SEARCH_DEBOUNCE_MS = 300;
 
-// Inline GIF search tray, embedded in place of the keyboard (see
-// ChatScreen's gifTrayOpen state) rather than the SDK's full-screen
+function trendingFor(mediaType: "gif" | "sticker"): GiphyContentRequest {
+  return mediaType === "sticker" ? GiphyContent.trendingStickers() : GiphyContent.trendingGifs();
+}
+
+// Inline GIF/sticker search tray, embedded in place of the keyboard (see
+// ChatScreen's pickerOpen state) rather than the SDK's full-screen
 // GiphyDialog modal — GiphyGridView is the SDK's plain, non-modal React
 // component for this. There's no bundled search bar, so this pairs it with
 // its own debounced TextInput, feeding a fresh GiphyContentRequest into the
-// grid's `content` prop on every query change.
-export default function GifTray({ height, onSelectGif }: GifTrayProps) {
+// grid's `content` prop on every query change. The parent mounts a fresh
+// instance per tab (key={mediaType}) rather than this reacting to prop
+// changes itself, so switching tabs always starts from a clean trending feed.
+export default function GifTray({ height, mediaType, onSelectGif }: GifTrayProps) {
   const { colors, scheme } = useTheme();
   const styles = useMemo(() => createStyles(colors), [colors]);
   const [query, setQuery] = useState("");
-  const [content, setContent] = useState<GiphyContentRequest>(() => GiphyContent.trendingGifs());
+  const [content, setContent] = useState<GiphyContentRequest>(() => trendingFor(mediaType));
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const handleChangeText = (text: string) => {
     setQuery(text);
     if (debounceRef.current) clearTimeout(debounceRef.current);
     debounceRef.current = setTimeout(() => {
-      setContent(text.trim() ? GiphyContent.search({ searchQuery: text.trim() }) : GiphyContent.trendingGifs());
+      setContent(
+        text.trim()
+          ? GiphyContent.search({
+              searchQuery: text.trim(),
+              mediaType: mediaType === "sticker" ? GiphyMediaType.Sticker : GiphyMediaType.Gif,
+            })
+          : trendingFor(mediaType)
+      );
     }, SEARCH_DEBOUNCE_MS);
   };
 
@@ -46,7 +69,7 @@ export default function GifTray({ height, onSelectGif }: GifTrayProps) {
         <Ionicons name="search" size={16} color={colors.textTertiary} />
         <TextInput
           style={styles.searchInput}
-          placeholder="Search GIFs"
+          placeholder={mediaType === "sticker" ? "Search stickers" : "Search GIFs"}
           placeholderTextColor={colors.textTertiary}
           value={query}
           onChangeText={handleChangeText}

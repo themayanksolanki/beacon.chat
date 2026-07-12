@@ -1,5 +1,5 @@
-import { useMemo } from "react";
-import { Image, Pressable, StyleSheet, Text, View } from "react-native";
+import { useMemo, useState } from "react";
+import { Image, Pressable, StyleSheet, Text, TextInput, View } from "react-native";
 import type { BottomTabScreenProps } from "@react-navigation/bottom-tabs";
 import type { CompositeScreenProps } from "@react-navigation/native";
 import type { NativeStackScreenProps } from "@react-navigation/native-stack";
@@ -17,77 +17,147 @@ type Props = CompositeScreenProps<
 
 const APPEARANCE_LABELS = { system: "System", light: "Light", dark: "Dark" };
 
+function matches(keywords: string[], query: string): boolean {
+  if (!query) return true;
+  return keywords.some((keyword) => keyword.toLowerCase().includes(query));
+}
+
 export default function SettingsScreen({ navigation }: Props) {
   const { colors, preference } = useTheme();
   const styles = useMemo(() => createStyles(colors), [colors]);
   const { profile, email } = useAuth();
+  const [searchQuery, setSearchQuery] = useState("");
+  const query = searchQuery.trim().toLowerCase();
+
+  const showProfile = matches(["profile", "edit profile", "name", "photo", "phone number", profile?.fullName ?? "", email ?? ""], query);
+  const showAppearance = matches(["appearance", "theme", "dark mode", "light mode", "system"], query);
+  const showAccount = matches(["account", "sign in", "sign out", "delete account"], query);
+  const showBlockedUsers = matches(["privacy", "blocked users", "block"], query);
+  const noResults = query.length > 0 && !showProfile && !showAppearance && !showAccount && !showBlockedUsers;
 
   return (
     <View style={styles.container}>
-      <Text style={styles.sectionHeader}>PROFILE</Text>
-      <View style={styles.section}>
-        <Pressable style={styles.profileRow} onPress={() => navigation.navigate("EditProfile")}>
-          {profile?.photoUri ? (
-            <Image source={{ uri: profile.photoUri }} style={styles.avatar} />
-          ) : (
-            <View style={[styles.avatar, { backgroundColor: colorForName(profile?.fullName ?? "?") }]}>
-              <Text style={styles.avatarInitial}>{initialFor(profile?.fullName)}</Text>
-            </View>
-          )}
-          <View style={styles.info}>
-            <Text style={styles.name}>{profile?.fullName}</Text>
-            <Text style={styles.email}>{email}</Text>
-          </View>
-          <Ionicons name="chevron-forward" size={20} color={colors.textTertiary} />
-        </Pressable>
+      <View style={styles.searchBar}>
+        <Ionicons name="search" size={16} color={colors.textTertiary} />
+        <TextInput
+          value={searchQuery}
+          onChangeText={setSearchQuery}
+          placeholder="Search settings"
+          placeholderTextColor={colors.textTertiary}
+          style={styles.searchInput}
+        />
+        {searchQuery ? (
+          <Pressable onPress={() => setSearchQuery("")} hitSlop={8}>
+            <Ionicons name="close-circle" size={18} color={colors.textTertiary} />
+          </Pressable>
+        ) : null}
       </View>
-      <Text style={styles.sectionFooter}>Tap to edit your name, photo, and phone number.</Text>
 
-      <Text style={styles.sectionHeader}>APPEARANCE</Text>
-      <View style={styles.section}>
-        <Pressable style={styles.accountRow} onPress={() => navigation.navigate("Appearance")}>
-          <View style={styles.accountRowLeft}>
-            <Ionicons name="color-palette-outline" size={20} color={colors.text} />
-            <Text style={styles.rowLabel}>Appearance</Text>
-          </View>
-          <View style={styles.accountRowLeft}>
-            <Text style={styles.rowValue}>{APPEARANCE_LABELS[preference]}</Text>
-            <Ionicons name="chevron-forward" size={20} color={colors.textTertiary} />
-          </View>
-        </Pressable>
-      </View>
-      <Text style={styles.sectionFooter}>Choose how Beacon Chat looks on this device.</Text>
+      {noResults ? (
+        <View style={styles.center}>
+          <Ionicons name="search-outline" size={32} color={colors.textTertiary} />
+          <Text style={styles.empty}>No settings match your search</Text>
+        </View>
+      ) : (
+        <>
+          {showProfile ? (
+            <>
+              <Text style={styles.sectionHeader}>PROFILE</Text>
+              <View style={styles.section}>
+                <Pressable style={styles.profileRow} onPress={() => navigation.navigate("EditProfile")}>
+                  {profile?.photoUri ? (
+                    <Image source={{ uri: profile.photoUri }} style={styles.avatar} />
+                  ) : (
+                    <View style={[styles.avatar, { backgroundColor: colorForName(profile?.fullName ?? "?") }]}>
+                      <Text style={styles.avatarInitial}>{initialFor(profile?.fullName)}</Text>
+                    </View>
+                  )}
+                  <View style={styles.info}>
+                    <Text style={styles.name}>{profile?.fullName}</Text>
+                    <Text style={styles.email}>{email}</Text>
+                  </View>
+                  <Ionicons name="chevron-forward" size={20} color={colors.textTertiary} />
+                </Pressable>
+              </View>
+              <Text style={styles.sectionFooter}>Tap to edit your name, photo, and phone number.</Text>
+            </>
+          ) : null}
 
-      <Text style={styles.sectionHeader}>ACCOUNT</Text>
-      <View style={styles.section}>
-        <Pressable style={styles.accountRow} onPress={() => navigation.navigate("Account")}>
-          <View style={styles.accountRowLeft}>
-            <Ionicons name="person-circle-outline" size={20} color={colors.text} />
-            <Text style={styles.rowLabel}>Account</Text>
-          </View>
-          <Ionicons name="chevron-forward" size={20} color={colors.textTertiary} />
-        </Pressable>
-      </View>
-      <Text style={styles.sectionFooter}>Manage sign-in and account deletion.</Text>
+          {showAppearance ? (
+            <>
+              <Text style={styles.sectionHeader}>APPEARANCE</Text>
+              <View style={styles.section}>
+                <Pressable style={styles.accountRow} onPress={() => navigation.navigate("Appearance")}>
+                  <View style={styles.accountRowLeft}>
+                    <Ionicons name="color-palette-outline" size={20} color={colors.text} />
+                    <Text style={styles.rowLabel}>Appearance</Text>
+                  </View>
+                  <View style={styles.accountRowLeft}>
+                    <Text style={styles.rowValue}>{APPEARANCE_LABELS[preference]}</Text>
+                    <Ionicons name="chevron-forward" size={20} color={colors.textTertiary} />
+                  </View>
+                </Pressable>
+              </View>
+              <Text style={styles.sectionFooter}>Choose how Beacon Chat looks on this device.</Text>
+            </>
+          ) : null}
 
-      <Text style={styles.sectionHeader}>PRIVACY</Text>
-      <View style={styles.section}>
-        <Pressable style={styles.accountRow} onPress={() => navigation.navigate("BlockedUsers")}>
-          <View style={styles.accountRowLeft}>
-            <Ionicons name="hand-left-outline" size={20} color={colors.text} />
-            <Text style={styles.rowLabel}>Blocked Users</Text>
-          </View>
-          <Ionicons name="chevron-forward" size={20} color={colors.textTertiary} />
-        </Pressable>
-      </View>
-      <Text style={styles.sectionFooter}>Blocked users can't message or call you.</Text>
+          {showAccount ? (
+            <>
+              <Text style={styles.sectionHeader}>ACCOUNT</Text>
+              <View style={styles.section}>
+                <Pressable style={styles.accountRow} onPress={() => navigation.navigate("Account")}>
+                  <View style={styles.accountRowLeft}>
+                    <Ionicons name="person-circle-outline" size={20} color={colors.text} />
+                    <Text style={styles.rowLabel}>Account</Text>
+                  </View>
+                  <Ionicons name="chevron-forward" size={20} color={colors.textTertiary} />
+                </Pressable>
+              </View>
+              <Text style={styles.sectionFooter}>Manage sign-in and account deletion.</Text>
+            </>
+          ) : null}
+
+          {showBlockedUsers ? (
+            <>
+              <Text style={styles.sectionHeader}>PRIVACY</Text>
+              <View style={styles.section}>
+                <Pressable style={styles.accountRow} onPress={() => navigation.navigate("BlockedUsers")}>
+                  <View style={styles.accountRowLeft}>
+                    <Ionicons name="hand-left-outline" size={20} color={colors.text} />
+                    <Text style={styles.rowLabel}>Blocked Users</Text>
+                  </View>
+                  <Ionicons name="chevron-forward" size={20} color={colors.textTertiary} />
+                </Pressable>
+              </View>
+              <Text style={styles.sectionFooter}>Blocked users can't message or call you.</Text>
+            </>
+          ) : null}
+        </>
+      )}
     </View>
   );
 }
 
 const createStyles = (colors: ThemeColors) =>
   StyleSheet.create({
-    container: { flex: 1, backgroundColor: colors.background, paddingTop: 20 },
+    container: { flex: 1, backgroundColor: colors.background, paddingTop: 12 },
+    center: { alignItems: "center", justifyContent: "center", gap: 8, paddingTop: 60 },
+    empty: { color: colors.textTertiary },
+    searchBar: {
+      flexDirection: "row",
+      alignItems: "center",
+      gap: 8,
+      marginHorizontal: 16,
+      marginBottom: 12,
+      paddingHorizontal: 12,
+      paddingVertical: 8,
+      borderRadius: 10,
+      backgroundColor: colors.surface,
+      borderWidth: StyleSheet.hairlineWidth,
+      borderColor: colors.border,
+    },
+    searchInput: { flex: 1, fontSize: 15, color: colors.text, padding: 0 },
     section: {
       backgroundColor: colors.surface,
       borderTopWidth: StyleSheet.hairlineWidth,

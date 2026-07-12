@@ -329,6 +329,16 @@ export function getMessages(conversationId: string): MessageRow[] {
   );
 }
 
+/** Every image/video/gif shared in this conversation, either direction, most recent first — powers ContactInfoScreen's "Media, links and docs" grid. */
+export function getMediaMessages(conversationId: string): MessageRow[] {
+  return db.getAllSync<MessageRow>(
+    `SELECT * FROM messages
+     WHERE conversation_id = ? AND kind IN ('image', 'video', 'gif') AND deleted_at IS NULL
+     ORDER BY sent_at DESC`,
+    [conversationId]
+  );
+}
+
 /**
  * The most recent `limit` messages, for ChatScreen's initial/paginated load —
  * unlike getMessages above (full history, used by delete/clear/test-bot
@@ -697,6 +707,16 @@ export function insertCallIfAbsent(call: CallRow): void {
 /** "Delete for me" for a logged call — local-only, same as deleteMessage; nothing to tell the peer or server since call history is already per-device. */
 export function deleteCall(id: string): void {
   db.runSync(`DELETE FROM calls WHERE id = ?`, [id]);
+}
+
+/** Bulk counterpart of deleteCall — used by CallHistoryScreen's "Delete all"/multi-select delete, one transaction instead of one round-trip per row. */
+export function deleteCalls(ids: string[]): void {
+  if (ids.length === 0) return;
+  db.withTransactionSync(() => {
+    for (const id of ids) {
+      db.runSync(`DELETE FROM calls WHERE id = ?`, [id]);
+    }
+  });
 }
 
 export function updateCallOutcome(

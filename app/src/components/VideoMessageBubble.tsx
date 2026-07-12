@@ -25,6 +25,12 @@ interface Props {
   /** Opens the video full-screen to actually play it (see MediaViewerModal)
    * — the in-bubble thumbnail is a static, non-interactive preview frame. */
   onExpand?: () => void;
+  /** Forwarded to this Pressable directly rather than relying on bubbling to
+   * a parent Pressable — a long-press starting on this thumbnail claims the
+   * touch responder itself (it's the deepest Pressable), so without this the
+   * parent MessageBubble's own onLongPress (the reply/copy/delete/pin menu)
+   * never fired here, only on the bubble's border/padding. */
+  onLongPress?: () => void;
 }
 
 function formatDuration(ms: number): string {
@@ -54,6 +60,7 @@ export default function VideoMessageBubble({
   onDownload,
   onCancelSend,
   onExpand,
+  onLongPress,
 }: Props) {
   const { colors } = useTheme();
   const styles = useMemo(() => createStyles(colors), [colors]);
@@ -79,7 +86,8 @@ export default function VideoMessageBubble({
       <Pressable
         style={containerStyle}
         onPress={!isSending ? onExpand : undefined}
-        disabled={isSending || !onExpand}
+        onLongPress={onLongPress}
+        disabled={!onExpand && !onLongPress}
       >
         <VideoView player={player} style={styles.video} nativeControls={false} contentFit="cover" />
         {!isSending ? (
@@ -113,7 +121,8 @@ export default function VideoMessageBubble({
     <Pressable
       style={containerStyle}
       onPress={mediaStatus === "downloading" ? undefined : onDownload}
-      disabled={mediaStatus === "downloading"}
+      onLongPress={mediaStatus === "downloading" ? undefined : onLongPress}
+      disabled={mediaStatus === "downloading" && !onLongPress}
     >
       <View style={[styles.video, styles.placeholder]}>
         {mediaStatus === "downloading" ? (

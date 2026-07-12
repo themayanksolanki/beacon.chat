@@ -30,8 +30,8 @@ interface Props {
   currentReaction?: string | null;
   onReact?: (emoji: string) => void;
   onClose: () => void;
-  /** Horizontal placement relative to the anchor — "center" (default, chat bubbles) or pinned to the left screen margin (e.g. a full-width list row, where centering under the touch point looks arbitrary). */
-  align?: "center" | "left";
+  /** Horizontal placement relative to the anchor — "center" (default, chat bubbles), pinned to the left screen margin (e.g. a full-width list row), or pinned to the right margin (e.g. a header overflow/three-dot button). */
+  align?: "center" | "left" | "right";
 }
 
 export default function MessageActionMenu({
@@ -73,10 +73,12 @@ export default function MessageActionMenu({
   const left =
     align === "left"
       ? SCREEN_MARGIN
-      : Math.min(
-          Math.max(SCREEN_MARGIN, anchor.x + anchor.width / 2 - CARD_WIDTH / 2),
-          screenWidth - CARD_WIDTH - SCREEN_MARGIN
-        );
+      : align === "right"
+        ? screenWidth - CARD_WIDTH - SCREEN_MARGIN
+        : Math.min(
+            Math.max(SCREEN_MARGIN, anchor.x + anchor.width / 2 - CARD_WIDTH / 2),
+            screenWidth - CARD_WIDTH - SCREEN_MARGIN
+          );
 
   return (
     <Modal visible={visible} transparent animationType="fade" onRequestClose={onClose}>

@@ -91,12 +91,10 @@ export default function FloatingCallWidget() {
     call,
     phase,
     remoteStreamURL,
-    localStreamURL,
     isMuted,
     isSpeakerOn,
     isCameraOff,
     isRemoteCameraOff,
-    isFrontCamera,
     callDurationSec,
     endCall,
     toggleMute,
@@ -148,8 +146,12 @@ export default function FloatingCallWidget() {
   if (routeName === "ActiveCall" || routeName === "IncomingCall") return null;
 
   const isVideoCall = call.kind === "video";
+  // This widget always represents the peer, never a fallback to our own
+  // camera — same principle as ActiveCallScreen's primary view: showing our
+  // own video here just because the peer's camera is off isn't useful for a
+  // "glance at the call" widget, and reads as if we were staring at
+  // ourselves.
   const showRemoteVideo = isVideoCall && !isRemoteCameraOff && !!remoteStreamURL;
-  const showLocalVideo = !showRemoteVideo && isVideoCall && !isCameraOff && !!localStreamURL;
   const expand = () => navigationRef.isReady() && navigationRef.navigate("ActiveCall");
 
   return (
@@ -160,14 +162,6 @@ export default function FloatingCallWidget() {
       <Pressable style={styles.preview} onPress={expand}>
         {showRemoteVideo ? (
           <RTCView streamURL={remoteStreamURL!} style={StyleSheet.absoluteFill} objectFit="cover" zOrder={0} />
-        ) : showLocalVideo ? (
-          <RTCView
-            streamURL={localStreamURL!}
-            style={StyleSheet.absoluteFill}
-            objectFit="cover"
-            mirror={isFrontCamera}
-            zOrder={0}
-          />
         ) : (
           <View style={styles.avatarBackdrop}>
             <Avatar name={call.peerName} avatarUrl={call.peerAvatarUrl} size={48} />

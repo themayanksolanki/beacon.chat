@@ -26,12 +26,18 @@ datasource db {
 // that moved to Session, one-to-many.
 model User {
   id                  String    @id @default(uuid())
-  email               String    @unique
+  // Nullable: a user can sign up/log in with email OR phone (contactNumber
+  // below) — exactly one is required at signup, both are valid unique login
+  // identifiers, and the other can be added later from Account (see
+  // routes/profile.ts's email/verify-otp and phone/verify-otp). Postgres,
+  // like SQLite, doesn't enforce uniqueness across NULLs, so two phone-only
+  // accounts can both have a null email with no conflict.
+  email               String?   @unique
   publicKey           String?   @map("public_key")
-  // Optional, self-reported, unverified — same role/shape as today
-  // (canonical E.164 string, doubles as an add-contact search key).
-  // Postgres, like SQLite, does not enforce uniqueness across NULLs, so
-  // this behaves the same as the old idx_users_contact_number.
+  // Once OTP-verified (see routes/auth.ts's phone-otp/verify and
+  // routes/profile.ts's phone/verify-otp), this doubles as the phone login
+  // identifier — same column that used to hold a self-reported, unverified
+  // number, now proven by OTP the same way email always has been.
   contactNumber       String?   @unique @map("contact_number")
   // Display profile — formerly lived in a separate Mongo collection; folded
   // in here since it's 1:1 with the user row anyway and Mongo held nothing
@@ -106,15 +112,22 @@ model Session {
   @@map("sessions")
 }
 
+// Exactly one of email/phone is set per row, depending on which channel the
+// challenge is for — the same table backs email OTP, phone OTP, and the
+// authenticated "add a missing identifier" flows in routes/profile.ts, since
+// all four are the same generate/hash/store/verify/cooldown shape (see
+// otpChallenge.ts).
 model OtpChallenge {
   id        String   @id @default(uuid())
-  email     String
+  email     String?
+  phone     String?
   codeHash  String   @map("code_hash")
   expiresAt DateTime @map("expires_at")
   attempts  Int      @default(0)
   createdAt DateTime @default(now()) @map("created_at")
 
   @@index([email, createdAt])
+  @@index([phone, createdAt])
   @@map("otp_challenges")
 }
 

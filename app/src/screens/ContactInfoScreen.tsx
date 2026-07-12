@@ -1,5 +1,6 @@
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { Alert, Image, Pressable, StyleSheet, Text, View } from "react-native";
+import { useFocusEffect } from "@react-navigation/native";
 import type { NativeStackScreenProps } from "@react-navigation/native-stack";
 import { Ionicons, MaterialCommunityIcons } from "@expo/vector-icons";
 import * as Clipboard from "expo-clipboard";
@@ -10,7 +11,14 @@ import { useAuth } from "../auth/AuthContext";
 import { useCall } from "../calls/CallContext";
 import { clearConversation } from "../chat/clearConversation";
 import { deleteConversation } from "../chat/deleteConversation";
-import { blockUser, getConversationById, isUserBlocked, unblockUser, updateConversationProfile } from "../db/database";
+import {
+  blockUser,
+  getConversationById,
+  getMediaMessages,
+  isUserBlocked,
+  unblockUser,
+  updateConversationProfile,
+} from "../db/database";
 import { usePresence } from "../presence/PresenceContext";
 import { TEST_BOT_CONVERSATION_ID } from "../testBot";
 import { useTheme } from "../ThemeContext";
@@ -37,6 +45,12 @@ export default function ContactInfoScreen({ route, navigation }: Props) {
   // them) — kept separate rather than overwriting that column's meaning.
   const [peerCreatedAt, setPeerCreatedAt] = useState<number | null>(null);
   const [blocked, setBlocked] = useState(() => isUserBlocked(conversationId));
+  const [mediaCount, setMediaCount] = useState(() => getMediaMessages(conversationId).length);
+  useFocusEffect(
+    useCallback(() => {
+      setMediaCount(getMediaMessages(conversationId).length);
+    }, [conversationId])
+  );
   const { colors } = useTheme();
   const styles = useMemo(() => createStyles(colors), [colors]);
   const { startCall } = useCall();
@@ -184,6 +198,13 @@ export default function ContactInfoScreen({ route, navigation }: Props) {
             <Ionicons name="videocam" size={20} color={blocked ? colors.textTertiary : colors.accent} />
             <Text style={[styles.actionLabel, blocked && { color: colors.textTertiary }]}>Video</Text>
           </Pressable>
+          <Pressable
+            style={styles.actionButton}
+            onPress={() => navigation.navigate("Chat", { conversationId, openSearch: true })}
+          >
+            <Ionicons name="search" size={20} color={colors.accent} />
+            <Text style={styles.actionLabel}>Search</Text>
+          </Pressable>
         </View>
       </View>
 
@@ -211,6 +232,19 @@ export default function ContactInfoScreen({ route, navigation }: Props) {
           <Text style={styles.rowLabel}>In Beacon since</Text>
           <Text style={styles.rowValue}>{formatMemberSince(peerCreatedAt ?? conversation.created_at)}</Text>
         </View>
+      </View>
+
+      <View style={styles.section}>
+        <Pressable style={styles.row} onPress={() => navigation.navigate("SharedMedia", { conversationId })}>
+          <View style={styles.mediaRowLeft}>
+            <Ionicons name="image-outline" size={20} color={colors.text} />
+            <Text style={styles.rowLabel}>Media, links and docs</Text>
+          </View>
+          <View style={styles.mediaRowLeft}>
+            <Text style={styles.rowValue}>{mediaCount}</Text>
+            <Ionicons name="chevron-forward" size={18} color={colors.textTertiary} />
+          </View>
+        </Pressable>
       </View>
 
       {/* Clear Chat gets its own container, separate from the account-level
@@ -293,6 +327,7 @@ const createStyles = (colors: ThemeColors) =>
       gap: 10,
     },
     info: { flex: 1 },
+    mediaRowLeft: { flexDirection: "row", alignItems: "center", gap: 10 },
     rowLabel: { fontSize: 16, color: colors.text },
     rowValue: { fontSize: 15, color: colors.textSecondary },
     fingerprint: { fontSize: 13, color: colors.textSecondary, marginTop: 4, fontFamily: "Menlo" },

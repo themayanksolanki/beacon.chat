@@ -18,6 +18,12 @@ interface Props {
   uploadProgress?: number;
   onCancelSend?: () => void;
   onPress?: () => void;
+  /** Forwarded to this Pressable directly rather than relying on bubbling to
+   * a parent Pressable — a long-press starting on this image/gif claims the
+   * touch responder itself (it's the deepest Pressable), so without this the
+   * parent MessageBubble's own onLongPress (the reply/copy/delete/pin menu)
+   * never fired here, only on the bubble's border/padding. */
+  onLongPress?: () => void;
 }
 
 export default function ImageMessageBubble({
@@ -28,6 +34,7 @@ export default function ImageMessageBubble({
   uploadProgress,
   onCancelSend,
   onPress,
+  onLongPress,
 }: Props) {
   const { colors } = useTheme();
   const styles = useMemo(() => createStyles(colors), [colors]);
@@ -46,7 +53,8 @@ export default function ImageMessageBubble({
     <Pressable
       style={[styles.container, { width: displayWidth, height: displayHeight }]}
       onPress={onPress}
-      disabled={!onPress}
+      onLongPress={onLongPress}
+      disabled={!onPress && !onLongPress}
     >
       {imageUri ? (
         <Image source={{ uri: imageUri }} style={styles.image} />

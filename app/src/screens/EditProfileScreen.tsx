@@ -5,12 +5,8 @@ import type { NativeStackScreenProps } from "@react-navigation/native-stack";
 import { Ionicons } from "@expo/vector-icons";
 
 import type { MainStackParamList } from "../../App";
-import { ApiError } from "../api/client";
 import { useAuth } from "../auth/AuthContext";
 import PrimaryButton from "../components/PrimaryButton";
-import PhoneNumberInput from "../components/PhoneNumberInput";
-import { DEFAULT_COUNTRY, type CountryDialCode } from "../constants/countryCodes";
-import { isValidLocalNumber, parseE164, toE164 } from "../phone/phoneValidation";
 import { useTheme } from "../ThemeContext";
 import { colorForName, initialFor, type ThemeColors } from "../theme";
 
@@ -21,14 +17,9 @@ const MIN_NAME_LENGTH = 3;
 export default function EditProfileScreen({ navigation }: Props) {
   const { colors } = useTheme();
   const styles = useMemo(() => createStyles(colors), [colors]);
-  const { profile, updateProfile, updatePhoneNumber } = useAuth();
+  const { profile, updateProfile } = useAuth();
   const [fullName, setFullName] = useState(profile?.fullName ?? "");
   const [photoUri, setPhotoUri] = useState<string | null>(profile?.photoUri ?? null);
-
-  const initialPhone = useMemo(() => (profile?.phoneNumber ? parseE164(profile.phoneNumber) : null), [profile]);
-  const [phoneCountry, setPhoneCountry] = useState<CountryDialCode>(initialPhone?.country ?? DEFAULT_COUNTRY);
-  const [phoneDigits, setPhoneDigits] = useState(initialPhone?.localDigits ?? "");
-  const [phoneTouched, setPhoneTouched] = useState(false);
 
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -55,26 +46,12 @@ export default function EditProfileScreen({ navigation }: Props) {
 
   const onSave = async () => {
     setError(null);
-    setPhoneTouched(true);
-    if (phoneDigits && !isValidLocalNumber(phoneCountry.dialCode, phoneDigits)) {
-      setError("Enter a valid mobile number.");
-      return;
-    }
-
     setSaving(true);
     try {
-      const newPhoneNumber = phoneDigits ? toE164(phoneCountry.dialCode, phoneDigits) : null;
-      if (newPhoneNumber !== (profile?.phoneNumber ?? null)) {
-        await updatePhoneNumber(newPhoneNumber);
-      }
       await updateProfile(fullName.trim(), photoUri);
       navigation.goBack();
     } catch (e) {
-      if (e instanceof ApiError && e.message === "phone_already_registered") {
-        setError("That number is already linked to another Beacon account.");
-      } else {
-        setError(e instanceof Error ? e.message : "Something went wrong");
-      }
+      setError(e instanceof Error ? e.message : "Something went wrong");
       setSaving(false);
     }
   };
@@ -118,19 +95,6 @@ export default function EditProfileScreen({ navigation }: Props) {
         <Text style={styles.fieldHint}>This is the name your contacts will see.</Text>
       </View>
 
-      <View style={styles.phoneField}>
-        <Text style={styles.fieldLabel}>Contact number (optional)</Text>
-        <PhoneNumberInput
-          country={phoneCountry}
-          localNumber={phoneDigits}
-          onChangeCountry={setPhoneCountry}
-          onChangeLocalNumber={setPhoneDigits}
-          showError={phoneTouched}
-          onBlur={() => setPhoneTouched(true)}
-        />
-        <Text style={styles.fieldHint}>Lets others find you by phone number in Add Contact.</Text>
-      </View>
-
       {memberSince ? (
         <View style={styles.memberSinceRow}>
           <Ionicons name="time-outline" size={14} color={colors.textTertiary} />
@@ -151,7 +115,6 @@ const createStyles = (colors: ThemeColors) =>
   StyleSheet.create({
     container: { flex: 1, alignItems: "center", padding: 24, paddingTop: 40, backgroundColor: colors.background },
     nameField: { width: "100%", marginTop: 28 },
-    phoneField: { width: "100%", marginTop: 20 },
     fieldLabel: { color: colors.textSecondary, fontSize: 13, fontWeight: "600", marginBottom: 6 },
     fieldHint: { color: colors.textTertiary, fontSize: 12, marginTop: 6 },
     photoHint: { color: colors.textTertiary, fontSize: 12, marginTop: 4 },

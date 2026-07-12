@@ -78,8 +78,13 @@ export default function ActiveCallScreen() {
 
   if (!call) return null;
 
+  // The big/primary slot always represents the peer — their video when
+  // available, their avatar otherwise — never a fallback to showing our own
+  // camera just because theirs happens to be off. Swapping to see our own
+  // video big only makes sense (and is only offered, see the PIP below)
+  // when both feeds are actually active.
   const showRemotePrimary = bothVideoActive ? !swapped : remoteVideoActive;
-  const showLocalPrimary = bothVideoActive ? swapped : !remoteVideoActive && localVideoActive;
+  const showLocalPrimary = bothVideoActive && swapped;
 
   const minimizeToPip = () => {
     const entered = ExpoCallPip.enterPipMode(PIP_ASPECT_RATIO.width, PIP_ASPECT_RATIO.height);
@@ -123,16 +128,21 @@ export default function ActiveCallScreen() {
         </View>
       )}
 
-      {bothVideoActive ? (
+      {/* The small preview always shows our own camera whenever it's on,
+          regardless of the peer's state — swapping to preview the peer's
+          feed small (while our own goes big) is only offered when both
+          feeds are actually active; there's nothing useful to swap to
+          otherwise. */}
+      {localVideoActive ? (
         <Pressable
           style={[styles.localPreview, { top: insets.top + 16 }]}
-          onPress={() => setSwapped((prev) => !prev)}
+          onPress={bothVideoActive ? () => setSwapped((prev) => !prev) : undefined}
         >
           {/* zOrder=1 puts this PIP's SurfaceView above the fullscreen RTCView's —
               on Android, RTCView renders via a real SurfaceView composited outside
               normal view draw order, so two overlapping RTCViews left at the same
               (default 0) zOrder z-fight/flicker against each other. */}
-          {swapped ? (
+          {bothVideoActive && swapped ? (
             <RTCView streamURL={remoteStreamURL!} style={StyleSheet.absoluteFill} objectFit="cover" zOrder={1} />
           ) : (
             <RTCView

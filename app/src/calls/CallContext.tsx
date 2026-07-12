@@ -16,6 +16,7 @@ import RNCallKeep, { CONSTANTS as CK_CONSTANTS } from "react-native-callkeep";
 import {
   mediaDevices,
   MediaStream,
+  MediaStreamTrack,
   RTCIceCandidate,
   RTCPeerConnection,
   RTCSessionDescription,
@@ -190,6 +191,16 @@ export function CallProvider({ children }: { children: ReactNode }) {
 
   const peerConnectionRef = useRef<RTCPeerConnection | null>(null);
   const localStreamRef = useRef<MediaStream | null>(null);
+  // Fallback accumulator for the remote track handler below — only used
+  // when a "track" event arrives with an empty event.streams (a known
+  // react-native-webrtc Android gap). Tracks every remote track seen so far;
+  // each new one triggers building a brand-new MediaStream (see the track
+  // handler for why it can't just be added to a single persistent stream).
+  const remoteTracksRef = useRef<MediaStreamTrack[]>([]);
+  // The MediaStream currently backing remoteStreamURL when using the
+  // fallback above — kept only so it can be released (without touching the
+  // still-in-use tracks) once superseded by a newer one.
+  const remoteStreamAccumulatorRef = useRef<MediaStream | null>(null);
   const pendingCandidatesRef = useRef<{ candidate: string; sdpMLineIndex: number | null; sdpMid: string | null }[]>(
     []
   );
@@ -337,6 +348,9 @@ export function CallProvider({ children }: { children: ReactNode }) {
     peerConnectionRef.current = null;
     localStreamRef.current?.getTracks().forEach((t) => t.stop());
     localStreamRef.current = null;
+    remoteStreamAccumulatorRef.current?.release(false);
+    remoteStreamAccumulatorRef.current = null;
+    remoteTracksRef.current = [];
     pendingCandidatesRef.current = [];
     remoteDescriptionSetRef.current = false;
     incomingInviteRef.current = null;
@@ -381,7 +395,10 @@ export function CallProvider({ children }: { children: ReactNode }) {
       // imports) — addEventListener works fine at runtime, so cast around it.
       const events = pc as unknown as {
         addEventListener(type: "icecandidate", listener: (event: { candidate: RTCIceCandidate | null }) => void): void;
-        addEventListener(type: "track", listener: (event: { streams: MediaStream[] }) => void): void;
+        addEventListener(
+          type: "track",
+          listener: (event: { streams: MediaStream[]; track: MediaStreamTrack }) => void
+        ): void;
         addEventListener(type: "connectionstatechange", listener: () => void): void;
       };
 
@@ -392,8 +409,39 @@ export function CallProvider({ children }: { children: ReactNode }) {
       });
 
       events.addEventListener("track", (event) => {
-        const [stream] = event.streams;
-        if (!stream) return;
+        // react-native-webrtc's Android build doesn't always populate
+        // event.streams (a long-standing upstream gap) even though the
+        // track itself always arrives — silently bailing out here used to
+        // mean the peer's video (and sometimes audio) never made it into
+        // remoteStreamURL at all, Android-only.
+        let stream = event.streams[0];
+        if (!stream) {
+          // Audio and video normally arrive as two separate track events, so
+          // this has to accumulate — but NOT by mutating one persistent
+          // MediaStream and re-emitting the same stream.toURL() each time.
+          // Android's native RTCView (WebRTCView.java's setStreamURL) only
+          // re-resolves which VideoTrack to render when the streamURL PROP
+          // STRING actually changes, and toURL() returns a stream's id,
+          // which is stable for the life of that MediaStream object — so if
+          // audio arrives first (binding to an audio-only stream, no video
+          // yet) and video arrives later added to that *same* stream
+          // instance, the prop never changes and the native view never
+          // re-binds to the now-available video track: black video,
+          // forever, on Android specifically (this exact bug — reproduced
+          // and confirmed against the WebRTCView.java source). Building a
+          // brand-new MediaStream (fresh id) with everything accumulated so
+          // far, every time, guarantees the prop changes and Android
+          // re-resolves the video track. The old wrapper is released (not
+          // its tracks, which are still owned by the peer connection) once
+          // superseded.
+          if (!remoteTracksRef.current.includes(event.track)) {
+            remoteTracksRef.current = [...remoteTracksRef.current, event.track];
+          }
+          const previous = remoteStreamAccumulatorRef.current;
+          stream = new MediaStream(remoteTracksRef.current);
+          remoteStreamAccumulatorRef.current = stream;
+          previous?.release(false);
+        }
         setRemoteStreamURL(stream.toURL());
         if (phaseRef.current !== "connected") {
           connectedAtRef.current = Date.now();
@@ -409,10 +457,21 @@ export function CallProvider({ children }: { children: ReactNode }) {
       events.addEventListener("connectionstatechange", () => {
         if (pc.connectionState === "failed" || pc.connectionState === "closed") {
           if (phaseRef.current !== "idle") {
-            const endedCallId = callRef.current?.callId;
+            // Every other self-initiated way a call ends (endCall,
+            // rejectIncomingCall, both ring-timeouts, the acceptIncomingCall/
+            // performOutgoingCallSetup catch blocks) tells the server via
+            // call:end so it clears activeCalls/userActiveCall — this path
+            // was the one exception, silently cleaning up only the local
+            // React state. The server's bookkeeping was left stuck "in a
+            // call" indefinitely (nothing else was ever going to clear it —
+            // the peer's socket is still perfectly connected), so the very
+            // next call attempt to or from either party got hard-rejected
+            // as "busy"/"That person is on another call" even though the
+            // call had genuinely ended on this device.
+            getSocket().emit("call:end", { callId });
             logCallOutcome(phaseRef.current === "connected" ? "completed" : "failed");
-            if (callKeepReadyRef.current && endedCallId) {
-              safeCallKeep(() => RNCallKeep.reportEndCallWithUUID(endedCallId, CK_CONSTANTS.END_CALL_REASONS.FAILED));
+            if (callKeepReadyRef.current) {
+              safeCallKeep(() => RNCallKeep.reportEndCallWithUUID(callId, CK_CONSTANTS.END_CALL_REASONS.FAILED));
             }
             dismissCallScreen();
             cleanup();
@@ -433,12 +492,34 @@ export function CallProvider({ children }: { children: ReactNode }) {
   // the call attempt rather than rejecting it for an OS-level reason.
   const performOutgoingCallSetup = useCallback(
     async (callId: string, conversationId: string, kind: CallKind) => {
+      // This can run after a delay (waiting on CallKeep's
+      // didReceiveStartCallAction, or its own fallback timeout) — if the
+      // user already cancelled during that wait, skip the camera/mic prompt
+      // entirely rather than acquiring it just to release it once the
+      // checks further down catch the same mismatch.
+      if (callRef.current?.callId !== callId) return;
       try {
         await ensureAndroidCallPermissions(true, kind === "video");
         const localStream = await mediaDevices.getUserMedia({
           audio: true,
           video: kind === "video" ? { facingMode: "user" } : false,
         });
+
+        // The user can hang up (endCall -> cleanup) while permissions/
+        // getUserMedia were still in flight above — cleanup() nulls callRef
+        // and resets phase, but it can't reach into THIS async call to stop
+        // it mid-flight, so without this check the function just kept going:
+        // acquiring the camera, creating an offer, and emitting call:invite
+        // for a call the caller's own UI had already torn down. The callee
+        // then rang for a call nobody was on, with no cancel ever coming
+        // (the caller's client no longer thinks this call exists at all, so
+        // there's nothing left to tell the server to relay). Bail out and
+        // release whatever this attempt already acquired instead.
+        if (callRef.current?.callId !== callId) {
+          localStream.getTracks().forEach((track) => track.stop());
+          return;
+        }
+
         localStreamRef.current = localStream;
         setLocalStreamURL(localStream.toURL());
         setIsCameraOff(kind !== "video");
@@ -450,6 +531,13 @@ export function CallProvider({ children }: { children: ReactNode }) {
 
         const offer = await pc.createOffer();
         await pc.setLocalDescription(offer);
+
+        // Same race, checked again — cancellation could just as easily have
+        // landed during createOffer/setLocalDescription instead.
+        if (callRef.current?.callId !== callId) {
+          pc.close();
+          return;
+        }
 
         getSocket()
           .timeout(15000)
@@ -654,6 +742,17 @@ export function CallProvider({ children }: { children: ReactNode }) {
         audio: true,
         video: invite.kind === "video" ? { facingMode: "user" } : false,
       });
+
+      // Same race as performOutgoingCallSetup's callRef check: the caller
+      // could have ended the call (handleRemoteCancel/handleRemoteEnd ->
+      // cleanup()) while permissions/getUserMedia were still in flight —
+      // continuing on would answer a call this device no longer thinks is
+      // happening at all.
+      if (callRef.current?.callId !== invite.callId) {
+        localStream.getTracks().forEach((track) => track.stop());
+        return;
+      }
+
       localStreamRef.current = localStream;
       setLocalStreamURL(localStream.toURL());
       setIsCameraOff(invite.kind !== "video");
@@ -669,6 +768,13 @@ export function CallProvider({ children }: { children: ReactNode }) {
 
       const answer = await pc.createAnswer();
       await pc.setLocalDescription(answer);
+
+      // Checked again — cancellation could just as easily have landed during
+      // setRemoteDescription/createAnswer instead.
+      if (callRef.current?.callId !== invite.callId) {
+        pc.close();
+        return;
+      }
 
       getSocket().emit("call:answer", { callId: invite.callId, sdp: pc.localDescription!.toJSON() });
     } catch (err) {

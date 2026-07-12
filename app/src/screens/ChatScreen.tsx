@@ -25,7 +25,6 @@ import sodium from "react-native-libsodium";
 import { useFocusEffect, useIsFocused } from "@react-navigation/native";
 import type { NativeStackScreenProps } from "@react-navigation/native-stack";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
-import { type EmojiType } from "rn-emoji-keyboard";
 
 import type { MainStackParamList } from "../../App";
 import { getUserById } from "../api/client";
@@ -36,7 +35,7 @@ import { persistRecordedVoice, readVoiceMessageBase64 } from "../audio/voiceStor
 import AttachmentSheet from "../components/AttachmentSheet";
 import Avatar from "../components/Avatar";
 import FileMessageBubble from "../components/FileMessageBubble";
-import EmojiGifTray from "../components/EmojiGifTray";
+import StickerGifTray from "../components/StickerGifTray";
 import AlbumGrid, { type AlbumCellData } from "../components/AlbumGrid";
 import ImageMessageBubble from "../components/ImageMessageBubble";
 import MediaViewerModal, { type ViewerMedia } from "../components/MediaViewerModal";
@@ -45,6 +44,7 @@ import VideoMessageBubble from "../components/VideoMessageBubble";
 import VoiceMessageBubble from "../components/VoiceMessageBubble";
 import { encryptMessage, getOrCreateIdentity } from "../crypto/identity";
 import {
+  deleteCall,
   deleteMessage,
   getCallsBefore,
   getCallsFrom,
@@ -521,6 +521,8 @@ interface MessageBubbleProps {
   onOpenMedia: (items: ViewerMedia[], initialIndex: number) => void;
   /** Fraction 0..1 of an in-flight attachment upload for this message, if any. */
   uploadProgress?: number;
+  /** True while this is the currently-active in-chat search match (see the searchMatches/activeMatch state) — tints the bubble so it stands out, WhatsApp-style. */
+  highlighted?: boolean;
 }
 
 function MessageBubble({
@@ -539,6 +541,7 @@ function MessageBubble({
   onDownload,
   onOpenMedia,
   uploadProgress,
+  highlighted,
 }: MessageBubbleProps) {
   const { colors } = useTheme();
   const styles = useMemo(() => createStyles(colors), [colors]);
@@ -611,6 +614,7 @@ function MessageBubble({
           ]}
           onLongPress={onLongPress}
         >
+          {highlighted ? <View style={styles.searchHighlightOverlay} pointerEvents="none" /> : null}
           {isDeleted ? (
             <View style={styles.deletedRow}>
               <Ionicons
@@ -642,6 +646,7 @@ function MessageBubble({
                   durationMs={message.duration_ms ?? 0}
                   waveform={message.waveform ? JSON.parse(message.waveform) : []}
                   isOutgoing={isOutgoing}
+                  onLongPress={onLongPress}
                 />
               ) : message.kind === "image" ? (
                 <ImageMessageBubble
@@ -658,6 +663,7 @@ function MessageBubble({
                       ? () => onOpenMedia([{ type: "image", uri: message.image_uri! }], 0)
                       : undefined
                   }
+                  onLongPress={onLongPress}
                 />
               ) : message.kind === "gif" ? (
                 <View>
@@ -674,6 +680,7 @@ function MessageBubble({
                         ? () => onOpenMedia([{ type: "image", uri: message.gif_url! }], 0)
                         : undefined
                     }
+                    onLongPress={onLongPress}
                   />
                   {/* GIPHY's terms require attribution wherever their content is
                       shown, not just in the picker — GiphyMediaView shows this
@@ -700,6 +707,7 @@ function MessageBubble({
                       ? () => onOpenMedia([{ type: "video", uri: message.video_uri! }], 0)
                       : undefined
                   }
+                  onLongPress={onLongPress}
                 />
               ) : message.kind === "file" ? (
                 <FileMessageBubble
@@ -712,6 +720,7 @@ function MessageBubble({
                   isOutgoing={isOutgoing}
                   uploadProgress={isOutgoing ? uploadProgress : undefined}
                   onDownload={!isOutgoing ? () => onDownload(message) : undefined}
+                  onLongPress={onLongPress}
                 />
               ) : (
                 <Text style={isOutgoing ? styles.outgoingText : styles.incomingText}>{message.plaintext}</Text>
@@ -908,17 +917,49 @@ function AlbumBubble({
   );
 }
 
-function CallBubble({ call, onRedial }: { call: CallRow; onRedial: (call: CallRow) => void }) {
+function CallBubble({
+  call,
+  onRedial,
+  onDeleteCall,
+  onOpenMenu,
+}: {
+  call: CallRow;
+  onRedial: (call: CallRow) => void;
+  onDeleteCall: (call: CallRow) => void;
+  onOpenMenu: (call: CallRow, actions: MessageAction[], anchor: MessageMenuAnchor) => void;
+}) {
   const { colors } = useTheme();
   const styles = useMemo(() => createStyles(colors), [colors]);
   const isOutgoing = call.direction === "outgoing";
   const isMissedLike = call.status === "missed" || call.status === "declined" || call.status === "failed";
+  const bubbleRef = useRef<View>(null);
+
+  const onLongPress = () => {
+    const actions: MessageAction[] = [
+      {
+        label: "Call",
+        icon: call.kind === "video" ? "videocam-outline" : "call-outline",
+        onPress: () => onRedial(call),
+      },
+      {
+        label: "Delete",
+        icon: "trash-outline",
+        destructive: true,
+        onPress: () => onDeleteCall(call),
+      },
+    ];
+    bubbleRef.current?.measureInWindow((x, y, width, height) => {
+      onOpenMenu(call, actions, { x, y, width, height });
+    });
+  };
 
   return (
     <View style={[styles.bubbleRowSpaced, { alignSelf: isOutgoing ? "flex-end" : "flex-start" }]}>
       <Pressable
+        ref={bubbleRef}
         style={[styles.callBubble, isOutgoing ? styles.outgoing : styles.incoming]}
         onPress={() => onRedial(call)}
+        onLongPress={onLongPress}
       >
         <View style={[styles.callBubbleIcon, isOutgoing ? styles.callBubbleIconOutgoing : styles.callBubbleIconIncoming]}>
           <Ionicons
@@ -1252,9 +1293,9 @@ export default function ChatScreen({ route, navigation }: Props) {
   const [attachmentSheetOpen, setAttachmentSheetOpen] = useState(false);
   const [attachmentAnchor, setAttachmentAnchor] = useState<MessageMenuAnchor | null>(null);
   const attachmentButtonRef = useRef<View>(null);
-  // Single combined emoji/GIF tray (see EmojiGifTray) in place of the
-  // keyboard — replaces what used to be two separate pieces of state for a
-  // dedicated emoji picker and a dedicated GIF tray.
+  // Combined sticker/GIF tray (see StickerGifTray) in place of the keyboard
+  // — mobile keyboards already have their own built-in emoji picker, so this
+  // only needs to cover stickers and GIFs.
   const [pickerOpen, setPickerOpen] = useState(false);
   // Sized to the last-measured real keyboard height so the tray occupies the
   // same footprint a keyboard would — falls back to a sane default before
@@ -1265,6 +1306,22 @@ export default function ChatScreen({ route, navigation }: Props) {
     actions: MessageAction[];
     anchor: MessageMenuAnchor;
   } | null>(null);
+  // Separate menu state for the inline call-log entries (see CallBubble) —
+  // a different row shape (CallRow, not MessageRow), so it can't reuse
+  // `menu` above, but renders through the same MessageActionMenu component.
+  const [callMenu, setCallMenu] = useState<{
+    call: CallRow;
+    actions: MessageAction[];
+    anchor: MessageMenuAnchor;
+  } | null>(null);
+  const openCallMenu = useCallback(
+    (call: CallRow, actions: MessageAction[], anchor: MessageMenuAnchor) => setCallMenu({ call, actions, anchor }),
+    []
+  );
+  const onDeleteCall = useCallback((call: CallRow) => {
+    deleteCall(call.id);
+    setCalls((prev) => prev.filter((c) => c.id !== call.id));
+  }, []);
   // Full-screen gallery opened by tapping a media bubble or album cell — see
   // MediaViewerModal. items is every viewable item in that bubble's batch
   // (just 1 for a non-grouped bubble), so the gallery can swipe across an
@@ -1275,6 +1332,59 @@ export default function ChatScreen({ route, navigation }: Props) {
     (items: ViewerMedia[], initialIndex: number) => setViewerGallery({ items, initialIndex }),
     []
   );
+
+  // In-chat search — opened either via the header search icon or by
+  // navigating here from ContactInfoScreen with openSearch (see the effect
+  // below). WhatsApp-style: no separate results list — the thread itself
+  // stays visible, the current match gets highlighted and scrolled to, and
+  // up/down arrows (see the searchMatches/activeMatch block further down,
+  // once listItems exists) step through every match in the conversation.
+  const [searchOpen, setSearchOpen] = useState(false);
+  const [searchQuery, setSearchQueryRaw] = useState("");
+  // -1 is a sentinel for "not yet positioned this query" — activeMatchIndex
+  // (below) redirects that to the most recent match, same as WhatsApp
+  // landing on the latest hit first when you start typing.
+  const [searchMatchIndex, setSearchMatchIndex] = useState(-1);
+  const setSearchQuery = useCallback((text: string) => {
+    setSearchQueryRaw(text);
+    setSearchMatchIndex(-1);
+  }, []);
+  const closeSearch = useCallback(() => {
+    setSearchOpen(false);
+    setSearchQueryRaw("");
+    setSearchMatchIndex(-1);
+  }, []);
+
+  useEffect(() => {
+    if (route.params?.openSearch) {
+      setSearchOpen(true);
+      navigation.setParams({ openSearch: undefined });
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- only reacts to the param actually changing, not every navigation/route identity change
+  }, [route.params?.openSearch]);
+
+  // Matches can be anywhere in the conversation, not just whatever page
+  // pagination has loaded so far — load the full local history (a plain
+  // SQLite read, not a network fetch) for the duration of a search so any
+  // match can actually be found/highlighted/scrolled to. Suppresses the
+  // normal "new content -> snap to bottom" auto-scroll (same mechanism
+  // loadOlderMessages uses) since loading everything at once would
+  // otherwise fire it and fight the match-scroll effect further down —
+  // opening search shouldn't jump the view at all until the user picks a match.
+  useEffect(() => {
+    if (!searchOpen) return;
+    const all = getMessages(conversationId);
+    hasLoadedInitialPageRef.current = true;
+    oldestLoadedMessageAtRef.current = all.length > 0 ? all[0].sent_at : null;
+    setHasMoreOlderMessages(false);
+    suppressAutoScrollRef.current = true;
+    if (suppressAutoScrollTimeoutRef.current) clearTimeout(suppressAutoScrollTimeoutRef.current);
+    suppressAutoScrollTimeoutRef.current = setTimeout(() => {
+      suppressAutoScrollRef.current = false;
+    }, 400);
+    setMessages(all);
+  }, [searchOpen, conversationId]);
+
   const listRef = useRef<FlatList<ListItem>>(null);
   const readSentRef = useRef<Set<string>>(new Set());
 
@@ -1433,23 +1543,40 @@ export default function ChatScreen({ route, navigation }: Props) {
       headerLeft: undefined,
       headerTitle: isTestBot
         ? undefined
-        : () => (
-            <ChatHeaderTitle
-              name={name}
-              avatarUrl={conversation?.avatar_url ?? null}
-              online={blocked ? false : peerPresence?.online ?? false}
-              lastSeenAt={blocked ? null : peerPresence?.lastSeenAt ?? null}
-              onPress={() => navigation.navigate("ContactInfo", { conversationId })}
-            />
-          ),
+        : searchOpen
+          ? () => (
+              <TextInput
+                autoFocus
+                value={searchQuery}
+                onChangeText={setSearchQuery}
+                placeholder="Search in chat"
+                placeholderTextColor={colors.textTertiary}
+                style={styles.searchHeaderInput}
+              />
+            )
+          : () => (
+              <ChatHeaderTitle
+                name={name}
+                avatarUrl={conversation?.avatar_url ?? null}
+                online={blocked ? false : peerPresence?.online ?? false}
+                lastSeenAt={blocked ? null : peerPresence?.lastSeenAt ?? null}
+                onPress={() => navigation.navigate("ContactInfo", { conversationId })}
+              />
+            ),
       headerRight: isTestBot
         ? undefined
-        : () => (
-            <ChatHeaderCallButtons
-              conversationId={conversationId}
-              disabled={conversation?.status !== "accepted" || blocked}
-            />
-          ),
+        : searchOpen
+          ? () => (
+              <Pressable onPress={closeSearch} hitSlop={8}>
+                <Ionicons name="close" size={24} color={colors.text} />
+              </Pressable>
+            )
+          : () => (
+              <ChatHeaderCallButtons
+                conversationId={conversationId}
+                disabled={conversation?.status !== "accepted" || blocked}
+              />
+            ),
     });
   }, [
     navigation,
@@ -1460,6 +1587,11 @@ export default function ChatScreen({ route, navigation }: Props) {
     blocked,
     peerPresence,
     conversationId,
+    searchOpen,
+    searchQuery,
+    colors,
+    styles,
+    closeSearch,
   ]);
 
   const markVisibleMessagesRead = useCallback(() => {
@@ -2241,9 +2373,12 @@ export default function ChatScreen({ route, navigation }: Props) {
     [conversation, conversationId, isTestBot, replyingTo, sendGifEncrypted]
   );
 
-  // Toggles the combined emoji/GIF tray in place of the keyboard (see
-  // EmojiGifTray) rather than opening a full-screen native dialog. Always
-  // opens back onto the emoji tab; the tray itself owns which tab is active.
+  // Toggles the sticker/GIF tray in place of the keyboard (see
+  // StickerGifTray) rather than opening a full-screen native dialog. Emoji
+  // entry is deliberately not duplicated here — every mobile keyboard
+  // already has its own built-in emoji picker, so this tray only covers
+  // what that doesn't: stickers and GIFs. Always opens back onto the
+  // sticker tab; the tray itself owns which tab is active.
   const togglePicker = useCallback(() => {
     if (pickerOpen) {
       setPickerOpen(false);
@@ -2253,16 +2388,12 @@ export default function ChatScreen({ route, navigation }: Props) {
     setPickerOpen(true);
   }, [pickerOpen]);
 
-  const handleEmojiSelected = useCallback(
-    (emoji: EmojiType) => {
-      handleDraftChange(draft + emoji.emoji);
-    },
-    [draft, handleDraftChange]
-  );
-
-  const handleGifSelected = useCallback(
-    (gif: PickedGif) => {
-      sendGif(gif.url, gif.width, gif.height);
+  // Shared by both of StickerGifTray's tabs — a picked sticker and a picked
+  // GIF are the exact same PickedGif shape and go out through the same
+  // sendGif pipeline (see GifTray's mediaType prop).
+  const handleMediaSelected = useCallback(
+    (media: PickedGif) => {
+      sendGif(media.url, media.width, media.height);
       setPickerOpen(false);
     },
     [sendGif]
@@ -2426,6 +2557,53 @@ export default function ChatScreen({ route, navigation }: Props) {
     [listItems]
   );
 
+  // Every message (oldest-first, same order as the thread itself) whose
+  // plaintext matches the current search query — the full-history load
+  // effect above guarantees `messages` covers the whole conversation while
+  // searching, not just whatever page pagination had loaded before it opened.
+  const searchMatches = useMemo(() => {
+    const query = searchQuery.trim().toLowerCase();
+    if (!query) return [];
+    return messages.filter((m) => !m.deleted_at && m.plaintext.toLowerCase().includes(query));
+  }, [messages, searchQuery]);
+
+  // searchMatchIndex is a sentinel (-1) until the user navigates, so this
+  // redirects to the most recent match — same as WhatsApp, which lands on
+  // the latest hit as soon as you start typing rather than the oldest one.
+  const activeMatchIndex =
+    searchMatches.length === 0 ? -1 : Math.min(Math.max(searchMatchIndex, 0), searchMatches.length - 1);
+  const activeMatch = activeMatchIndex >= 0 ? searchMatches[activeMatchIndex] : null;
+
+  // Up = older (back toward the start of the conversation), down = newer —
+  // same convention as WhatsApp's search chevrons.
+  const goToOlderMatch = useCallback(() => {
+    setSearchMatchIndex((prev) => {
+      const current = prev === -1 ? searchMatches.length - 1 : prev;
+      return Math.max(0, current - 1);
+    });
+  }, [searchMatches.length]);
+  const goToNewerMatch = useCallback(() => {
+    setSearchMatchIndex((prev) => {
+      const current = prev === -1 ? searchMatches.length - 1 : prev;
+      return Math.min(searchMatches.length - 1, current + 1);
+    });
+  }, [searchMatches.length]);
+
+  // Scrolls to whichever match is currently active (renderItem below passes
+  // highlighted={item.message.id === activeMatch?.id} so it's also visually
+  // tinted) every time that changes — either because the query changed (new
+  // set of matches, landing on the latest) or the user tapped an up/down arrow.
+  useEffect(() => {
+    if (!activeMatch) return;
+    const index = listItems.findIndex((item) => item.id === activeMatch.id);
+    if (index < 0) return;
+    const timeout = setTimeout(() => {
+      listRef.current?.scrollToIndex({ index, animated: true });
+    }, 50);
+    return () => clearTimeout(timeout);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- only re-scroll when the active match itself changes, not on every unrelated listItems recompute
+  }, [activeMatch?.id]);
+
   if (!conversation) {
     return (
       <View style={styles.center}>
@@ -2442,104 +2620,141 @@ export default function ChatScreen({ route, navigation }: Props) {
       behavior={Platform.OS === "ios" ? "padding" : undefined}
       keyboardVerticalOffset={Platform.OS === "ios" ? 90 : 0}
     >
-      {pinnedMessage ? (
-        <Pressable style={styles.pinnedBanner} onPress={() => scrollToMessage(pinnedMessage.id)}>
-          <Ionicons name="pin" size={14} color={colors.accent} />
-          <View style={styles.pinnedBannerText}>
-            <Text style={styles.pinnedBannerLabel}>Pinned message</Text>
-            <Text numberOfLines={1} style={styles.pinnedBannerPreview}>
-              {pinnedMessage.plaintext}
-            </Text>
+      {searchOpen && searchQuery.trim() ? (
+        <View style={styles.searchToolbar}>
+          <Text style={styles.searchToolbarCount}>
+            {searchMatches.length === 0 ? "No results" : `${activeMatchIndex + 1} of ${searchMatches.length}`}
+          </Text>
+          <View style={styles.searchToolbarArrows}>
+            <Pressable
+              onPress={goToOlderMatch}
+              disabled={searchMatches.length === 0 || activeMatchIndex <= 0}
+              hitSlop={8}
+            >
+              <Ionicons
+                name="chevron-up"
+                size={20}
+                color={searchMatches.length === 0 || activeMatchIndex <= 0 ? colors.textTertiary : colors.text}
+              />
+            </Pressable>
+            <Pressable
+              onPress={goToNewerMatch}
+              disabled={searchMatches.length === 0 || activeMatchIndex >= searchMatches.length - 1}
+              hitSlop={8}
+            >
+              <Ionicons
+                name="chevron-down"
+                size={20}
+                color={
+                  searchMatches.length === 0 || activeMatchIndex >= searchMatches.length - 1
+                    ? colors.textTertiary
+                    : colors.text
+                }
+              />
+            </Pressable>
           </View>
-          <Pressable onPress={() => onUnpin(pinnedMessage)} hitSlop={8}>
-            <Ionicons name="close-circle" size={20} color={colors.textTertiary} />
-          </Pressable>
-        </Pressable>
+        </View>
       ) : null}
 
-      <FlatList
-        ref={listRef}
-        style={styles.flex}
-        data={listItems}
-        keyExtractor={(item) => item.id}
-        contentContainerStyle={styles.list}
-        // FlatList's default initialNumToRender (10) only renders from the
-        // start of `data`, which is oldest-first here — with a longer history
-        // that leaves the true latest message unrendered, so scrollToEnd below
-        // lands at the bottom of whatever's rendered so far, not the real end.
-        // Now bounded by CHAT_ITEM_PAGE_SIZE (pagination above), so rendering
-        // the whole initial page up front is cheap.
-        initialNumToRender={listItems.length || 1}
-        onContentSizeChange={() => {
-          // Loading older history prepends at the top and must not yank the
-          // view back down to the bottom — see suppressAutoScrollRef above.
-          // Deliberately not cleared here: this can fire more than once per
-          // prepend, and the timer that owns it already accounts for that.
-          if (suppressAutoScrollRef.current) return;
-          scrollToEndProgrammatically();
-        }}
-        onScrollToIndexFailed={({ averageItemLength, index }) =>
-          listRef.current?.scrollToOffset({ offset: averageItemLength * index, animated: true })
-        }
-        onScroll={handleListScroll}
-        scrollEventThrottle={100}
-        // Keeps whatever the user is currently looking at in place (rather
-        // than jumping) when an older page is prepended above it. Only
-        // enabled during that prepend — see preservingScrollPosition above.
-        maintainVisibleContentPosition={preservingScrollPosition ? { minIndexForVisible: 0 } : undefined}
-        ListHeaderComponent={
-          loadingOlderMessages ? (
-            <View style={styles.loadingOlderContainer}>
-              <ActivityIndicator size="small" color={colors.textTertiary} />
+        {pinnedMessage ? (
+          <Pressable style={styles.pinnedBanner} onPress={() => scrollToMessage(pinnedMessage.id)}>
+            <Ionicons name="pin" size={14} color={colors.accent} />
+            <View style={styles.pinnedBannerText}>
+              <Text style={styles.pinnedBannerLabel}>Pinned message</Text>
+              <Text numberOfLines={1} style={styles.pinnedBannerPreview}>
+                {pinnedMessage.plaintext}
+              </Text>
             </View>
-          ) : null
-        }
-        renderItem={({ item }) =>
-          item.type === "separator" ? (
-            <View style={styles.dateSeparator}>
-              <Text style={styles.dateSeparatorText}>{item.label}</Text>
-            </View>
-          ) : item.type === "call" ? (
-            <CallBubble call={item.call} onRedial={onRedial} />
-          ) : item.type === "album" ? (
-            <AlbumBubble
-              messages={item.messages}
-              isGroupEnd={item.isGroupEnd}
-              onReply={onReply}
-              onCopy={onCopy}
-              onDelete={onDelete}
-              onRetry={onRetry}
-              onPin={onPin}
-              onUnpin={onUnpin}
-              onDeleteForEveryone={onDeleteForEveryone}
-              onOpenMenu={openMenu}
-              onCancelSend={onCancelSend}
-              onSaveMedia={onSaveMedia}
-              onDownload={downloadMedia}
-              onOpenMedia={onOpenMedia}
-              uploadProgressById={uploadProgressById}
-            />
-          ) : (
-            <MessageBubble
-              message={item.message}
-              isGroupEnd={item.isGroupEnd}
-              onReply={onReply}
-              onCopy={onCopy}
-              onDelete={onDelete}
-              onRetry={onRetry}
-              onPin={onPin}
-              onUnpin={onUnpin}
-              onDeleteForEveryone={onDeleteForEveryone}
-              onOpenMenu={openMenu}
-              onCancelSend={onCancelSend}
-              onSaveMedia={onSaveMedia}
-              onDownload={downloadMedia}
-              onOpenMedia={onOpenMedia}
-              uploadProgress={uploadProgressById[item.message.id]}
-            />
-          )
-        }
-      />
+            <Pressable onPress={() => onUnpin(pinnedMessage)} hitSlop={8}>
+              <Ionicons name="close-circle" size={20} color={colors.textTertiary} />
+            </Pressable>
+          </Pressable>
+        ) : null}
+
+        <FlatList
+          ref={listRef}
+          style={styles.flex}
+          data={listItems}
+          keyExtractor={(item) => item.id}
+          contentContainerStyle={styles.list}
+          // FlatList's default initialNumToRender (10) only renders from the
+          // start of `data`, which is oldest-first here — with a longer history
+          // that leaves the true latest message unrendered, so scrollToEnd below
+          // lands at the bottom of whatever's rendered so far, not the real end.
+          // Now bounded by CHAT_ITEM_PAGE_SIZE (pagination above), so rendering
+          // the whole initial page up front is cheap.
+          initialNumToRender={listItems.length || 1}
+          onContentSizeChange={() => {
+            // Loading older history prepends at the top and must not yank the
+            // view back down to the bottom — see suppressAutoScrollRef above.
+            // Deliberately not cleared here: this can fire more than once per
+            // prepend, and the timer that owns it already accounts for that.
+            if (suppressAutoScrollRef.current) return;
+            scrollToEndProgrammatically();
+          }}
+          onScrollToIndexFailed={({ averageItemLength, index }) =>
+            listRef.current?.scrollToOffset({ offset: averageItemLength * index, animated: true })
+          }
+          onScroll={handleListScroll}
+          scrollEventThrottle={100}
+          // Keeps whatever the user is currently looking at in place (rather
+          // than jumping) when an older page is prepended above it. Only
+          // enabled during that prepend — see preservingScrollPosition above.
+          maintainVisibleContentPosition={preservingScrollPosition ? { minIndexForVisible: 0 } : undefined}
+          ListHeaderComponent={
+            loadingOlderMessages ? (
+              <View style={styles.loadingOlderContainer}>
+                <ActivityIndicator size="small" color={colors.textTertiary} />
+              </View>
+            ) : null
+          }
+          renderItem={({ item }) =>
+            item.type === "separator" ? (
+              <View style={styles.dateSeparator}>
+                <Text style={styles.dateSeparatorText}>{item.label}</Text>
+              </View>
+            ) : item.type === "call" ? (
+              <CallBubble call={item.call} onRedial={onRedial} onDeleteCall={onDeleteCall} onOpenMenu={openCallMenu} />
+            ) : item.type === "album" ? (
+              <AlbumBubble
+                messages={item.messages}
+                isGroupEnd={item.isGroupEnd}
+                onReply={onReply}
+                onCopy={onCopy}
+                onDelete={onDelete}
+                onRetry={onRetry}
+                onPin={onPin}
+                onUnpin={onUnpin}
+                onDeleteForEveryone={onDeleteForEveryone}
+                onOpenMenu={openMenu}
+                onCancelSend={onCancelSend}
+                onSaveMedia={onSaveMedia}
+                onDownload={downloadMedia}
+                onOpenMedia={onOpenMedia}
+                uploadProgressById={uploadProgressById}
+              />
+            ) : (
+              <MessageBubble
+                message={item.message}
+                isGroupEnd={item.isGroupEnd}
+                onReply={onReply}
+                onCopy={onCopy}
+                onDelete={onDelete}
+                onRetry={onRetry}
+                onPin={onPin}
+                onUnpin={onUnpin}
+                onDeleteForEveryone={onDeleteForEveryone}
+                onOpenMenu={openMenu}
+                onCancelSend={onCancelSend}
+                onSaveMedia={onSaveMedia}
+                onDownload={downloadMedia}
+                onOpenMedia={onOpenMedia}
+                uploadProgress={uploadProgressById[item.message.id]}
+                highlighted={item.message.id === activeMatch?.id}
+              />
+            )
+          }
+        />
 
       <MessageActionMenu
         visible={!!menu}
@@ -2548,6 +2763,14 @@ export default function ChatScreen({ route, navigation }: Props) {
         currentReaction={menu?.message.reaction_mine ?? null}
         onReact={menu ? (emoji) => onReact(menu.message, emoji) : undefined}
         onClose={() => setMenu(null)}
+      />
+
+      <MessageActionMenu
+        visible={!!callMenu}
+        anchor={callMenu?.anchor ?? null}
+        actions={callMenu?.actions ?? []}
+        align="left"
+        onClose={() => setCallMenu(null)}
       />
 
       <MediaViewerModal
@@ -2640,16 +2863,18 @@ export default function ChatScreen({ route, navigation }: Props) {
                 placeholderTextColor={colors.textTertiary}
                 multiline
               />
-              {/* Opens the combined emoji/GIF tray (see EmojiGifTray) — hidden
+              {/* Opens the sticker/GIF tray (see StickerGifTray) — hidden
                   once there's typed text so it doesn't sit on top of it, but
                   kept visible while the tray itself is open so there's always
-                  a way to tap back to the keyboard. */}
+                  a way to tap back to the keyboard. Emoji entry itself isn't
+                  duplicated here — the OS keyboard's own emoji picker already
+                  covers that. */}
               {pickerOpen || !draft.trim() ? (
                 <Pressable style={styles.pickerBadge} onPress={togglePicker} hitSlop={8}>
                   {pickerOpen ? (
                     <MaterialCommunityIcons name="keyboard-outline" size={20} color={colors.textSecondary} />
                   ) : (
-                    <Ionicons name="happy-outline" size={20} color={colors.textSecondary} />
+                    <MaterialCommunityIcons name="sticker-emoji" size={20} color={colors.textSecondary} />
                   )}
                 </Pressable>
               ) : null}
@@ -2678,11 +2903,7 @@ export default function ChatScreen({ route, navigation }: Props) {
       )}
 
       {pickerOpen ? (
-        <EmojiGifTray
-          height={keyboardHeight}
-          onEmojiSelected={handleEmojiSelected}
-          onSelectGif={handleGifSelected}
-        />
+        <StickerGifTray height={keyboardHeight} onSelectMedia={handleMediaSelected} />
       ) : null}
 
       <AttachmentSheet
@@ -2774,6 +2995,11 @@ const createStyles = (colors: ThemeColors) =>
       shadowOpacity: 0.06,
       shadowRadius: 2,
       elevation: 1,
+      overflow: "hidden",
+    },
+    searchHighlightOverlay: {
+      ...StyleSheet.absoluteFill,
+      backgroundColor: "rgba(255, 213, 0, 0.35)",
     },
     outgoing: { alignSelf: "flex-end", backgroundColor: colors.accent, borderBottomRightRadius: 6 },
     incoming: { alignSelf: "flex-start", backgroundColor: colors.bubbleIncoming, borderBottomLeftRadius: 6 },
@@ -2857,6 +3083,24 @@ const createStyles = (colors: ThemeColors) =>
     pinnedBannerText: { flex: 1 },
     pinnedBannerLabel: { fontSize: 11, color: colors.accent, fontWeight: "600" },
     pinnedBannerPreview: { fontSize: 13, color: colors.text },
+    searchHeaderInput: {
+      fontSize: 16,
+      color: colors.text,
+      padding: 0,
+      minWidth: 160,
+    },
+    searchToolbar: {
+      flexDirection: "row",
+      alignItems: "center",
+      justifyContent: "space-between",
+      paddingHorizontal: 16,
+      paddingVertical: 8,
+      backgroundColor: colors.surface,
+      borderBottomWidth: StyleSheet.hairlineWidth,
+      borderBottomColor: colors.border,
+    },
+    searchToolbarCount: { fontSize: 13, color: colors.textSecondary },
+    searchToolbarArrows: { flexDirection: "row", alignItems: "center", gap: 20 },
     inputRow: {
       flexDirection: "row",
       alignItems: "flex-end",

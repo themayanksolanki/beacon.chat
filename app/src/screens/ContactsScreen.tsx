@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useMemo, useState } from "react";
 import {
   ActivityIndicator,
   Alert,
@@ -13,70 +13,52 @@ import {
   View,
 } from "react-native";
 import type { NativeStackScreenProps } from "@react-navigation/native-stack";
+import { useFocusEffect } from "@react-navigation/native";
 import { Ionicons } from "@expo/vector-icons";
 
 import type { MainStackParamList } from "../../App";
 import { ApiError, inviteByEmail } from "../api/client";
 import { useAuth } from "../auth/AuthContext";
-import {
-  loadMatchedContacts,
-  lookupSingleEmail,
-  lookupSinglePhone,
-  normalize,
-  type MatchedContact,
-} from "../contacts/matchContacts";
-import PhoneNumberInput from "../components/PhoneNumberInput";
-import { DEFAULT_COUNTRY, type CountryDialCode } from "../constants/countryCodes";
+import { loadMatchedContacts, lookupSingleEmail, normalize, type MatchedContact } from "../contacts/matchContacts";
 import { getConversationByPeerKey, insertConversation, isUserBlocked, setConversationStatus } from "../db/database";
 import { getSocket } from "../network/socket";
-import { isValidLocalNumber, toE164 } from "../phone/phoneValidation";
 import { useTheme } from "../ThemeContext";
 import { colorForName, initialFor, type ThemeColors } from "../theme";
 
 type Props = NativeStackScreenProps<MainStackParamList, "Contacts">;
-
-type AddMode = "email" | "phone";
 
 const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
 export default function ContactsScreen({ navigation }: Props) {
   const { colors } = useTheme();
   const styles = useMemo(() => createStyles(colors), [colors]);
-  const { token, email } = useAuth();
+  const { token, email, phoneNumber } = useAuth();
   const [contacts, setContacts] = useState<MatchedContact[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [invitingId, setInvitingId] = useState<string | null>(null);
 
-  const [addMode, setAddMode] = useState<AddMode>("email");
   const [manualEmail, setManualEmail] = useState("");
-  const [manualCountry, setManualCountry] = useState<CountryDialCode>(DEFAULT_COUNTRY);
-  const [manualPhoneDigits, setManualPhoneDigits] = useState("");
-  const [manualPhoneTouched, setManualPhoneTouched] = useState(false);
   const [manualResult, setManualResult] = useState<MatchedContact | null>(null);
   const [manualLoading, setManualLoading] = useState(false);
   const [manualError, setManualError] = useState<string | null>(null);
 
-  const switchMode = useCallback((mode: AddMode) => {
-    setAddMode(mode);
-    setManualError(null);
-    setManualResult(null);
-    setManualEmail("");
-    setManualPhoneDigits("");
-    setManualPhoneTouched(false);
-  }, []);
-
-  useEffect(() => {
-    if (!token || !email) return;
-    loadMatchedContacts(token, email)
-      .then((list) => setContacts(list.filter((c) => !c.userId || !isUserBlocked(c.userId))))
-      .catch((e) =>
-        setError(
-          e instanceof Error && e.message === "contacts_permission_denied"
-            ? "Beacon needs contacts access to show you who's already here. You can enable it in Settings."
-            : "Couldn't load contacts."
-        )
-      );
-  }, [token, email]);
+  // Re-synced every time this screen gains focus (not just on first mount)
+  // so a contact who's just installed Beacon shows up as registered without
+  // the user having to leave and re-enter the app.
+  useFocusEffect(
+    useCallback(() => {
+      if (!token) return;
+      loadMatchedContacts(token, email, phoneNumber)
+        .then((list) => setContacts(list.filter((c) => !c.userId || !isUserBlocked(c.userId))))
+        .catch((e) =>
+          setError(
+            e instanceof Error && e.message === "contacts_permission_denied"
+              ? "Beacon needs contacts access to show you who's already here. You can enable it in Settings."
+              : "Couldn't load contacts."
+          )
+        );
+    }, [token, email, phoneNumber])
+  );
 
   // Starting a chat with someone new no longer opens it directly — it sends
   // a contact request and the other side has to accept before messaging (or
@@ -189,34 +171,6 @@ export default function ContactsScreen({ navigation }: Props) {
     }
   }, [token, email, manualEmail]);
 
-  const addByPhone = useCallback(async () => {
-    if (!token) return;
-    setManualPhoneTouched(true);
-    if (!isValidLocalNumber(manualCountry.dialCode, manualPhoneDigits)) {
-      // No separate manualError here — PhoneNumberInput already shows an
-      // inline "enter a valid mobile number" message once touched.
-      return;
-    }
-    const e164 = toE164(manualCountry.dialCode, manualPhoneDigits);
-
-    setManualError(null);
-    setManualLoading(true);
-    try {
-      const result = await lookupSinglePhone(token, e164);
-      if (result.userId && isUserBlocked(result.userId)) {
-        setManualError("You've blocked this user.");
-        return;
-      }
-      setManualResult(result);
-      setManualPhoneDigits("");
-      setManualPhoneTouched(false);
-    } catch {
-      setManualError("Couldn't look that up. Please try again.");
-    } finally {
-      setManualLoading(false);
-    }
-  }, [token, manualCountry, manualPhoneDigits]);
-
   if (error) {
     return (
       <View style={styles.center}>
@@ -238,69 +192,29 @@ export default function ContactsScreen({ navigation }: Props) {
       keyboardShouldPersistTaps="handled"
       ListHeaderComponent={
         <View style={styles.addSection}>
-          <View style={styles.modeToggle}>
-            <Pressable
-              style={[styles.modeButton, addMode === "email" && styles.modeButtonActive]}
-              onPress={() => switchMode("email")}
-            >
-              <Text style={[styles.modeButtonText, addMode === "email" && styles.modeButtonTextActive]}>Email</Text>
-            </Pressable>
-            <Pressable
-              style={[styles.modeButton, addMode === "phone" && styles.modeButtonActive]}
-              onPress={() => switchMode("phone")}
-            >
-              <Text style={[styles.modeButtonText, addMode === "phone" && styles.modeButtonTextActive]}>Phone</Text>
+          <View style={styles.addRow}>
+            <TextInput
+              style={styles.input}
+              placeholder="Add by email"
+              placeholderTextColor={colors.textTertiary}
+              autoCapitalize="none"
+              autoCorrect={false}
+              keyboardType="email-address"
+              value={manualEmail}
+              onChangeText={(t) => {
+                setManualEmail(t);
+                setManualError(null);
+              }}
+              onSubmitEditing={addByEmail}
+            />
+            <Pressable style={styles.addButton} onPress={addByEmail} disabled={manualLoading}>
+              {manualLoading ? (
+                <ActivityIndicator size="small" color="#fff" />
+              ) : (
+                <Text style={styles.addButtonText}>Add</Text>
+              )}
             </Pressable>
           </View>
-
-          {addMode === "email" ? (
-            <View style={styles.addRow}>
-              <TextInput
-                style={styles.input}
-                placeholder="Add by email"
-                placeholderTextColor={colors.textTertiary}
-                autoCapitalize="none"
-                autoCorrect={false}
-                keyboardType="email-address"
-                value={manualEmail}
-                onChangeText={(t) => {
-                  setManualEmail(t);
-                  setManualError(null);
-                }}
-                onSubmitEditing={addByEmail}
-              />
-              <Pressable style={styles.addButton} onPress={addByEmail} disabled={manualLoading}>
-                {manualLoading ? (
-                  <ActivityIndicator size="small" color="#fff" />
-                ) : (
-                  <Text style={styles.addButtonText}>Add</Text>
-                )}
-              </Pressable>
-            </View>
-          ) : (
-            <View style={styles.addRow}>
-              <View style={styles.phoneInputWrap}>
-                <PhoneNumberInput
-                  country={manualCountry}
-                  localNumber={manualPhoneDigits}
-                  onChangeCountry={setManualCountry}
-                  onChangeLocalNumber={(digits) => {
-                    setManualPhoneDigits(digits);
-                    setManualError(null);
-                  }}
-                  showError={manualPhoneTouched}
-                  onBlur={() => setManualPhoneTouched(true)}
-                />
-              </View>
-              <Pressable style={styles.addButton} onPress={addByPhone} disabled={manualLoading}>
-                {manualLoading ? (
-                  <ActivityIndicator size="small" color="#fff" />
-                ) : (
-                  <Text style={styles.addButtonText}>Add</Text>
-                )}
-              </Pressable>
-            </View>
-          )}
           {manualError ? <Text style={styles.manualError}>{manualError}</Text> : null}
           {manualResult ? (
             <ContactRow
@@ -379,8 +293,8 @@ function ContactRow({
           )}
         </Pressable>
       ) : (
-        // No SMS-invite capability — a phone search that doesn't match a
-        // registered account just has nothing actionable to offer.
+        // No SMS-invite capability — a phone-only contact who isn't
+        // registered has nothing actionable to offer.
         <Text style={styles.notFoundText}>Not on Beacon</Text>
       )}
     </Pressable>
@@ -395,24 +309,7 @@ const createStyles = (colors: ThemeColors) =>
     empty: { color: colors.textTertiary, textAlign: "center", marginTop: 24 },
     error: { color: colors.textSecondary, textAlign: "center", paddingHorizontal: 24 },
     addSection: { paddingTop: 12, paddingHorizontal: 16, backgroundColor: colors.surface },
-    modeToggle: {
-      flexDirection: "row",
-      backgroundColor: colors.background,
-      borderRadius: 10,
-      padding: 3,
-      marginBottom: 10,
-    },
-    modeButton: {
-      flex: 1,
-      alignItems: "center",
-      paddingVertical: 8,
-      borderRadius: 8,
-    },
-    modeButtonActive: { backgroundColor: colors.surface, shadowColor: "#000", shadowOpacity: 0.08, shadowRadius: 3, shadowOffset: { width: 0, height: 1 }, elevation: 1 },
-    modeButtonText: { fontSize: 14, fontWeight: "600", color: colors.textSecondary },
-    modeButtonTextActive: { color: colors.accent },
     addRow: { flexDirection: "row", gap: 8 },
-    phoneInputWrap: { flex: 1 },
     input: {
       flex: 1,
       borderWidth: 1,

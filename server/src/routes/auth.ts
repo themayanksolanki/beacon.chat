@@ -5,14 +5,17 @@ import { prisma } from "../prisma";
 import { requireAuth, signToken, type AuthedRequest } from "../auth";
 import { resolveLoginDevice } from "../devices";
 import { revokeAllUserSessions, revokeDeviceSessions } from "../socketServer";
-import { generateOtp, hashOtp, otpHashesMatch, MAX_ATTEMPTS, OTP_TTL_MS } from "../otp";
-import { sendOtpEmail } from "../email";
+import { requestEmailOtp, requestPhoneOtp, verifyEmailOtp, verifyPhoneOtp } from "../otpChallenge";
 import { cancelDeletionIfPending, requestDeletion } from "../accountDeletion";
 import { normalizeEmail } from "../util";
 
 export const authRouter = Router();
 
 const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+// E.164-shaped: a leading '+', a non-zero first digit, then up to 14 more
+// digits (matches the ITU E.164 15-digit-total cap) — same rule as
+// routes/profile.ts's PHONE_REGEX.
+const PHONE_REGEX = /^\+[1-9]\d{6,14}$/;
 const SESSION_TTL_MS = 90 * 24 * 60 * 60 * 1000; // matches the JWT's own 90d expiry (see signToken)
 
 // deviceId/deviceName are optional in every login request; a JSON client
@@ -24,10 +27,18 @@ function optionalString(value: unknown): string | undefined {
   return typeof value === "string" && value.length > 0 ? value : undefined;
 }
 
+// Coarse brute-force/spam guard on top of otpChallenge.ts's real 60s resend
+// cooldown — this just caps total requests per IP+identifier in a window.
 const otpRequestLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 5,
   keyGenerator: (req) => `${ipKeyGenerator(req.ip ?? "")}:${req.body?.email ?? ""}`,
+});
+
+const phoneOtpRequestLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 5,
+  keyGenerator: (req) => `${ipKeyGenerator(req.ip ?? "")}:${req.body?.phoneNumber ?? ""}`,
 });
 
 /** Step 1: user submits their email, we mail them a one-time code. */
@@ -40,23 +51,11 @@ authRouter.post("/otp/request", otpRequestLimiter, async (req, res) => {
   }
   const normalizedEmail = normalizeEmail(email);
 
-  // Opportunistic cleanup: otherwise every request leaves a row behind
-  // forever, since nothing else ever deletes expired challenges.
-  await prisma.otpChallenge.deleteMany({
-    where: { email: normalizedEmail, expiresAt: { lt: new Date() } },
-  });
-
-  const code = generateOtp();
-  await prisma.otpChallenge.create({
-    data: {
-      email: normalizedEmail,
-      codeHash: hashOtp(code, normalizedEmail),
-      expiresAt: new Date(Date.now() + OTP_TTL_MS),
-      attempts: 0,
-    },
-  });
-
-  await sendOtpEmail(normalizedEmail, code);
+  const result = await requestEmailOtp(normalizedEmail);
+  if ("error" in result) {
+    res.status(429).json(result);
+    return;
+  }
   res.status(202).json({ ok: true });
 });
 
@@ -81,40 +80,73 @@ authRouter.post("/otp/verify", async (req, res) => {
   }
   const normalizedEmail = normalizeEmail(email);
 
-  const challenge = await prisma.otpChallenge.findFirst({
-    where: { email: normalizedEmail },
-    orderBy: { createdAt: "desc" },
-  });
-
-  if (!challenge || challenge.expiresAt.getTime() < Date.now()) {
-    res.status(400).json({ error: "otp_expired_or_not_found" });
+  const verification = await verifyEmailOtp(normalizedEmail, code);
+  if ("error" in verification) {
+    const status = verification.error === "too_many_attempts" ? 429 : verification.error === "invalid_code" ? 401 : 400;
+    res.status(status).json({ error: verification.error });
     return;
   }
 
-  if (challenge.attempts >= MAX_ATTEMPTS) {
-    res.status(429).json({ error: "too_many_attempts" });
+  const { token, userId, deviceId: linkedDeviceId } = await issueSession(
+    { email: normalizedEmail },
+    publicKey,
+    deviceId,
+    deviceName
+  );
+  res.status(200).json({ token, userId, deviceId: linkedDeviceId });
+});
+
+/** Phone equivalent of /otp/request — sends via MSG91 (see sms.ts), stubbed to a console log until real credentials are configured. */
+authRouter.post("/phone-otp/request", phoneOtpRequestLimiter, async (req, res) => {
+  const { phoneNumber } = req.body ?? {};
+
+  if (typeof phoneNumber !== "string" || !PHONE_REGEX.test(phoneNumber)) {
+    res.status(400).json({ error: "invalid_phone_number" });
     return;
   }
 
-  if (!otpHashesMatch(challenge.codeHash, hashOtp(code, normalizedEmail))) {
-    await prisma.otpChallenge.update({
-      where: { id: challenge.id },
-      data: { attempts: { increment: 1 } },
-    });
-    res.status(401).json({ error: "invalid_code" });
+  const result = await requestPhoneOtp(phoneNumber);
+  if ("error" in result) {
+    res.status(429).json(result);
+    return;
+  }
+  res.status(202).json({ ok: true });
+});
+
+/** Phone equivalent of /otp/verify — same device-linking semantics as issueSession below, just keyed by contactNumber instead of email. */
+authRouter.post("/phone-otp/verify", async (req, res) => {
+  const { phoneNumber, code, publicKey } = req.body ?? {};
+  const deviceId = optionalString(req.body?.deviceId);
+  const deviceName = optionalString(req.body?.deviceName);
+
+  if (typeof phoneNumber !== "string" || typeof code !== "string" || typeof publicKey !== "string") {
+    res.status(400).json({ error: "phoneNumber, code and publicKey are required" });
     return;
   }
 
-  await prisma.otpChallenge.deleteMany({ where: { email: normalizedEmail } });
+  const verification = await verifyPhoneOtp(phoneNumber, code);
+  if ("error" in verification) {
+    const status = verification.error === "too_many_attempts" ? 429 : verification.error === "invalid_code" ? 401 : 400;
+    res.status(status).json({ error: verification.error });
+    return;
+  }
 
-  const { token, userId, deviceId: linkedDeviceId } = await issueSession(normalizedEmail, publicKey, deviceId, deviceName);
+  const { token, userId, deviceId: linkedDeviceId } = await issueSession(
+    { phoneNumber },
+    publicKey,
+    deviceId,
+    deviceName
+  );
   res.status(200).json({ token, userId, deviceId: linkedDeviceId });
 });
 
 /**
- * Upserts the user for this email/publicKey, registers/refreshes the login
- * device, and signs a fresh token. Shared by the real OTP flow and the
- * SKIP_OTP dev bypass below — both end in the same session state.
+ * Upserts the user for this email-or-phone identity plus publicKey,
+ * registers/refreshes the login device, and signs a fresh token. Shared by
+ * both real OTP flows (email and phone) and the SKIP_OTP dev bypass below —
+ * all three end in the same session state. Exactly one of
+ * identity.email/identity.phoneNumber is ever set, matching the OtpChallenge
+ * shape this is called after verifying.
  *
  * Re-authenticating on the SAME device (deviceId matches one already linked
  * to this account) replaces that device's own session; every other device
@@ -124,24 +156,26 @@ authRouter.post("/otp/verify", async (req, res) => {
  * device from Settings (see routes/devices.ts).
  */
 async function issueSession(
-  email: string,
+  identity: { email: string } | { phoneNumber: string },
   publicKey: string,
   deviceId?: string,
   deviceName?: string
 ): Promise<{ token: string; userId: string; deviceId: string }> {
+  const where = "email" in identity ? { email: identity.email } : { contactNumber: identity.phoneNumber };
+
   let user: User;
   try {
     user = await prisma.user.upsert({
-      where: { email },
+      where,
       update: { publicKey },
-      create: { email, publicKey },
+      create: { ...where, publicKey },
     });
   } catch {
-    // Extremely rare race on the email unique constraint (two concurrent
-    // first-time verifications for the same address) — the loser just
+    // Extremely rare race on the unique constraint (two concurrent
+    // first-time verifications for the same identity) — the loser just
     // re-reads the row the winner created instead of surfacing an error
     // for what looks to the client like a normal login.
-    const created = await prisma.user.findUnique({ where: { email } });
+    const created = await prisma.user.findUnique({ where });
     if (!created) throw new Error("user upsert failed and no row was found after conflict");
     user = await prisma.user.update({ where: { id: created.id }, data: { publicKey } });
   }
@@ -171,27 +205,32 @@ async function issueSession(
 }
 
 /**
- * Dev-only bypass so the OTP email round trip doesn't have to be exercised
- * on every test login. Only active when SKIP_OTP=true — never enable this
- * in production, it's a full authentication bypass by design.
+ * Dev-only bypass so the OTP round trip (email or phone) doesn't have to be
+ * exercised on every test login. Only active when SKIP_OTP=true — never
+ * enable this in production, it's a full authentication bypass by design.
  */
 if (process.env.SKIP_OTP === "true") {
   authRouter.post("/dev-login", async (req, res) => {
-    const { email, publicKey } = req.body ?? {};
+    const { email, phoneNumber, publicKey } = req.body ?? {};
     const deviceId = optionalString(req.body?.deviceId);
     const deviceName = optionalString(req.body?.deviceName);
 
-    if (typeof email !== "string" || !EMAIL_REGEX.test(email) || typeof publicKey !== "string") {
-      res.status(400).json({ error: "email and publicKey are required" });
+    if (typeof publicKey !== "string") {
+      res.status(400).json({ error: "publicKey is required" });
       return;
     }
 
-    const { token, userId, deviceId: linkedDeviceId } = await issueSession(
-      normalizeEmail(email),
-      publicKey,
-      deviceId,
-      deviceName
-    );
+    let identity: { email: string } | { phoneNumber: string };
+    if (typeof email === "string" && EMAIL_REGEX.test(email)) {
+      identity = { email: normalizeEmail(email) };
+    } else if (typeof phoneNumber === "string" && PHONE_REGEX.test(phoneNumber)) {
+      identity = { phoneNumber };
+    } else {
+      res.status(400).json({ error: "a valid email or phoneNumber is required" });
+      return;
+    }
+
+    const { token, userId, deviceId: linkedDeviceId } = await issueSession(identity, publicKey, deviceId, deviceName);
     res.status(200).json({ token, userId, deviceId: linkedDeviceId });
   });
 }
@@ -199,7 +238,7 @@ if (process.env.SKIP_OTP === "true") {
 authRouter.get("/session", requireAuth, async (req: AuthedRequest, res) => {
   const user = await prisma.user.findUnique({ where: { id: req.user!.userId } });
 
-  res.json({ userId: user!.id, email: user!.email });
+  res.json({ userId: user!.id, email: user!.email, phoneNumber: user!.contactNumber });
 });
 
 authRouter.post("/logout", requireAuth, async (req: AuthedRequest, res) => {

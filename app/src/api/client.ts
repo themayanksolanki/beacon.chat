@@ -39,11 +39,44 @@ async function request<T>(path: string, options: RequestOptions = {}): Promise<T
   return res.json();
 }
 
-export function requestOtp(email: string) {
-  return request<{ ok: true }>("/auth/otp/request", {
+// Thrown instead of ApiError when the server enforces the 60s resend
+// cooldown (see server's otpChallenge.ts) — carries retryAfterSeconds so the
+// UI can show/resume an accurate countdown instead of just a generic error.
+export class OtpCooldownError extends Error {
+  retryAfterSeconds: number;
+  constructor(retryAfterSeconds: number) {
+    super("cooldown");
+    this.retryAfterSeconds = retryAfterSeconds;
+  }
+}
+
+async function requestWithCooldown(path: string, body: Record<string, unknown>, token?: string) {
+  const res = await fetch(`${SERVER_URL}${path}`, {
     method: "POST",
-    body: JSON.stringify({ email }),
+    headers: { "Content-Type": "application/json", ...(token ? { Authorization: `Bearer ${token}` } : {}) },
+    body: JSON.stringify(body),
   });
+
+  if (res.status === 429) {
+    const parsed = await res.json().catch(() => ({}));
+    if (parsed.error === "cooldown" && typeof parsed.retryAfterSeconds === "number") {
+      throw new OtpCooldownError(parsed.retryAfterSeconds);
+    }
+    throw new ApiError(parsed.error ?? "too_many_requests", 429);
+  }
+  if (!res.ok) {
+    const parsed = await res.json().catch(() => ({}));
+    throw new ApiError(parsed.error ?? `request_failed_${res.status}`, res.status);
+  }
+  return res.json();
+}
+
+export function requestOtp(email: string) {
+  return requestWithCooldown("/auth/otp/request", { email }) as Promise<{ ok: true }>;
+}
+
+export function requestPhoneOtp(phoneNumber: string) {
+  return requestWithCooldown("/auth/phone-otp/request", { phoneNumber }) as Promise<{ ok: true }>;
 }
 
 export interface LoginResult {
@@ -71,6 +104,19 @@ export function verifyOtp(
   });
 }
 
+export function verifyPhoneOtp(
+  phoneNumber: string,
+  code: string,
+  publicKey: string,
+  deviceId?: string,
+  deviceName?: string | null
+) {
+  return request<LoginResult>("/auth/phone-otp/verify", {
+    method: "POST",
+    body: JSON.stringify({ phoneNumber, code, publicKey, deviceId, deviceName }),
+  });
+}
+
 // Dev-only: mirrors verifyOtp but skips the code entirely. Only works while
 // the server has SKIP_OTP=true; see EmailEntryScreen for the toggle.
 export function devLogin(email: string, publicKey: string, deviceId?: string, deviceName?: string | null) {
@@ -80,8 +126,15 @@ export function devLogin(email: string, publicKey: string, deviceId?: string, de
   });
 }
 
+export function devLoginPhone(phoneNumber: string, publicKey: string, deviceId?: string, deviceName?: string | null) {
+  return request<LoginResult>("/auth/dev-login", {
+    method: "POST",
+    body: JSON.stringify({ phoneNumber, publicKey, deviceId, deviceName }),
+  });
+}
+
 export function getSession(token: string) {
-  return request<{ userId: string; email: string }>("/auth/session", { token });
+  return request<{ userId: string; email: string | null; phoneNumber: string | null }>("/auth/session", { token });
 }
 
 export interface LinkedDevice {
@@ -188,12 +241,32 @@ export async function lookupUsersByPhone(token: string, phoneNumbers: string[]) 
   return matches;
 }
 
-// null clears the stored number; the server never OTP-verifies this field.
-export function updatePhoneNumber(token: string, phoneNumber: string | null) {
-  return request<{ ok: true }>("/profile/phone", {
-    method: "PUT",
+// Verified "add a missing login identifier" flow — attaches email/phone to
+// the CALLER's account only once its OTP is confirmed (contactNumber is now
+// a verified identifier, same guarantee as email always had — see server's
+// routes/profile.ts). Used from AccountScreen/AddContactMethodScreen when a
+// user who signed up with only one identifier wants to add the other.
+export function requestAddEmailOtp(token: string, email: string) {
+  return requestWithCooldown("/profile/email/request-otp", { email }, token) as Promise<{ ok: true }>;
+}
+
+export function verifyAddEmailOtp(token: string, email: string, code: string) {
+  return request<{ ok: true }>("/profile/email/verify-otp", {
+    method: "POST",
     token,
-    body: JSON.stringify({ phoneNumber }),
+    body: JSON.stringify({ email, code }),
+  });
+}
+
+export function requestAddPhoneOtp(token: string, phoneNumber: string) {
+  return requestWithCooldown("/profile/phone/request-otp", { phoneNumber }, token) as Promise<{ ok: true }>;
+}
+
+export function verifyAddPhoneOtp(token: string, phoneNumber: string, code: string) {
+  return request<{ ok: true }>("/profile/phone/verify-otp", {
+    method: "POST",
+    token,
+    body: JSON.stringify({ phoneNumber, code }),
   });
 }
 

@@ -23,22 +23,15 @@ import {
   getOrCreateDeviceId,
   saveDeviceId,
 } from "../storage/secureKeyStore";
+import { clearProfile, isProfileSynced, loadProfile, markProfileSynced, saveProfile, type Profile } from "../storage/profileStore";
 import {
-  clearProfile,
-  isProfileSynced,
-  loadProfile,
-  markProfileSynced,
-  savePhoneNumber,
-  saveProfile,
-  type Profile,
-} from "../storage/profileStore";
-import {
-  clearSessionEmail,
+  clearCachedIdentity,
   clearSessionToken,
-  loadSessionEmail,
+  loadCachedIdentity,
   loadSessionToken,
-  saveSessionEmail,
+  saveCachedIdentity,
   saveSessionToken,
+  type CachedIdentity,
 } from "../storage/sessionStore";
 
 type AuthStatus = "loading" | "signed-out" | "needs-profile" | "signed-in";
@@ -46,14 +39,25 @@ type AuthStatus = "loading" | "signed-out" | "needs-profile" | "signed-in";
 interface AuthContextValue {
   status: AuthStatus;
   email: string | null;
+  phoneNumber: string | null;
   profile: Profile | null;
   token: string | null;
   requestOtp: (email: string) => Promise<void>;
   verifyOtp: (email: string, code: string) => Promise<void>;
+  requestPhoneOtp: (phoneNumber: string) => Promise<void>;
+  verifyPhoneOtp: (phoneNumber: string, code: string) => Promise<void>;
   devLogin: (email: string) => Promise<void>;
+  devLoginPhone: (phoneNumber: string) => Promise<void>;
   completeProfile: (fullName: string, photoUri: string | null) => Promise<void>;
   updateProfile: (fullName: string, photoUri: string | null) => Promise<void>;
-  updatePhoneNumber: (phoneNumber: string | null) => Promise<void>;
+  // Verified "add a missing login identifier" flow — see AccountScreen and
+  // AddContactMethodScreen. Split into request/confirm since each is its own
+  // OTP round trip; confirm* only resolves once the server has attached the
+  // identifier to this account.
+  requestAddEmailOtp: (email: string) => Promise<void>;
+  confirmAddEmailOtp: (email: string, code: string) => Promise<void>;
+  requestAddPhoneOtp: (phoneNumber: string) => Promise<void>;
+  confirmAddPhoneOtp: (phoneNumber: string, code: string) => Promise<void>;
   logout: () => Promise<void>;
   deleteAccount: () => Promise<void>;
 }
@@ -114,25 +118,28 @@ function retrySyncIfNeeded(accountKey: string, token: string, localProfile: Prof
 export function AuthProvider({ children }: { children: ReactNode }) {
   const [status, setStatus] = useState<AuthStatus>("loading");
   const [email, setEmail] = useState<string | null>(null);
+  const [phoneNumber, setPhoneNumber] = useState<string | null>(null);
   const [profile, setProfile] = useState<Profile | null>(null);
   const [token, setToken] = useState<string | null>(null);
 
-  // Tracks the signed-in email outside of React state so signOutLocally
-  // (memoized once, below) always clears the profile for whichever account
-  // is actually active rather than a stale value captured at mount.
-  const emailRef = useRef<string | null>(null);
-  useEffect(() => {
-    emailRef.current = email;
-  }, [email]);
+  // The stable per-device key namespacing local chat DB/profile/identity
+  // storage (see storage/accountKey.ts) — set once, the first time this
+  // device establishes a session (whichever identifier was used to log in),
+  // and never recomputed from email/phoneNumber afterwards. That matters
+  // now that an account can have both identifiers: adding the second one
+  // later must not change which local files this device already reads from.
+  const accountKeyRef = useRef<string | null>(null);
 
   // Called both on explicit logout and when the server tells this device
   // it's been superseded by a login elsewhere (see "session:revoked" below).
   const signOutLocally = useCallback(() => {
     disconnectSocket();
     void clearSessionToken();
-    void clearSessionEmail();
-    if (emailRef.current) void clearProfile(emailRef.current);
+    void clearCachedIdentity();
+    if (accountKeyRef.current) void clearProfile(accountKeyRef.current);
+    accountKeyRef.current = null;
     setEmail(null);
+    setPhoneNumber(null);
     setProfile(null);
     setToken(null);
     setStatus("signed-out");
@@ -146,23 +153,26 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         return;
       }
 
-      const cachedEmail = await loadSessionEmail();
+      const cached = await loadCachedIdentity();
 
       try {
         const session = await api.getSession(storedToken);
-        await saveSessionEmail(session.email);
+        const accountKey = cached?.accountKey ?? session.email ?? session.phoneNumber ?? session.userId;
+        await saveCachedIdentity({ accountKey, email: session.email, phoneNumber: session.phoneNumber });
         // Opens this account's own local database/profile/identity so a
         // device that was previously signed into a different account
         // doesn't surface that account's chats, profile, or crypto keys here.
-        initDatabase(session.email);
-        await getOrCreateIdentity(session.email);
-        const localProfile = await loadProfile(session.email);
+        initDatabase(accountKey);
+        await getOrCreateIdentity(accountKey);
+        const localProfile = await loadProfile(accountKey);
+        accountKeyRef.current = accountKey;
         setEmail(session.email);
+        setPhoneNumber(session.phoneNumber);
         setToken(storedToken);
         connectSocket(storedToken).on("session:revoked", signOutLocally);
         setProfile(localProfile);
         setStatus(localProfile ? "signed-in" : "needs-profile");
-        if (localProfile) retrySyncIfNeeded(session.email, storedToken, localProfile);
+        if (localProfile) retrySyncIfNeeded(accountKey, storedToken, localProfile);
       } catch (err) {
         // A 401 means the server explicitly rejected this token (expired,
         // revoked by a login elsewhere, etc.) — that's a real sign-out.
@@ -174,20 +184,22 @@ export function AuthProvider({ children }: { children: ReactNode }) {
           return;
         }
 
-        if (!cachedEmail) {
+        if (!cached) {
           signOutLocally();
           return;
         }
 
-        initDatabase(cachedEmail);
-        await getOrCreateIdentity(cachedEmail);
-        const localProfile = await loadProfile(cachedEmail);
-        setEmail(cachedEmail);
+        initDatabase(cached.accountKey);
+        await getOrCreateIdentity(cached.accountKey);
+        const localProfile = await loadProfile(cached.accountKey);
+        accountKeyRef.current = cached.accountKey;
+        setEmail(cached.email);
+        setPhoneNumber(cached.phoneNumber);
         setToken(storedToken);
         connectSocket(storedToken).on("session:revoked", signOutLocally);
         setProfile(localProfile);
         setStatus(localProfile ? "signed-in" : "needs-profile");
-        if (localProfile) retrySyncIfNeeded(cachedEmail, storedToken, localProfile);
+        if (localProfile) retrySyncIfNeeded(cached.accountKey, storedToken, localProfile);
       }
     })();
   }, [signOutLocally]);
@@ -196,22 +208,35 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     await api.requestOtp(emailAddress);
   }, []);
 
+  const requestPhoneOtp = useCallback(async (phone: string) => {
+    await api.requestPhoneOtp(phone);
+  }, []);
+
   // Shared tail for anything that ends with "here's a fresh session token" —
-  // real OTP verification and the SKIP_OTP dev bypass both land here.
+  // real OTP verification (email or phone) and the SKIP_OTP dev bypass all
+  // land here. Exactly one of email/phoneNumber is set, matching whichever
+  // identifier was just proven by OTP.
   const establishSession = useCallback(
-    async (emailAddress: string, newToken: string) => {
-      initDatabase(emailAddress);
+    async (identity: { email?: string; phoneNumber?: string }, newToken: string) => {
+      const accountKey = (identity.email ?? identity.phoneNumber)!;
+      initDatabase(accountKey);
       await saveSessionToken(newToken);
-      await saveSessionEmail(emailAddress);
-      setEmail(emailAddress);
+      await saveCachedIdentity({
+        accountKey,
+        email: identity.email ?? null,
+        phoneNumber: identity.phoneNumber ?? null,
+      });
+      accountKeyRef.current = accountKey;
+      setEmail(identity.email ?? null);
+      setPhoneNumber(identity.phoneNumber ?? null);
       setToken(newToken);
       connectSocket(newToken).on("session:revoked", signOutLocally);
 
-      const localProfile = await loadProfile(emailAddress);
+      const localProfile = await loadProfile(accountKey);
       if (localProfile) {
         setProfile(localProfile);
         setStatus("signed-in");
-        retrySyncIfNeeded(emailAddress, newToken, localProfile);
+        retrySyncIfNeeded(accountKey, newToken, localProfile);
       } else {
         setStatus("needs-profile");
       }
@@ -237,7 +262,27 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         getDeviceName()
       );
       await saveDeviceId(emailAddress, linkedDeviceId);
-      await establishSession(emailAddress, newToken);
+      await establishSession({ email: emailAddress }, newToken);
+    },
+    [establishSession]
+  );
+
+  const verifyPhoneOtp = useCallback(
+    async (phone: string, code: string) => {
+      const identity = await getOrCreateIdentity(phone);
+      await sodium.ready;
+      const publicKey = sodium.to_base64(identity.publicKey);
+      const deviceId = await getOrCreateDeviceId(phone);
+
+      const { token: newToken, deviceId: linkedDeviceId } = await api.verifyPhoneOtp(
+        phone,
+        code,
+        publicKey,
+        deviceId,
+        getDeviceName()
+      );
+      await saveDeviceId(phone, linkedDeviceId);
+      await establishSession({ phoneNumber: phone }, newToken);
     },
     [establishSession]
   );
@@ -258,52 +303,110 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         getDeviceName()
       );
       await saveDeviceId(emailAddress, linkedDeviceId);
-      await establishSession(emailAddress, newToken);
+      await establishSession({ email: emailAddress }, newToken);
+    },
+    [establishSession]
+  );
+
+  // Phone counterpart of devLogin above — same SKIP_OTP dev bypass, just
+  // keyed by phone number (see EmailEntryScreen's phone tab).
+  const devLoginPhone = useCallback(
+    async (phone: string) => {
+      const identity = await getOrCreateIdentity(phone);
+      await sodium.ready;
+      const publicKey = sodium.to_base64(identity.publicKey);
+      const deviceId = await getOrCreateDeviceId(phone);
+
+      const { token: newToken, deviceId: linkedDeviceId } = await api.devLoginPhone(
+        phone,
+        publicKey,
+        deviceId,
+        getDeviceName()
+      );
+      await saveDeviceId(phone, linkedDeviceId);
+      await establishSession({ phoneNumber: phone }, newToken);
     },
     [establishSession]
   );
 
   const completeProfile = useCallback(
     async (fullName: string, photoUri: string | null) => {
-      if (!email) throw new Error("completeProfile called while signed out");
-      const saved = await saveProfile(email, fullName, photoUri);
+      const accountKey = accountKeyRef.current;
+      if (!accountKey) throw new Error("completeProfile called while signed out");
+      const saved = await saveProfile(accountKey, fullName, photoUri);
       setProfile(saved);
       setStatus("signed-in");
       // Onboarding: never previously synced, so always treat the photo (if any) as new.
       if (token && (await pushRemoteProfile(token, fullName, photoUri, true))) {
-        await markProfileSynced(email, true);
+        await markProfileSynced(accountKey, true);
       }
     },
-    [email, token]
+    [token]
   );
 
   const updateProfile = useCallback(
     async (fullName: string, photoUri: string | null) => {
-      if (!email) throw new Error("updateProfile called while signed out");
+      const accountKey = accountKeyRef.current;
+      if (!accountKey) throw new Error("updateProfile called while signed out");
       // Captured before saveProfile overwrites local `profile` state, so this
       // reflects whether the user actually picked a new photo this edit.
       const photoChanged = photoUri !== profile?.photoUri;
-      const saved = await saveProfile(email, fullName, photoUri);
+      const saved = await saveProfile(accountKey, fullName, photoUri);
       setProfile(saved);
       if (token && (await pushRemoteProfile(token, fullName, photoUri, photoChanged))) {
-        await markProfileSynced(email, true);
+        await markProfileSynced(accountKey, true);
       }
     },
-    [email, token, profile]
+    [token, profile]
   );
 
-  // Unlike name/photo above, this can genuinely fail (number already linked
-  // to another account) — the server call happens first and is left to
-  // throw so the caller can surface that, instead of swallowing it and
-  // leaving the local copy out of sync with what the server actually has.
-  const updatePhoneNumber = useCallback(
-    async (phoneNumber: string | null) => {
-      if (!email || !token) throw new Error("updatePhoneNumber called while signed out");
-      await api.updatePhoneNumber(token, phoneNumber);
-      await savePhoneNumber(email, phoneNumber);
-      setProfile((prev) => (prev ? { ...prev, phoneNumber } : prev));
+  // Persists a newly-added identifier into the cached identity blob (see
+  // sessionStore) so a later cold start that can't reach the server (see the
+  // startup effect's catch branch) still shows it, without ever touching
+  // accountKey itself — that stays fixed for this device (see accountKeyRef).
+  const persistIdentity = useCallback(
+    async (next: { email: string | null; phoneNumber: string | null }) => {
+      if (!accountKeyRef.current) return;
+      await saveCachedIdentity({ accountKey: accountKeyRef.current, ...next });
     },
-    [email, token]
+    []
+  );
+
+  const requestAddEmailOtp = useCallback(
+    async (emailAddress: string) => {
+      if (!token) throw new Error("requestAddEmailOtp called while signed out");
+      await api.requestAddEmailOtp(token, emailAddress);
+    },
+    [token]
+  );
+
+  const confirmAddEmailOtp = useCallback(
+    async (emailAddress: string, code: string) => {
+      if (!token) throw new Error("confirmAddEmailOtp called while signed out");
+      await api.verifyAddEmailOtp(token, emailAddress, code);
+      const normalized = emailAddress.trim().toLowerCase();
+      setEmail(normalized);
+      await persistIdentity({ email: normalized, phoneNumber });
+    },
+    [token, phoneNumber, persistIdentity]
+  );
+
+  const requestAddPhoneOtp = useCallback(
+    async (phone: string) => {
+      if (!token) throw new Error("requestAddPhoneOtp called while signed out");
+      await api.requestAddPhoneOtp(token, phone);
+    },
+    [token]
+  );
+
+  const confirmAddPhoneOtp = useCallback(
+    async (phone: string, code: string) => {
+      if (!token) throw new Error("confirmAddPhoneOtp called while signed out");
+      await api.verifyAddPhoneOtp(token, phone, code);
+      setPhoneNumber(phone);
+      await persistIdentity({ email, phoneNumber: phone });
+    },
+    [token, email, persistIdentity]
   );
 
   const logout = useCallback(async () => {
@@ -321,40 +424,55 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   // of signing the user out of an account that was never actually scheduled
   // for deletion.
   const deleteAccount = useCallback(async () => {
-    if (!token || !email) throw new Error("deleteAccount called while signed out");
+    const accountKey = accountKeyRef.current;
+    if (!token || !accountKey) throw new Error("deleteAccount called while signed out");
     await api.requestAccountDeletion(token);
-    wipeAccountDatabase(email);
-    await clearIdentityKeys(email);
-    await clearDeviceId(email);
+    wipeAccountDatabase(accountKey);
+    await clearIdentityKeys(accountKey);
+    await clearDeviceId(accountKey);
     signOutLocally();
-  }, [token, email, signOutLocally]);
+  }, [token, signOutLocally]);
 
   const value = useMemo(
     () => ({
       status,
       email,
+      phoneNumber,
       profile,
       token,
       requestOtp,
       verifyOtp,
+      requestPhoneOtp,
+      verifyPhoneOtp,
       devLogin,
+      devLoginPhone,
       completeProfile,
       updateProfile,
-      updatePhoneNumber,
+      requestAddEmailOtp,
+      confirmAddEmailOtp,
+      requestAddPhoneOtp,
+      confirmAddPhoneOtp,
       logout,
       deleteAccount,
     }),
     [
       status,
       email,
+      phoneNumber,
       profile,
       token,
       requestOtp,
       verifyOtp,
+      requestPhoneOtp,
+      verifyPhoneOtp,
       devLogin,
+      devLoginPhone,
       completeProfile,
       updateProfile,
-      updatePhoneNumber,
+      requestAddEmailOtp,
+      confirmAddEmailOtp,
+      requestAddPhoneOtp,
+      confirmAddPhoneOtp,
       logout,
       deleteAccount,
     ]

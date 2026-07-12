@@ -3,6 +3,7 @@ import { ActivityIndicator, Pressable, StyleSheet, Text } from "react-native";
 import type { NativeStackScreenProps } from "@react-navigation/native-stack";
 
 import type { AuthStackParamList } from "../../App";
+import { OtpCooldownError } from "../api/client";
 import { useAuth } from "../auth/AuthContext";
 import AuthScreenLayout from "../components/AuthScreenLayout";
 import OtpCodeInput from "../components/OtpCodeInput";
@@ -13,13 +14,13 @@ import type { ThemeColors } from "../theme";
 type Props = NativeStackScreenProps<AuthStackParamList, "Otp">;
 
 const CODE_LENGTH = 6;
-const RESEND_COOLDOWN_SEC = 30;
+const RESEND_COOLDOWN_SEC = 60;
 
 export default function OtpScreen({ navigation, route }: Props) {
   const { colors } = useTheme();
   const styles = useMemo(() => createStyles(colors), [colors]);
-  const { email } = route.params;
-  const { requestOtp, verifyOtp } = useAuth();
+  const { method, identifier } = route.params;
+  const { requestOtp, verifyOtp, requestPhoneOtp, verifyPhoneOtp } = useAuth();
   const [code, setCode] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -36,7 +37,11 @@ export default function OtpScreen({ navigation, route }: Props) {
     setError(null);
     setLoading(true);
     try {
-      await verifyOtp(email, code);
+      if (method === "email") {
+        await verifyOtp(identifier, code);
+      } else {
+        await verifyPhoneOtp(identifier, code);
+      }
       // On success AuthProvider flips status to "signed-in" and the
       // navigator swaps to the main stack on its own.
     } catch (e) {
@@ -51,10 +56,18 @@ export default function OtpScreen({ navigation, route }: Props) {
     setError(null);
     setResending(true);
     try {
-      await requestOtp(email);
+      if (method === "email") {
+        await requestOtp(identifier);
+      } else {
+        await requestPhoneOtp(identifier);
+      }
       setResendCooldown(RESEND_COOLDOWN_SEC);
     } catch (e) {
-      setError(e instanceof Error ? e.message : "Couldn't resend the code");
+      if (e instanceof OtpCooldownError) {
+        setResendCooldown(e.retryAfterSeconds);
+      } else {
+        setError(e instanceof Error ? e.message : "Couldn't resend the code");
+      }
     } finally {
       setResending(false);
     }
@@ -63,8 +76,8 @@ export default function OtpScreen({ navigation, route }: Props) {
   return (
     <AuthScreenLayout
       onBack={() => navigation.goBack()}
-      title="Check your email"
-      subtitle={`We sent a ${CODE_LENGTH}-digit code to ${email}`}
+      title={method === "email" ? "Check your email" : "Check your phone"}
+      subtitle={`We sent a ${CODE_LENGTH}-digit code to ${identifier}`}
       footer={
         <PrimaryButton title="Verify" onPress={onSubmit} disabled={code.length !== CODE_LENGTH} loading={loading} />
       }

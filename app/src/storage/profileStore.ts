@@ -10,10 +10,6 @@ const secureOptions: SecureStore.SecureStoreOptions = {
 export interface Profile {
   fullName: string;
   photoUri: string | null;
-  // Optional, self-reported, unverified. Kept alongside name/photo so the
-  // edit-profile screen has something to prefill; the server (not this
-  // local copy) is the source of truth for add-contact search.
-  phoneNumber: string | null;
   createdAt: number;
 }
 
@@ -24,7 +20,6 @@ function aliasesFor(accountKey: string) {
   return {
     fullName: `beacon.profile.${key}.fullName`,
     photoUri: `beacon.profile.${key}.photoUri`,
-    phoneNumber: `beacon.profile.${key}.phoneNumber`,
     createdAt: `beacon.profile.${key}.createdAt`,
     photoFilename: `profile-photo-${key}.jpg`,
     synced: `beacon.profile.${key}.synced`,
@@ -83,21 +78,7 @@ export async function saveProfile(
   // right after this and marks it synced on success (see AuthContext).
   await SecureStore.setItemAsync(alias.synced, "false", secureOptions);
 
-  // Phone number isn't touched by this function (it's saved separately via
-  // savePhoneNumber) — just read it back so the returned Profile reflects
-  // whatever's currently stored, instead of silently reporting it as unset.
-  const phoneNumber = await SecureStore.getItemAsync(alias.phoneNumber, secureOptions);
-
-  return { fullName, photoUri, phoneNumber: phoneNumber ?? null, createdAt };
-}
-
-export async function savePhoneNumber(accountKey: string, phoneNumber: string | null): Promise<void> {
-  const alias = aliasesFor(accountKey);
-  if (phoneNumber) {
-    await SecureStore.setItemAsync(alias.phoneNumber, phoneNumber, secureOptions);
-  } else {
-    await SecureStore.deleteItemAsync(alias.phoneNumber, secureOptions);
-  }
+  return { fullName, photoUri, createdAt };
 }
 
 export async function loadProfile(accountKey: string): Promise<Profile | null> {
@@ -111,12 +92,10 @@ export async function loadProfile(accountKey: string): Promise<Profile | null> {
   // a path that no longer exists rather than rendering a broken image.
   const photoUri = storedPhotoUri && new File(storedPhotoUri).exists ? storedPhotoUri : null;
 
-  const phoneNumber = await SecureStore.getItemAsync(alias.phoneNumber, secureOptions);
   const createdAt = await SecureStore.getItemAsync(alias.createdAt, secureOptions);
   return {
     fullName,
     photoUri,
-    phoneNumber: phoneNumber ?? null,
     createdAt: createdAt ? Number(createdAt) : Date.now(),
   };
 }
@@ -125,7 +104,6 @@ export async function clearProfile(accountKey: string): Promise<void> {
   const alias = aliasesFor(accountKey);
   await SecureStore.deleteItemAsync(alias.fullName, secureOptions);
   await SecureStore.deleteItemAsync(alias.photoUri, secureOptions);
-  await SecureStore.deleteItemAsync(alias.phoneNumber, secureOptions);
   await SecureStore.deleteItemAsync(alias.createdAt, secureOptions);
   const photo = new File(Paths.document, alias.photoFilename);
   if (photo.exists) {

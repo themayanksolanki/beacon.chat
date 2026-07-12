@@ -15,8 +15,10 @@ import CallHistoryScreen from "./src/screens/CallHistoryScreen";
 import ChatScreen from "./src/screens/ChatScreen";
 import ContactsScreen from "./src/screens/ContactsScreen";
 import ContactInfoScreen from "./src/screens/ContactInfoScreen";
+import SharedMediaScreen from "./src/screens/SharedMediaScreen";
 import SettingsScreen from "./src/screens/SettingsScreen";
 import AccountScreen from "./src/screens/AccountScreen";
+import AddContactMethodScreen from "./src/screens/AddContactMethodScreen";
 import AppearanceScreen from "./src/screens/AppearanceScreen";
 import LinkedDevicesScreen from "./src/screens/LinkedDevicesScreen";
 import BlockedUsersScreen from "./src/screens/BlockedUsersScreen";
@@ -39,7 +41,7 @@ import { ThemeProvider, useTheme } from "./src/ThemeContext";
 
 export type AuthStackParamList = {
   EmailEntry: undefined;
-  Otp: { email: string };
+  Otp: { method: "email" | "phone"; identifier: string };
 };
 
 export type ProfileStackParamList = {
@@ -55,10 +57,12 @@ export type MainTabParamList = {
 
 export type MainStackParamList = {
   MainTabs: undefined;
-  Chat: { conversationId: string };
+  Chat: { conversationId: string; openSearch?: boolean };
   Contacts: undefined;
   ContactInfo: { conversationId: string };
+  SharedMedia: { conversationId: string };
   Account: undefined;
+  AddContactMethod: { method: "email" | "phone" };
   Appearance: undefined;
   LinkedDevices: undefined;
   BlockedUsers: undefined;
@@ -166,7 +170,17 @@ function RootNavigator() {
         component={ContactInfoScreen}
         options={{ title: "Contact Info" }}
       />
+      <MainStack.Screen
+        name="SharedMedia"
+        component={SharedMediaScreen}
+        options={{ title: "Media, links and docs" }}
+      />
       <MainStack.Screen name="Account" component={AccountScreen} options={{ title: "Account" }} />
+      <MainStack.Screen
+        name="AddContactMethod"
+        component={AddContactMethodScreen}
+        options={({ route }) => ({ title: route.params.method === "email" ? "Add email" : "Add mobile number" })}
+      />
       <MainStack.Screen
         name="Appearance"
         component={AppearanceScreen}

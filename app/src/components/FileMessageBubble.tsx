@@ -16,6 +16,12 @@ interface Props {
   isOutgoing: boolean;
   uploadProgress?: number;
   onDownload?: () => void;
+  /** Forwarded to this Pressable directly rather than relying on bubbling to
+   * a parent Pressable — a long-press starting here claims the touch
+   * responder itself (it's the deepest Pressable), so without this the
+   * parent MessageBubble's own onLongPress (the reply/copy/delete/pin menu)
+   * never fired here, only on the bubble's border/padding. */
+  onLongPress?: () => void;
 }
 
 function formatSize(bytes: number | null): string {
@@ -34,6 +40,7 @@ export default function FileMessageBubble({
   isOutgoing,
   uploadProgress,
   onDownload,
+  onLongPress,
 }: Props) {
   const { colors } = useTheme();
   const styles = useMemo(() => createStyles(colors), [colors]);
@@ -46,7 +53,8 @@ export default function FileMessageBubble({
     <Pressable
       style={[styles.container, isOutgoing ? styles.outgoing : styles.incoming]}
       onPress={canDownload ? onDownload : undefined}
-      disabled={!canDownload}
+      onLongPress={onLongPress}
+      disabled={!canDownload && !onLongPress}
     >
       <View style={styles.iconWrap}>
         {inFlight ? (

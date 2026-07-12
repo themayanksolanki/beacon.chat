@@ -28,9 +28,15 @@ interface Props {
   durationMs: number;
   waveform: number[];
   isOutgoing: boolean;
+  /** Forwarded to this Pressable directly rather than relying on bubbling to
+   * a parent Pressable — a long-press starting here claims the touch
+   * responder itself (it's the deepest Pressable), so without this the
+   * parent MessageBubble's own onLongPress (the reply/copy/delete/pin menu)
+   * never fired here, only on the bubble's border/padding. */
+  onLongPress?: () => void;
 }
 
-export default function VoiceMessageBubble({ audioUri, durationMs, waveform, isOutgoing }: Props) {
+export default function VoiceMessageBubble({ audioUri, durationMs, waveform, isOutgoing, onLongPress }: Props) {
   const { colors } = useTheme();
   const styles = useMemo(() => createStyles(colors), [colors]);
   const player = useAudioPlayer(audioUri ? { uri: audioUri } : null);
@@ -57,7 +63,12 @@ export default function VoiceMessageBubble({ audioUri, durationMs, waveform, isO
   const unplayedColor = isOutgoing ? "rgba(255,255,255,0.4)" : colors.textTertiary;
 
   return (
-    <Pressable style={styles.row} onPress={toggle} disabled={!audioUri}>
+    <Pressable
+      style={styles.row}
+      onPress={toggle}
+      onLongPress={onLongPress}
+      disabled={!audioUri && !onLongPress}
+    >
       <Ionicons name={status.playing ? "pause-circle" : "play-circle"} size={30} color={isOutgoing ? "#fff" : colors.accent} />
       <View style={styles.waveform}>
         {waveform.map((amplitude, index) => (
