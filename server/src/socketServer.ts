@@ -682,6 +682,24 @@ export function createSocketServer(httpServer: HttpServer): Server {
       }
     });
 
+    // Same reasoning as call:camera-state above — screen-share on/off has no
+    // wire-level signal of its own (it's just which local track got
+    // replaceTrack'd onto the existing video sender), so the other party
+    // needs this relayed to relabel the feed instead of just showing raw
+    // video content unlabeled.
+    socket.on("call:screen-share-state", (payload: { callId: string; sharing: boolean }) => {
+      try {
+        const call = activeCalls.get(payload.callId);
+        if (!call || (call.callerId !== userId && call.calleeId !== userId)) return;
+        io!.to(otherParty(call, userId)).emit("call:screen-share-state", {
+          callId: payload.callId,
+          sharing: payload.sharing,
+        });
+      } catch (err) {
+        console.error("[socket] call:screen-share-state failed", err);
+      }
+    });
+
     // Same reasoning as call:camera-state above — mute is purely local
     // (track.enabled on the audio track), so the other party needs this
     // relayed to show a "muted" indicator for them.
