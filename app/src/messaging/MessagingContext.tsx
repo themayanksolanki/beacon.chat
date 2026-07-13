@@ -7,6 +7,7 @@ import { writeVoiceMessageBase64 } from "../audio/voiceStorage";
 import { subscribeConversationActivity } from "../chat/conversationActivity";
 import { decryptMessage, getOrCreateIdentity } from "../crypto/identity";
 import {
+  archiveConversation,
   getConversationById,
   insertConversation,
   insertMessage,
@@ -14,8 +15,10 @@ import {
   markMessageDeletedEverywhere,
   markMessageDelivered,
   markMessageRead,
+  reconcileArchivedConversations,
   setConversationStatus,
   setPeerReaction,
+  unarchiveConversation,
   updateConversationPeerKey,
   updateConversationProfile,
   type ConversationRow,
@@ -51,9 +54,17 @@ interface ReplyRef {
 // on the legacy variant lets payload.transport be checked directly to
 // distinguish the two without a separate type guard.
 export type MessagePayload =
-  | { kind: "text"; text: string; replyTo?: ReplyRef }
-  | { kind: "voice"; audio: string; durationMs: number; waveform: number[]; replyTo?: ReplyRef }
-  | { kind: "image"; transport?: undefined; image: string; width: number; height: number; replyTo?: ReplyRef }
+  | { kind: "text"; text: string; replyTo?: ReplyRef; forwarded?: boolean }
+  | { kind: "voice"; audio: string; durationMs: number; waveform: number[]; replyTo?: ReplyRef; forwarded?: boolean }
+  | {
+      kind: "image";
+      transport?: undefined;
+      image: string;
+      width: number;
+      height: number;
+      replyTo?: ReplyRef;
+      forwarded?: boolean;
+    }
   | {
       kind: "image";
       transport: "s3";
@@ -68,8 +79,9 @@ export type MessagePayload =
       // pickAndSendAttachment) so the recipient groups them into the same
       // grid bubble the sender sees — see the album_id column/MessageRow field.
       albumId?: string;
+      forwarded?: boolean;
     }
-  | { kind: "gif"; url: string; width: number; height: number; replyTo?: ReplyRef }
+  | { kind: "gif"; url: string; width: number; height: number; replyTo?: ReplyRef; forwarded?: boolean }
   | {
       kind: "video";
       url: string;
@@ -81,6 +93,7 @@ export type MessagePayload =
       size: number;
       replyTo?: ReplyRef;
       albumId?: string;
+      forwarded?: boolean;
     }
   | {
       kind: "file";
@@ -91,6 +104,7 @@ export type MessagePayload =
       mime: string;
       size: number;
       replyTo?: ReplyRef;
+      forwarded?: boolean;
     };
 
 export interface ReactionPayload {
@@ -196,6 +210,8 @@ export function MessagingProvider({ children }: { children: ReactNode }) {
           created_at: Date.now(),
           status: "accepted",
           contact_number: peer.contactNumber,
+          is_archived: 0,
+          archived_at: null,
         };
         insertConversation(conversation);
         return getConversationById(peerId);
@@ -325,6 +341,7 @@ export function MessagingProvider({ children }: { children: ReactNode }) {
             (payload.kind === "image" && payload.transport === "s3") || payload.kind === "video"
               ? (payload.albumId ?? null)
               : null,
+          forwarded_at: payload.forwarded ? message.created_at : null,
         };
         insertMessage(row);
         getSocket().emit("message:delivered", { id: message.id });
@@ -441,6 +458,8 @@ export function MessagingProvider({ children }: { children: ReactNode }) {
           created_at: Date.now(),
           status: "pending_incoming",
           contact_number: peer.contactNumber,
+          is_archived: 0,
+          archived_at: null,
         });
         bump();
       } catch (err) {
@@ -481,6 +500,30 @@ export function MessagingProvider({ children }: { children: ReactNode }) {
       bump();
     };
 
+    // Archive/unarchive done on ANOTHER of this user's devices (see
+    // socket.to(userId) in socketServer.ts's conversation:archive/unarchive —
+    // excludes the device that made the change, since it already updated its
+    // own local cache from the ack in chat/archivedChats.ts).
+    const onConversationArchived = ({ peerId, archivedAt }: { peerId: string; archivedAt: number }) => {
+      archiveConversation(peerId, archivedAt);
+      bump();
+    };
+
+    const onConversationUnarchived = ({ peerId }: { peerId: string }) => {
+      unarchiveConversation(peerId);
+      bump();
+    };
+
+    // Full archive-state snapshot sent on every connect (see
+    // flushArchivedChats in socketServer.ts) — reconciles this device's
+    // local cache with the server's authoritative state, covering both a
+    // brand-new device/session and one that missed a live push above while
+    // it was offline.
+    const onArchivedSync = (entries: { peerId: string; archivedAt: number }[]) => {
+      reconcileArchivedConversations(entries.map((e) => ({ peer_id: e.peerId, archived_at: e.archivedAt })));
+      bump();
+    };
+
     socket.on("message", onMessage);
     socket.on("message:delivered", onDelivered);
     socket.on("message:read", onRead);
@@ -490,6 +533,9 @@ export function MessagingProvider({ children }: { children: ReactNode }) {
     socket.on("contact:request", onContactRequest);
     socket.on("contact:accepted", onContactAccepted);
     socket.on("contact:declined", onContactDeclined);
+    socket.on("conversation:archived", onConversationArchived);
+    socket.on("conversation:unarchived", onConversationUnarchived);
+    socket.on("conversation:archived:sync", onArchivedSync);
     return () => {
       socket.off("message", onMessage);
       socket.off("message:delivered", onDelivered);
@@ -500,6 +546,9 @@ export function MessagingProvider({ children }: { children: ReactNode }) {
       socket.off("contact:request", onContactRequest);
       socket.off("contact:accepted", onContactAccepted);
       socket.off("contact:declined", onContactDeclined);
+      socket.off("conversation:archived", onConversationArchived);
+      socket.off("conversation:unarchived", onConversationUnarchived);
+      socket.off("conversation:archived:sync", onArchivedSync);
     };
   }, [token, email]);
 

@@ -34,6 +34,7 @@ export default function EmailEntryScreen({ navigation }: Props) {
   const [country, setCountry] = useState<CountryDialCode>(DEFAULT_COUNTRY);
   const [phoneDigits, setPhoneDigits] = useState("");
   const [phoneTouched, setPhoneTouched] = useState(false);
+  const [emailFocused, setEmailFocused] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -113,8 +114,18 @@ export default function EmailEntryScreen({ navigation }: Props) {
       </View>
 
       {method === "email" ? (
-        <View style={[styles.inputWrap, error ? styles.inputWrapError : null]}>
-          <Ionicons name="mail-outline" size={20} color={colors.textTertiary} />
+        <View
+          style={[
+            styles.inputWrap,
+            emailFocused ? styles.inputWrapFocused : null,
+            error ? styles.inputWrapError : null,
+          ]}
+        >
+          <Ionicons
+            name="mail-outline"
+            size={20}
+            color={emailFocused ? colors.accent : colors.textTertiary}
+          />
           <TextInput
             style={styles.input}
             placeholder="you@example.com"
@@ -126,6 +137,8 @@ export default function EmailEntryScreen({ navigation }: Props) {
             autoFocus
             returnKeyType="send"
             value={email}
+            onFocus={() => setEmailFocused(true)}
+            onBlur={() => setEmailFocused(false)}
             onChangeText={(text) => {
               setEmail(text);
               if (error) setError(null);
@@ -186,6 +199,7 @@ const createStyles = (colors: ThemeColors) =>
       borderRadius: 12,
       paddingHorizontal: 14,
     },
+    inputWrapFocused: { borderColor: colors.accent },
     inputWrapError: { borderColor: colors.danger },
     input: { flex: 1, color: colors.text, fontSize: 16, paddingVertical: 14 },
     errorRow: { flexDirection: "row", alignItems: "center", gap: 6, marginTop: 8 },

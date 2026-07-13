@@ -79,7 +79,8 @@
       "expo-notifications",
       "expo-font",
       "expo-asset",
-      "expo-video"
+      "expo-video",
+      "expo-sharing"
     ],
     "extra": {
       "eas": {

@@ -91,21 +91,41 @@ export async function rejectContact(
  * Backfills 'accepted' contacts rows from existing message history so
  * conversations that predate this feature keep working — without this,
  * shipping the message:send/call:invite gate would instantly lock every
- * chat that existed before the contacts table did. Safe to call on every
- * boot: the upsert's no-op update makes it a no-op past the first run.
+ * chat that existed before the contacts table did.
+ *
+ * This is a one-time historical migration, not an ongoing job: every
+ * message sent since the gate went live already required an accepted
+ * contact row (see isAcceptedContact in socketServer.ts), so once this has
+ * run successfully there is nothing left for it to backfill. Trigger it
+ * explicitly (see index.ts) rather than on every boot.
+ *
+ * Grouped by (senderId, recipientId) so Postgres collapses duplicates
+ * itself — this reads one row per distinct pair (bounded by conversation
+ * count) instead of pulling every message row into memory — then writes
+ * in small concurrent batches instead of one upsert per pair, sequentially.
  */
 export async function backfillAcceptedContactsFromMessages(): Promise<void> {
-  const pairs = await prisma.message.findMany({ select: { senderId: true, recipientId: true } });
-  const seen = new Set<string>();
+  const pairs = await prisma.message.groupBy({ by: ["senderId", "recipientId"] });
+
+  const canonicalPairs = new Map<string, { a: string; b: string; requestedBy: string }>();
   for (const { senderId, recipientId } of pairs) {
     const [a, b] = canonicalPair(senderId, recipientId);
     const key = `${a}:${b}`;
-    if (seen.has(key)) continue;
-    seen.add(key);
-    await prisma.contact.upsert({
-      where: { userAId_userBId: { userAId: a, userBId: b } },
-      update: {},
-      create: { userAId: a, userBId: b, status: "accepted", requestedBy: senderId, respondedAt: new Date() },
-    });
+    if (!canonicalPairs.has(key)) canonicalPairs.set(key, { a, b, requestedBy: senderId });
+  }
+
+  const entries = [...canonicalPairs.values()];
+  const BATCH_SIZE = 50;
+  for (let i = 0; i < entries.length; i += BATCH_SIZE) {
+    const batch = entries.slice(i, i + BATCH_SIZE);
+    await Promise.all(
+      batch.map(({ a, b, requestedBy }) =>
+        prisma.contact.upsert({
+          where: { userAId_userBId: { userAId: a, userBId: b } },
+          update: {},
+          create: { userAId: a, userBId: b, status: "accepted", requestedBy, respondedAt: new Date() },
+        })
+      )
+    );
   }
 }

@@ -1,12 +1,16 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useState } from "react";
-import { Alert, Dimensions, FlatList, Image, Pressable, StyleSheet, Text, View } from "react-native";
+import { ActivityIndicator, Alert, Dimensions, FlatList, Image, Pressable, StyleSheet, Text, View } from "react-native";
 import { useFocusEffect } from "@react-navigation/native";
 import type { NativeStackScreenProps } from "@react-navigation/native-stack";
 import { Ionicons } from "@expo/vector-icons";
 import { useVideoPlayer, VideoView } from "expo-video";
+import * as Sharing from "expo-sharing";
 
 import type { MainStackParamList } from "../../App";
-import { deleteMessage, getMediaMessages, type MessageRow } from "../db/database";
+import { extractLinks, openLink } from "../chat/linkify";
+import { formatSize } from "../components/FileMessageBubble";
+import { deleteMessage, getFileMessages, getMediaMessages, getTextMessages, type MessageRow } from "../db/database";
+import { fetchAndStoreChatMedia } from "../media/chatMediaDownload";
 import MediaViewerModal, { type ViewerMedia } from "../components/MediaViewerModal";
 import { useTheme } from "../ThemeContext";
 import type { ThemeColors } from "../theme";
@@ -14,6 +18,35 @@ import type { ThemeColors } from "../theme";
 type Props = NativeStackScreenProps<MainStackParamList, "SharedMedia">;
 
 type Tab = "media" | "links" | "docs";
+
+interface LinkEntry {
+  id: string;
+  url: string;
+  sentAt: number;
+}
+
+/** Flattens every link found across `messages` (already most-recent-first, see getTextMessages) into one row per occurrence — a message with 2 links contributes 2 rows, in the order they appear in that message. */
+function buildLinkEntries(messages: MessageRow[]): LinkEntry[] {
+  const entries: LinkEntry[] = [];
+  for (const message of messages) {
+    extractLinks(message.plaintext).forEach((url, index) => {
+      entries.push({ id: `${message.id}-${index}`, url, sentAt: message.sent_at });
+    });
+  }
+  return entries;
+}
+
+function hostOf(url: string): string {
+  try {
+    return new URL(url.startsWith("http") ? url : `https://${url}`).hostname;
+  } catch {
+    return url;
+  }
+}
+
+function formatDate(ts: number): string {
+  return new Date(ts).toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" });
+}
 
 const NUM_COLUMNS = 4;
 const CELL_GAP = 2;
@@ -39,20 +72,54 @@ function GridVideoCell({ uri, size }: { uri: string; size: number }) {
 }
 
 export default function SharedMediaScreen({ route, navigation }: Props) {
-  const { conversationId } = route.params;
+  const { conversationId, initialTab } = route.params;
   const { colors } = useTheme();
   const themedStyles = useMemo(() => createStyles(colors), [colors]);
   const [media, setMedia] = useState<MessageRow[]>([]);
-  const [tab, setTab] = useState<Tab>("media");
+  const [docs, setDocs] = useState<MessageRow[]>([]);
+  const [linkEntries, setLinkEntries] = useState<LinkEntry[]>([]);
+  const [tab, setTab] = useState<Tab>(initialTab ?? "media");
   const [selectionMode, setSelectionMode] = useState(false);
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const [viewerOpen, setViewerOpen] = useState(false);
   const [viewerIndex, setViewerIndex] = useState(0);
 
+  const reloadDocs = useCallback(() => {
+    setDocs(getFileMessages(conversationId));
+  }, [conversationId]);
+
   useFocusEffect(
     useCallback(() => {
       setMedia(getMediaMessages(conversationId));
-    }, [conversationId])
+      reloadDocs();
+      setLinkEntries(buildLinkEntries(getTextMessages(conversationId)));
+    }, [conversationId, reloadDocs])
+  );
+
+  const onOpenDoc = useCallback(async (message: MessageRow) => {
+    if (!message.file_uri) return;
+    try {
+      const available = await Sharing.isAvailableAsync();
+      if (!available) {
+        Alert.alert("Can't open file", "No app is available to open this file on your device.");
+        return;
+      }
+      await Sharing.shareAsync(message.file_uri, {
+        mimeType: message.file_mime ?? undefined,
+        dialogTitle: message.file_name ?? undefined,
+      });
+    } catch (err) {
+      console.warn("[shared-media] failed to open file", err);
+      Alert.alert("Couldn't open file", "Please try again.");
+    }
+  }, []);
+
+  const onDownloadDoc = useCallback(
+    (message: MessageRow) => {
+      setDocs((prev) => prev.map((m) => (m.id === message.id ? { ...m, media_status: "downloading" } : m)));
+      fetchAndStoreChatMedia(message).then(reloadDocs).catch(reloadDocs);
+    },
+    [reloadDocs]
   );
 
   const exitSelectionMode = useCallback(() => {
@@ -179,15 +246,92 @@ export default function SharedMediaScreen({ route, navigation }: Props) {
         ))}
       </View>
 
-      {tab !== "media" ? (
-        <View style={themedStyles.empty}>
-          <Ionicons
-            name={tab === "links" ? "link-outline" : "document-text-outline"}
-            size={40}
-            color={colors.textTertiary}
+      {tab === "links" ? (
+        linkEntries.length === 0 ? (
+          <View style={themedStyles.empty}>
+            <Ionicons name="link-outline" size={40} color={colors.textTertiary} />
+            <Text style={themedStyles.emptyText}>No links shared yet</Text>
+          </View>
+        ) : (
+          <FlatList
+            data={linkEntries}
+            keyExtractor={(item) => item.id}
+            contentContainerStyle={themedStyles.rowList}
+            renderItem={({ item }) => (
+              <Pressable style={themedStyles.linkRow} onPress={() => void openLink(item.url)}>
+                <View style={themedStyles.docIconWrap}>
+                  <Ionicons name="link-outline" size={20} color={colors.accent} />
+                </View>
+                <View style={themedStyles.docInfo}>
+                  <Text style={themedStyles.docName} numberOfLines={1}>
+                    {hostOf(item.url)}
+                  </Text>
+                  <Text style={themedStyles.docMeta} numberOfLines={1}>
+                    {item.url}
+                  </Text>
+                </View>
+              </Pressable>
+            )}
+            ListFooterComponent={
+              <Text style={themedStyles.footerText}>
+                {linkEntries.length} Link{linkEntries.length === 1 ? "" : "s"}
+              </Text>
+            }
           />
-          <Text style={themedStyles.emptyText}>{tab === "links" ? "Links" : "Docs"} coming soon</Text>
-        </View>
+        )
+      ) : tab === "docs" ? (
+        docs.length === 0 ? (
+          <View style={themedStyles.empty}>
+            <Ionicons name="document-text-outline" size={40} color={colors.textTertiary} />
+            <Text style={themedStyles.emptyText}>No documents shared yet</Text>
+          </View>
+        ) : (
+          <FlatList
+            data={docs}
+            keyExtractor={(item) => item.id}
+            contentContainerStyle={themedStyles.rowList}
+            renderItem={({ item }) => {
+              const isLocal = !!item.file_uri;
+              const inFlight = item.media_status === "downloading";
+              const icon = item.file_mime?.startsWith("audio/") ? "musical-notes-outline" : "document-outline";
+              return (
+                <Pressable
+                  style={themedStyles.linkRow}
+                  disabled={inFlight}
+                  onPress={() => (isLocal ? onOpenDoc(item) : onDownloadDoc(item))}
+                >
+                  <View style={themedStyles.docIconWrap}>
+                    {inFlight ? (
+                      <ActivityIndicator size="small" color={colors.textSecondary} />
+                    ) : (
+                      <Ionicons name={icon} size={20} color={colors.textSecondary} />
+                    )}
+                  </View>
+                  <View style={themedStyles.docInfo}>
+                    <Text style={themedStyles.docName} numberOfLines={1} ellipsizeMode="middle">
+                      {item.file_name ?? "File"}
+                    </Text>
+                    <Text style={themedStyles.docMeta} numberOfLines={1}>
+                      {inFlight
+                        ? "Downloading…"
+                        : `${formatDate(item.sent_at)}${item.file_size ? ` · ${formatSize(item.file_size)}` : ""}${
+                            !isLocal ? " · Tap to download" : ""
+                          }`}
+                    </Text>
+                  </View>
+                  {!isLocal && !inFlight ? (
+                    <Ionicons name="download-outline" size={18} color={colors.textTertiary} />
+                  ) : null}
+                </Pressable>
+              );
+            }}
+            ListFooterComponent={
+              <Text style={themedStyles.footerText}>
+                {docs.length} Document{docs.length === 1 ? "" : "s"}
+              </Text>
+            }
+          />
+        )
       ) : media.length === 0 ? (
         <View style={themedStyles.empty}>
           <Ionicons name="images-outline" size={40} color={colors.textTertiary} />
@@ -312,4 +456,18 @@ const createStyles = (colors: ThemeColors) =>
     },
     headerTextButton: { paddingHorizontal: 4, paddingVertical: 4 },
     headerButtonLabel: { fontSize: 16, color: colors.accent },
+    rowList: { padding: 12, paddingTop: 4, gap: 8 },
+    linkRow: {
+      flexDirection: "row",
+      alignItems: "center",
+      gap: 12,
+      paddingHorizontal: 14,
+      paddingVertical: 10,
+      borderRadius: 14,
+      backgroundColor: colors.surface,
+    },
+    docIconWrap: { width: 32, height: 32, alignItems: "center", justifyContent: "center" },
+    docInfo: { flex: 1, minWidth: 0 },
+    docName: { fontSize: 15, fontWeight: "600", color: colors.text },
+    docMeta: { fontSize: 12, color: colors.textTertiary, marginTop: 2 },
   });

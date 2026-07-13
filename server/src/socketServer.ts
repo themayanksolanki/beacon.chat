@@ -20,6 +20,7 @@ import { getUnsyncedMissedCalls, markMissedCallsSynced, recordMissedCall } from 
 import { getLastSeen, setLastSeen } from "./presence";
 import { setDeviceLastSeen } from "./devices";
 import { acceptContact, isAcceptedContact, rejectContact, requestContact, type RejectAction } from "./contacts";
+import { archiveChat, listArchivedChats, unarchiveChat } from "./archivedChats";
 
 interface AuthedSocket extends Socket {
   userId?: string;
@@ -156,6 +157,23 @@ async function flushMissedCalls(socket: AuthedSocket, userId: string): Promise<v
   if (missed.length > 0) await markMissedCallsSynced(userId);
 }
 
+/**
+ * Archive state is current state, not an event log, so — unlike the flushes
+ * above — there's nothing to mark synced: this just sends the full list every
+ * time a device connects, so a device that archived/unarchived something
+ * while ANOTHER of this user's devices was offline (missing the live
+ * conversation:archived/unarchived push below) still ends up consistent as
+ * soon as it reconnects, and so a brand-new device linking mid-session picks
+ * up the current state immediately instead of starting from nothing.
+ */
+async function flushArchivedChats(socket: AuthedSocket, userId: string): Promise<void> {
+  const archived = await listArchivedChats(userId);
+  socket.emit(
+    "conversation:archived:sync",
+    archived.map((a) => ({ peerId: a.peerId, archivedAt: a.archivedAt.getTime() }))
+  );
+}
+
 export function createSocketServer(httpServer: HttpServer): Server {
   io = new Server(httpServer, {
     cors: { origin: "*" },
@@ -228,6 +246,7 @@ export function createSocketServer(httpServer: HttpServer): Server {
     if (socket.deviceId) void flushUndelivered(socket, socket.deviceId);
     void flushMessageStatus(socket, userId);
     void flushMissedCalls(socket, userId);
+    void flushArchivedChats(socket, userId);
 
     socket.on(
       "message:send",
@@ -499,6 +518,46 @@ export function createSocketServer(httpServer: HttpServer): Server {
           ack?.({ ok: true });
         } catch (err) {
           console.error("[socket] contact:reject failed", err);
+          ack?.({ ok: false, error: "internal_error" });
+        }
+      }
+    );
+
+    // --- Archive chat (per-viewer only — never notifies the peer, only this
+    // user's OTHER devices; see archivedChats.ts) ---
+
+    socket.on(
+      "conversation:archive",
+      async (
+        payload: { peerId: string },
+        ack?: (response: { ok: true; archivedAt: number } | { ok: false; error: string }) => void
+      ) => {
+        try {
+          if (!(await userExists(payload.peerId))) {
+            ack?.({ ok: false, error: "recipient_not_found" });
+            return;
+          }
+          const archivedAt = await archiveChat(userId, payload.peerId);
+          // socket.to (not io.to) excludes this socket — the caller already
+          // knows via its own ack, so only sibling devices need the push.
+          socket.to(userId).emit("conversation:archived", { peerId: payload.peerId, archivedAt: archivedAt.getTime() });
+          ack?.({ ok: true, archivedAt: archivedAt.getTime() });
+        } catch (err) {
+          console.error("[socket] conversation:archive failed", err);
+          ack?.({ ok: false, error: "internal_error" });
+        }
+      }
+    );
+
+    socket.on(
+      "conversation:unarchive",
+      async (payload: { peerId: string }, ack?: (response: { ok: true } | { ok: false; error: string }) => void) => {
+        try {
+          await unarchiveChat(userId, payload.peerId);
+          socket.to(userId).emit("conversation:unarchived", { peerId: payload.peerId });
+          ack?.({ ok: true });
+        } catch (err) {
+          console.error("[socket] conversation:unarchive failed", err);
           ack?.({ ok: false, error: "internal_error" });
         }
       }

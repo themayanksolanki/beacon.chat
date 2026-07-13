@@ -13,6 +13,7 @@ export interface AttachmentSheetProps {
   onPickImages: () => void;
   onPickVideo: () => void;
   onPickAudio: () => void;
+  onPickDocument: () => void;
 }
 
 interface Row {
@@ -41,6 +42,7 @@ export default function AttachmentSheet({
   onPickImages,
   onPickVideo,
   onPickAudio,
+  onPickDocument,
 }: AttachmentSheetProps) {
   const { colors } = useTheme();
   const styles = useMemo(() => createStyles(colors), [colors]);
@@ -70,6 +72,7 @@ export default function AttachmentSheet({
     { label: "Images", icon: "images-outline", onPress: onPickImages },
     { label: "Video", icon: "videocam-outline", onPress: onPickVideo },
     { label: "Audio", icon: "musical-notes-outline", onPress: onPickAudio },
+    { label: "Document", icon: "document-text-outline", onPress: onPickDocument },
   ];
 
   return (

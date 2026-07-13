@@ -76,6 +76,8 @@ export default function OtpScreen({ navigation, route }: Props) {
   return (
     <AuthScreenLayout
       onBack={() => navigation.goBack()}
+      logo
+      logoSize={56}
       title={method === "email" ? "Check your email" : "Check your phone"}
       subtitle={`We sent a ${CODE_LENGTH}-digit code to ${identifier}`}
       footer={

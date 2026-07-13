@@ -57,12 +57,14 @@ model User {
   receivedMessages  Message[]  @relation("MessageRecipient")
   sentReactions     Reaction[] @relation("ReactionSender")
   receivedReactions Reaction[] @relation("ReactionRecipient")
-  contactsAsA       Contact[]  @relation("ContactUserA")
-  contactsAsB       Contact[]  @relation("ContactUserB")
-  reportsFiled      Report[]   @relation("ReportFiledBy")
-  reportsReceived   Report[]   @relation("ReportAgainst")
-  callsMade         Call[]     @relation("CallCaller")
-  callsMissed       Call[]     @relation("CallCallee")
+  contactsAsA       Contact[]      @relation("ContactUserA")
+  contactsAsB       Contact[]      @relation("ContactUserB")
+  reportsFiled      Report[]       @relation("ReportFiledBy")
+  reportsReceived   Report[]       @relation("ReportAgainst")
+  callsMade         Call[]         @relation("CallCaller")
+  callsMissed       Call[]         @relation("CallCallee")
+  archivedChats     ArchivedChat[] @relation("ArchivedChatUser")
+  archivedByPeers   ArchivedChat[] @relation("ArchivedChatPeer")
 
   @@map("users")
 }
@@ -225,6 +227,24 @@ model Contact {
 
   @@unique([userAId, userBId])
   @@map("contacts")
+}
+
+// Archiving is per-viewer, not a mutual relationship like Contact above — I
+// can archive our chat without that affecting what you see at all, so this
+// is keyed by (userId, peerId) rather than a canonically-ordered pair.
+// "peerId" is just the other user's id; there's no separate Conversation
+// model to point at (see Message — conversations are implicit).
+model ArchivedChat {
+  id         String   @id @default(uuid())
+  userId     String   @map("user_id")
+  peerId     String   @map("peer_id")
+  archivedAt DateTime @default(now()) @map("archived_at")
+
+  user User @relation("ArchivedChatUser", fields: [userId], references: [id])
+  peer User @relation("ArchivedChatPeer", fields: [peerId], references: [id])
+
+  @@unique([userId, peerId])
+  @@map("archived_chats")
 }
 
 // Persisted only — no moderation UI yet, just a record for later review.

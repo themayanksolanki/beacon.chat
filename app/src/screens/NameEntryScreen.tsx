@@ -24,6 +24,8 @@ export default function NameEntryScreen({ navigation }: Props) {
 
   return (
     <AuthScreenLayout
+      logo
+      logoSize={56}
       step={{ index: 0, total: 2 }}
       title="What's your name?"
       subtitle="This is how you'll appear to your contacts on Beacon."

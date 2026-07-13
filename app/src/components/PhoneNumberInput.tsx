@@ -31,13 +31,14 @@ export default function PhoneNumberInput({
   const { colors } = useTheme();
   const styles = useMemo(() => createStyles(colors), [colors]);
   const [pickerVisible, setPickerVisible] = useState(false);
+  const [focused, setFocused] = useState(false);
 
   const valid = localNumber.length === 0 || isValidLocalNumber(country.dialCode, localNumber);
   const displayError = showError && !valid;
 
   return (
     <View>
-      <View style={[styles.row, displayError && styles.rowError]}>
+      <View style={[styles.row, focused && styles.rowFocused, displayError && styles.rowError]}>
         <Pressable style={styles.codeButton} onPress={() => setPickerVisible(true)}>
           <Text style={styles.flag}>{flagEmoji(country.iso2)}</Text>
           <Text style={styles.dialCode}>+{country.dialCode}</Text>
@@ -51,7 +52,11 @@ export default function PhoneNumberInput({
           keyboardType="number-pad"
           value={localNumber}
           onChangeText={(text) => onChangeLocalNumber(text.replace(/\D/g, ""))}
-          onBlur={onBlur}
+          onFocus={() => setFocused(true)}
+          onBlur={() => {
+            setFocused(false);
+            onBlur?.();
+          }}
           maxLength={15}
         />
       </View>
@@ -76,6 +81,7 @@ const createStyles = (colors: ThemeColors) =>
       backgroundColor: colors.surface,
       borderRadius: 10,
     },
+    rowFocused: { borderColor: colors.accent },
     rowError: { borderColor: colors.danger },
     codeButton: { flexDirection: "row", alignItems: "center", gap: 6, paddingHorizontal: 12, paddingVertical: 12 },
     flag: { fontSize: 18 },

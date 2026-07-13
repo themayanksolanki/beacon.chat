@@ -1,10 +1,11 @@
 import { useMemo, type ReactNode } from "react";
-import { Image, KeyboardAvoidingView, Platform, Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
+import { KeyboardAvoidingView, Platform, Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { Ionicons } from "@expo/vector-icons";
 
 import { useTheme } from "../ThemeContext";
 import type { ThemeColors } from "../theme";
+import Logo from "./Logo";
 
 interface Props {
   title: string;
@@ -12,6 +13,7 @@ interface Props {
   onBack?: () => void;
   step?: { index: number; total: number };
   logo?: boolean;
+  logoSize?: number;
   footer?: ReactNode;
   children: ReactNode;
 }
@@ -19,7 +21,16 @@ interface Props {
 // Shared chrome for the sign-in and profile-setup screens (EmailEntry, Otp,
 // NameEntry, ProfilePhoto) — keyboard handling, back/step affordances, and
 // title/subtitle typography previously duplicated ad hoc across each one.
-export default function AuthScreenLayout({ title, subtitle, onBack, step, logo, footer, children }: Props) {
+export default function AuthScreenLayout({
+  title,
+  subtitle,
+  onBack,
+  step,
+  logo,
+  logoSize,
+  footer,
+  children,
+}: Props) {
   const insets = useSafeAreaInsets();
   const { colors } = useTheme();
   const styles = useMemo(() => createStyles(colors), [colors]);
@@ -60,7 +71,7 @@ export default function AuthScreenLayout({ title, subtitle, onBack, step, logo, 
 
         {logo ? (
           <View style={styles.logoWrap}>
-            <Image source={require("../../assets/logo.png")} style={styles.logo} resizeMode="cover" />
+            <Logo size={logoSize} />
           </View>
         ) : null}
 
@@ -86,7 +97,6 @@ const createStyles = (colors: ThemeColors) =>
     dots: { flexDirection: "row", gap: 6 },
     dot: { width: 6, height: 6, borderRadius: 3 },
     logoWrap: { alignItems: "center", marginTop: 8, marginBottom: 8 },
-    logo: { width: 84, height: 84, borderRadius: 42 },
     header: { marginTop: 28 },
     title: { fontSize: 26, fontWeight: "700", color: colors.text },
     subtitle: { fontSize: 15, lineHeight: 21, color: colors.textSecondary, marginTop: 8 },

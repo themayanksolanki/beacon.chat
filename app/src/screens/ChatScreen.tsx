@@ -21,6 +21,7 @@ import * as Clipboard from "expo-clipboard";
 import * as Crypto from "expo-crypto";
 import * as DocumentPicker from "expo-document-picker";
 import * as ImagePicker from "expo-image-picker";
+import * as Sharing from "expo-sharing";
 import sodium from "react-native-libsodium";
 import { useFocusEffect, useIsFocused } from "@react-navigation/native";
 import type { NativeStackScreenProps } from "@react-navigation/native-stack";
@@ -35,6 +36,7 @@ import { persistRecordedVoice, readVoiceMessageBase64 } from "../audio/voiceStor
 import AttachmentSheet from "../components/AttachmentSheet";
 import Avatar from "../components/Avatar";
 import FileMessageBubble from "../components/FileMessageBubble";
+import Linkify from "../components/Linkify";
 import StickerGifTray from "../components/StickerGifTray";
 import AlbumGrid, { type AlbumCellData } from "../components/AlbumGrid";
 import ImageMessageBubble from "../components/ImageMessageBubble";
@@ -49,6 +51,7 @@ import {
   getCallsBefore,
   getCallsFrom,
   getConversationById,
+  getMessageById,
   getMessages,
   getMessagesBefore,
   getMessagesFrom,
@@ -83,6 +86,7 @@ import {
   uploadChatMedia,
 } from "../media/chatMediaUpload";
 import { fetchAndStoreChatMedia } from "../media/chatMediaDownload";
+import { DOCUMENT_PICKER_MIME_TYPES, isSupportedDocument } from "../media/documentTypes";
 import { compressImage } from "../media/imageCompression";
 import { deleteImageMessage, persistPickedImage, readImageMessageBase64 } from "../media/imageStorage";
 import { deleteFileMessage, persistPickedFile, readFileMessageBase64 } from "../media/fileStorage";
@@ -137,6 +141,7 @@ const NO_MEDIA_FIELDS = {
   // pickAndSendAttachment) — none of the kinds this is spread into
   // (text/voice/gif/legacy inline image) can be part of one.
   album_id: null,
+  forwarded_at: null,
 } as const;
 
 type Props = NativeStackScreenProps<MainStackParamList, "Chat">;
@@ -454,6 +459,94 @@ function StatusTicks({ status }: { status: MessageRow["status"] }) {
 }
 
 /**
+ * Turns an already-sent message back into a wire payload for forwarding —
+ * used by ChatScreen's forwardMessagesTo. S3-backed kinds (image via the
+ * attachment pipeline, video, file) just re-reference the same already-
+ * uploaded object rather than re-encrypting/re-uploading the bytes; only
+ * voice and legacy inline images (never touch S3) need their local plaintext
+ * copy re-embedded as base64, same as a fresh send of that kind would.
+ * Throws if the underlying local/remote media this message depends on is no
+ * longer available — callers should catch this per-message.
+ */
+function buildForwardPayload(message: MessageRow, albumId: string | null): MessagePayload {
+  switch (message.kind) {
+    case "text":
+      return { kind: "text", text: message.plaintext, forwarded: true };
+    case "voice":
+      if (!message.audio_uri) throw new Error("voice message no longer available locally");
+      return {
+        kind: "voice",
+        audio: readVoiceMessageBase64(message.audio_uri),
+        durationMs: message.duration_ms ?? 0,
+        waveform: message.waveform ? JSON.parse(message.waveform) : [],
+        forwarded: true,
+      };
+    case "image":
+      if (message.media_url && message.media_key && message.media_nonce) {
+        return {
+          kind: "image",
+          transport: "s3",
+          url: message.media_url,
+          keyB64: message.media_key,
+          nonceB64: message.media_nonce,
+          width: message.image_width ?? 0,
+          height: message.image_height ?? 0,
+          size: 0,
+          forwarded: true,
+          albumId: albumId ?? undefined,
+        };
+      }
+      if (!message.image_uri) throw new Error("image no longer available locally");
+      return {
+        kind: "image",
+        image: readImageMessageBase64(message.image_uri),
+        width: message.image_width ?? 0,
+        height: message.image_height ?? 0,
+        forwarded: true,
+      };
+    case "gif":
+      if (!message.gif_url) throw new Error("GIF no longer available");
+      return {
+        kind: "gif",
+        url: message.gif_url,
+        width: message.gif_width ?? 0,
+        height: message.gif_height ?? 0,
+        forwarded: true,
+      };
+    case "video":
+      if (!message.media_url || !message.media_key || !message.media_nonce) {
+        throw new Error("video no longer available");
+      }
+      return {
+        kind: "video",
+        url: message.media_url,
+        keyB64: message.media_key,
+        nonceB64: message.media_nonce,
+        width: message.video_width ?? 0,
+        height: message.video_height ?? 0,
+        durationMs: message.video_duration_ms ?? 0,
+        size: message.video_size ?? 0,
+        forwarded: true,
+        albumId: albumId ?? undefined,
+      };
+    case "file":
+      if (!message.media_url || !message.media_key || !message.media_nonce) {
+        throw new Error("file no longer available");
+      }
+      return {
+        kind: "file",
+        url: message.media_url,
+        keyB64: message.media_key,
+        nonceB64: message.media_nonce,
+        name: message.file_name ?? "file",
+        mime: message.file_mime ?? "application/octet-stream",
+        size: message.file_size ?? 0,
+        forwarded: true,
+      };
+  }
+}
+
+/**
  * Builds the long-press action list for a single message — shared by
  * MessageBubble (one bubble) and AlbumBubble (one grid cell per message, see
  * below) so both get the same Reply/Copy/Save/Info/Pin/Delete set.
@@ -462,6 +555,7 @@ function buildMessageActions(
   message: MessageRow,
   callbacks: {
     onReply: (message: MessageRow) => void;
+    onForward: (message: MessageRow) => void;
     onCopy: (message: MessageRow) => void;
     onSaveMedia: (message: MessageRow) => void;
     onPin: (message: MessageRow) => void;
@@ -470,7 +564,7 @@ function buildMessageActions(
     onDelete: (message: MessageRow) => void;
   }
 ): MessageAction[] {
-  const { onReply, onCopy, onSaveMedia, onPin, onUnpin, onDeleteForEveryone, onDelete } = callbacks;
+  const { onReply, onForward, onCopy, onSaveMedia, onPin, onUnpin, onDeleteForEveryone, onDelete } = callbacks;
   const isOutgoing = message.direction === "outgoing";
   const isPinned = !!message.pinned_at;
   const canDeleteForEveryone =
@@ -478,6 +572,7 @@ function buildMessageActions(
 
   const actions: MessageAction[] = [
     { label: "Reply", icon: "arrow-undo-outline", onPress: () => onReply(message) },
+    { label: "Forward", icon: "arrow-redo-outline", onPress: () => onForward(message) },
     { label: "Copy", icon: "copy-outline", onPress: () => onCopy(message) },
   ];
   if (message.kind !== "text" && isDownloadAvailable()) {
@@ -507,6 +602,7 @@ interface MessageBubbleProps {
   message: MessageRow;
   isGroupEnd: boolean;
   onReply: (message: MessageRow) => void;
+  onForward: (message: MessageRow) => void;
   onCopy: (message: MessageRow) => void;
   onDelete: (message: MessageRow) => void;
   onRetry: (message: MessageRow) => void;
@@ -517,18 +613,25 @@ interface MessageBubbleProps {
   onCancelSend: (message: MessageRow) => void;
   onSaveMedia: (message: MessageRow) => void;
   onDownload: (message: MessageRow) => void;
+  /** Opens an already-local file/document via the OS share/open sheet — see ChatScreen's onOpenFile. */
+  onOpenFile: (message: MessageRow) => void;
   /** Opens the full-screen gallery (see MediaViewerModal) — items is every viewable item in this bubble's batch (just 1 for a non-grouped bubble), initialIndex is which one was tapped. */
   onOpenMedia: (items: ViewerMedia[], initialIndex: number) => void;
   /** Fraction 0..1 of an in-flight attachment upload for this message, if any. */
   uploadProgress?: number;
   /** True while this is the currently-active in-chat search match (see the searchMatches/activeMatch state) — tints the bubble so it stands out, WhatsApp-style. */
   highlighted?: boolean;
+  /** True while forward-selection mode is active (see ChatScreen's selectionMode) — swaps every tap on this bubble to toggle selection instead of its normal behavior. */
+  selectionMode?: boolean;
+  selected?: boolean;
+  onToggleSelect?: (message: MessageRow) => void;
 }
 
 function MessageBubble({
   message,
   isGroupEnd,
   onReply,
+  onForward,
   onCopy,
   onDelete,
   onRetry,
@@ -539,9 +642,13 @@ function MessageBubble({
   onCancelSend,
   onSaveMedia,
   onDownload,
+  onOpenFile,
   onOpenMedia,
   uploadProgress,
   highlighted,
+  selectionMode,
+  selected,
+  onToggleSelect,
 }: MessageBubbleProps) {
   const { colors } = useTheme();
   const styles = useMemo(() => createStyles(colors), [colors]);
@@ -579,32 +686,44 @@ function MessageBubble({
   const isPinned = !!message.pinned_at;
   const hasReaction = !isDeleted && !!(message.reaction_mine || message.reaction_peer);
 
-  const onLongPress = isDeleted
-    ? undefined
-    : () => {
-        const actions = buildMessageActions(message, {
-          onReply,
-          onCopy,
-          onSaveMedia,
-          onPin,
-          onUnpin,
-          onDeleteForEveryone,
-          onDelete,
-        });
-        bubbleRef.current?.measureInWindow((x, y, width, height) => {
-          onOpenMenu(message, actions, { x, y, width, height });
-        });
-      };
+  const onLongPress =
+    isDeleted || selectionMode
+      ? undefined
+      : () => {
+          const actions = buildMessageActions(message, {
+            onReply,
+            onForward,
+            onCopy,
+            onSaveMedia,
+            onPin,
+            onUnpin,
+            onDeleteForEveryone,
+            onDelete,
+          });
+          bubbleRef.current?.measureInWindow((x, y, width, height) => {
+            onOpenMenu(message, actions, { x, y, width, height });
+          });
+        };
 
   return (
     <Animated.View
-      {...panResponder.panHandlers}
+      {...(selectionMode ? {} : panResponder.panHandlers)}
       style={[
         { transform: [{ translateX }] },
         hasReaction ? styles.bubbleRowReacted : isGroupEnd ? styles.bubbleRowSpaced : styles.bubbleRowTight,
       ]}
     >
-      <View style={{ alignSelf: isOutgoing ? "flex-end" : "flex-start" }}>
+      <View style={selectionMode ? styles.selectionRow : undefined}>
+        {selectionMode ? (
+          <Pressable onPress={() => onToggleSelect?.(message)} hitSlop={8} style={styles.selectionCheck}>
+            <Ionicons
+              name={selected ? "checkmark-circle" : "ellipse-outline"}
+              size={22}
+              color={selected ? colors.accent : colors.textTertiary}
+            />
+          </Pressable>
+        ) : null}
+        <View style={{ alignSelf: isOutgoing ? "flex-end" : "flex-start", flex: selectionMode ? 1 : undefined }}>
         <Pressable
           ref={bubbleRef}
           style={[
@@ -612,6 +731,7 @@ function MessageBubble({
             isOutgoing ? styles.outgoing : styles.incoming,
             !isGroupEnd && (isOutgoing ? styles.outgoingGrouped : styles.incomingGrouped),
           ]}
+          onPress={selectionMode ? () => onToggleSelect?.(message) : undefined}
           onLongPress={onLongPress}
         >
           {highlighted ? <View style={styles.searchHighlightOverlay} pointerEvents="none" /> : null}
@@ -628,6 +748,18 @@ function MessageBubble({
             </View>
           ) : (
             <>
+              {message.forwarded_at ? (
+                <View style={styles.forwardedLabelRow}>
+                  <Ionicons
+                    name="arrow-redo-outline"
+                    size={12}
+                    color={isOutgoing ? "rgba(255,255,255,0.75)" : colors.textTertiary}
+                  />
+                  <Text style={isOutgoing ? styles.forwardedLabelTextOutgoing : styles.forwardedLabelTextIncoming}>
+                    Forwarded
+                  </Text>
+                </View>
+              ) : null}
               {message.reply_preview ? (
                 <View
                   style={[styles.replyQuote, isOutgoing ? styles.replyQuoteOutgoing : styles.replyQuoteIncoming]}
@@ -656,10 +788,10 @@ function MessageBubble({
                   isSending={isOutgoing && message.status === "pending"}
                   uploadProgress={isOutgoing ? uploadProgress : undefined}
                   onCancelSend={
-                    isOutgoing && message.status === "pending" ? () => onCancelSend(message) : undefined
+                    !selectionMode && isOutgoing && message.status === "pending" ? () => onCancelSend(message) : undefined
                   }
                   onPress={
-                    message.image_uri
+                    !selectionMode && message.image_uri
                       ? () => onOpenMedia([{ type: "image", uri: message.image_uri! }], 0)
                       : undefined
                   }
@@ -673,10 +805,10 @@ function MessageBubble({
                     height={message.gif_height ?? 0}
                     isSending={isOutgoing && message.status === "pending"}
                     onCancelSend={
-                      isOutgoing && message.status === "pending" ? () => onCancelSend(message) : undefined
+                      !selectionMode && isOutgoing && message.status === "pending" ? () => onCancelSend(message) : undefined
                     }
                     onPress={
-                      message.gif_url
+                      !selectionMode && message.gif_url
                         ? () => onOpenMedia([{ type: "image", uri: message.gif_url! }], 0)
                         : undefined
                     }
@@ -698,12 +830,12 @@ function MessageBubble({
                   mediaStatus={message.media_status}
                   isSending={isOutgoing && message.status === "pending"}
                   uploadProgress={isOutgoing ? uploadProgress : undefined}
-                  onDownload={!isOutgoing ? () => onDownload(message) : undefined}
+                  onDownload={!selectionMode && !isOutgoing ? () => onDownload(message) : undefined}
                   onCancelSend={
-                    isOutgoing && message.status === "pending" ? () => onCancelSend(message) : undefined
+                    !selectionMode && isOutgoing && message.status === "pending" ? () => onCancelSend(message) : undefined
                   }
                   onExpand={
-                    message.video_uri
+                    !selectionMode && message.video_uri
                       ? () => onOpenMedia([{ type: "video", uri: message.video_uri! }], 0)
                       : undefined
                   }
@@ -719,18 +851,23 @@ function MessageBubble({
                   isSending={isOutgoing && message.status === "pending"}
                   isOutgoing={isOutgoing}
                   uploadProgress={isOutgoing ? uploadProgress : undefined}
-                  onDownload={!isOutgoing ? () => onDownload(message) : undefined}
+                  onDownload={!selectionMode && !isOutgoing ? () => onDownload(message) : undefined}
+                  onOpen={!selectionMode && message.file_uri ? () => onOpenFile(message) : undefined}
                   onLongPress={onLongPress}
                 />
               ) : (
-                <Text style={isOutgoing ? styles.outgoingText : styles.incomingText}>{message.plaintext}</Text>
+                <Linkify
+                  text={message.plaintext}
+                  style={isOutgoing ? styles.outgoingText : styles.incomingText}
+                  linkStyle={isOutgoing ? styles.outgoingLinkText : styles.incomingLinkText}
+                />
               )}
             </>
           )}
           <Pressable
             style={styles.metaRow}
             onPress={() => onRetry(message)}
-            disabled={message.status !== "failed" && message.media_status !== "download_failed"}
+            disabled={selectionMode || (message.status !== "failed" && message.media_status !== "download_failed")}
           >
             {isPinned ? (
               <Ionicons
@@ -757,6 +894,7 @@ function MessageBubble({
             </Text>
           </View>
         ) : null}
+        </View>
       </View>
     </Animated.View>
   );
@@ -766,6 +904,7 @@ interface AlbumBubbleProps {
   messages: MessageRow[];
   isGroupEnd: boolean;
   onReply: (message: MessageRow) => void;
+  onForward: (message: MessageRow) => void;
   onCopy: (message: MessageRow) => void;
   onDelete: (message: MessageRow) => void;
   onRetry: (message: MessageRow) => void;
@@ -780,6 +919,9 @@ interface AlbumBubbleProps {
   onOpenMedia: (items: ViewerMedia[], initialIndex: number) => void;
   /** Fraction 0..1 per in-flight attachment upload, keyed by message id — same map ChatScreen keeps for single bubbles. */
   uploadProgressById: Record<string, number>;
+  selectionMode?: boolean;
+  selectedIds?: Set<string>;
+  onToggleSelect?: (message: MessageRow) => void;
 }
 
 /**
@@ -793,6 +935,7 @@ function AlbumBubble({
   messages,
   isGroupEnd,
   onReply,
+  onForward,
   onCopy,
   onDelete,
   onRetry,
@@ -805,6 +948,9 @@ function AlbumBubble({
   onDownload,
   onOpenMedia,
   uploadProgressById,
+  selectionMode,
+  selectedIds,
+  onToggleSelect,
 }: AlbumBubbleProps) {
   const { colors } = useTheme();
   const styles = useMemo(() => createStyles(colors), [colors]);
@@ -847,28 +993,32 @@ function AlbumBubble({
 
     const onPress = isDeleted
       ? undefined
-      : kind === "video" && !message.video_uri
-        ? () => onDownload(message)
-        : uri && readyIndex !== undefined
-          ? () => onOpenMedia(readyItems, readyIndex)
-          : undefined;
+      : selectionMode
+        ? () => onToggleSelect?.(message)
+        : kind === "video" && !message.video_uri
+          ? () => onDownload(message)
+          : uri && readyIndex !== undefined
+            ? () => onOpenMedia(readyItems, readyIndex)
+            : undefined;
 
-    const onLongPress = isDeleted
-      ? undefined
-      : () => {
-          const actions = buildMessageActions(message, {
-            onReply,
-            onCopy,
-            onSaveMedia,
-            onPin,
-            onUnpin,
-            onDeleteForEveryone,
-            onDelete,
-          });
-          gridWrapRef.current?.measureInWindow((x, y, width, height) => {
-            onOpenMenu(message, actions, { x, y, width, height });
-          });
-        };
+    const onLongPress =
+      isDeleted || selectionMode
+        ? undefined
+        : () => {
+            const actions = buildMessageActions(message, {
+              onReply,
+              onForward,
+              onCopy,
+              onSaveMedia,
+              onPin,
+              onUnpin,
+              onDeleteForEveryone,
+              onDelete,
+            });
+            gridWrapRef.current?.measureInWindow((x, y, width, height) => {
+              onOpenMenu(message, actions, { x, y, width, height });
+            });
+          };
 
     return {
       id: message.id,
@@ -878,10 +1028,14 @@ function AlbumBubble({
       uploadProgress: isSending ? uploadProgressById[message.id] : undefined,
       onPress,
       onLongPress,
-      onCancelSend: isSending ? () => onCancelSend(message) : undefined,
+      onCancelSend: !selectionMode && isSending ? () => onCancelSend(message) : undefined,
       extraCount: index === 3 && messages.length > 4 ? messages.length - 4 : undefined,
+      selectable: selectionMode,
+      selected: selectedIds?.has(message.id),
     };
   });
+
+  const anyForwarded = messages.some((m) => m.forwarded_at);
 
   return (
     <View
@@ -890,6 +1044,12 @@ function AlbumBubble({
         { alignSelf: isOutgoing ? "flex-end" : "flex-start" },
       ]}
     >
+      {anyForwarded ? (
+        <View style={styles.forwardedLabelRow}>
+          <Ionicons name="arrow-redo-outline" size={12} color={colors.textTertiary} />
+          <Text style={styles.forwardedLabelTextIncoming}>Forwarded</Text>
+        </View>
+      ) : null}
       <View ref={gridWrapRef} collapsable={false} style={styles.albumWrap}>
         <AlbumGrid cells={cells} />
         <View style={styles.albumMetaBadge} pointerEvents="box-none">
@@ -922,11 +1082,13 @@ function CallBubble({
   onRedial,
   onDeleteCall,
   onOpenMenu,
+  selectionMode,
 }: {
   call: CallRow;
   onRedial: (call: CallRow) => void;
   onDeleteCall: (call: CallRow) => void;
   onOpenMenu: (call: CallRow, actions: MessageAction[], anchor: MessageMenuAnchor) => void;
+  selectionMode?: boolean;
 }) {
   const { colors } = useTheme();
   const styles = useMemo(() => createStyles(colors), [colors]);
@@ -958,8 +1120,8 @@ function CallBubble({
       <Pressable
         ref={bubbleRef}
         style={[styles.callBubble, isOutgoing ? styles.outgoing : styles.incoming]}
-        onPress={() => onRedial(call)}
-        onLongPress={onLongPress}
+        onPress={selectionMode ? undefined : () => onRedial(call)}
+        onLongPress={selectionMode ? undefined : onLongPress}
       >
         <View style={[styles.callBubbleIcon, isOutgoing ? styles.callBubbleIconOutgoing : styles.callBubbleIconIncoming]}>
           <Ionicons
@@ -1290,6 +1452,32 @@ export default function ChatScreen({ route, navigation }: Props) {
 
   const [draft, setDraft] = useState("");
   const [replyingTo, setReplyingTo] = useState<ReplyTarget | null>(null);
+
+  // Forward flow: long-pressing a message and tapping "Forward" (see
+  // buildMessageActions) enters this WhatsApp-style multi-select mode —
+  // header flips to Cancel/"N selected"/forward-icon (see the header
+  // useLayoutEffect below), and tapping any other bubble/album cell toggles
+  // it into the set instead of its normal action. Mirrors the
+  // selectionMode/selectedIds pattern in SharedMediaScreen/CallHistoryScreen.
+  const [selectionMode, setSelectionMode] = useState(false);
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+  const exitSelectionMode = useCallback(() => {
+    setSelectionMode(false);
+    setSelectedIds(new Set());
+  }, []);
+  const onForward = useCallback((message: MessageRow) => {
+    setSelectionMode(true);
+    setSelectedIds(new Set([message.id]));
+  }, []);
+  const toggleSelected = useCallback((message: MessageRow) => {
+    setSelectedIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(message.id)) next.delete(message.id);
+      else next.add(message.id);
+      return next;
+    });
+  }, []);
+
   const [attachmentSheetOpen, setAttachmentSheetOpen] = useState(false);
   const [attachmentAnchor, setAttachmentAnchor] = useState<MessageMenuAnchor | null>(null);
   const attachmentButtonRef = useRef<View>(null);
@@ -1527,6 +1715,12 @@ export default function ChatScreen({ route, navigation }: Props) {
     ]);
   }, [conversationId, conversation?.display_name, navigation]);
 
+  const openForwardPicker = useCallback(() => {
+    if (selectedIds.size === 0) return;
+    const orderedIds = messages.filter((m) => selectedIds.has(m.id)).map((m) => m.id);
+    navigation.navigate("Forward", { messageIds: orderedIds, sourceConversationId: conversationId });
+  }, [selectedIds, messages, navigation, conversationId]);
+
   useLayoutEffect(() => {
     const name = conversation?.display_name ?? "Chat";
     navigation.setOptions({
@@ -1540,43 +1734,61 @@ export default function ChatScreen({ route, navigation }: Props) {
       // it wholesale, so headerLeft must be explicitly reset here — otherwise
       // a stale custom value from an earlier options call (e.g. during a dev
       // Fast Refresh) keeps overriding the default back chevron indefinitely.
-      headerLeft: undefined,
-      headerTitle: isTestBot
-        ? undefined
-        : searchOpen
-          ? () => (
-              <TextInput
-                autoFocus
-                value={searchQuery}
-                onChangeText={setSearchQuery}
-                placeholder="Search in chat"
-                placeholderTextColor={colors.textTertiary}
-                style={styles.searchHeaderInput}
+      headerLeft: selectionMode
+        ? () => (
+            <Pressable onPress={exitSelectionMode} hitSlop={8} style={styles.headerTextButton}>
+              <Text style={styles.headerButtonLabel}>Cancel</Text>
+            </Pressable>
+          )
+        : undefined,
+      headerTitle: selectionMode
+        ? `${selectedIds.size} selected`
+        : isTestBot
+          ? undefined
+          : searchOpen
+            ? () => (
+                <TextInput
+                  autoFocus
+                  value={searchQuery}
+                  onChangeText={setSearchQuery}
+                  placeholder="Search in chat"
+                  placeholderTextColor={colors.textTertiary}
+                  style={styles.searchHeaderInput}
+                />
+              )
+            : () => (
+                <ChatHeaderTitle
+                  name={name}
+                  avatarUrl={conversation?.avatar_url ?? null}
+                  online={blocked ? false : peerPresence?.online ?? false}
+                  lastSeenAt={blocked ? null : peerPresence?.lastSeenAt ?? null}
+                  onPress={() => navigation.navigate("ContactInfo", { conversationId })}
+                />
+              ),
+      headerRight: selectionMode
+        ? () => (
+            <Pressable onPress={openForwardPicker} disabled={selectedIds.size === 0} hitSlop={8}>
+              <Ionicons
+                name="arrow-redo-outline"
+                size={22}
+                color={selectedIds.size === 0 ? colors.textTertiary : colors.accent}
               />
-            )
-          : () => (
-              <ChatHeaderTitle
-                name={name}
-                avatarUrl={conversation?.avatar_url ?? null}
-                online={blocked ? false : peerPresence?.online ?? false}
-                lastSeenAt={blocked ? null : peerPresence?.lastSeenAt ?? null}
-                onPress={() => navigation.navigate("ContactInfo", { conversationId })}
-              />
-            ),
-      headerRight: isTestBot
-        ? undefined
-        : searchOpen
-          ? () => (
-              <Pressable onPress={closeSearch} hitSlop={8}>
-                <Ionicons name="close" size={24} color={colors.text} />
-              </Pressable>
-            )
-          : () => (
-              <ChatHeaderCallButtons
-                conversationId={conversationId}
-                disabled={conversation?.status !== "accepted" || blocked}
-              />
-            ),
+            </Pressable>
+          )
+        : isTestBot
+          ? undefined
+          : searchOpen
+            ? () => (
+                <Pressable onPress={closeSearch} hitSlop={8}>
+                  <Ionicons name="close" size={24} color={colors.text} />
+                </Pressable>
+              )
+            : () => (
+                <ChatHeaderCallButtons
+                  conversationId={conversationId}
+                  disabled={conversation?.status !== "accepted" || blocked}
+                />
+              ),
     });
   }, [
     navigation,
@@ -1592,6 +1804,10 @@ export default function ChatScreen({ route, navigation }: Props) {
     colors,
     styles,
     closeSearch,
+    selectionMode,
+    selectedIds,
+    exitSelectionMode,
+    openForwardPicker,
   ]);
 
   const markVisibleMessagesRead = useCallback(() => {
@@ -1656,8 +1872,12 @@ export default function ChatScreen({ route, navigation }: Props) {
   const cancelledSendIdsRef = useRef<Set<string>>(new Set());
 
   const sendPayload = useCallback(
-    async (id: string, payload: MessagePayload) => {
-      if (!conversation || !email) return;
+    // targetConversationId defaults to this screen's own conversation — the
+    // forward flow (see forwardMessagesTo below) is the only caller that ever
+    // passes a different one, to deliver a freshly-forwarded copy to a chat
+    // other than the one currently open.
+    async (id: string, payload: MessagePayload, targetConversationId: string = conversationId) => {
+      if (!email) return;
       try {
         const identity = await getOrCreateIdentity(email);
         await sodium.ready;
@@ -1668,11 +1888,11 @@ export default function ChatScreen({ route, navigation }: Props) {
         // (refreshed on chat open, see the effect above); if it's empty —
         // e.g. this conversation was created but never opened yet — fetch
         // live rather than failing the send outright.
-        let peerDevices = getPeerDevices(conversationId);
+        let peerDevices = getPeerDevices(targetConversationId);
         if (peerDevices.length === 0 && token) {
-          const peer = await getUserById(token, conversationId);
+          const peer = await getUserById(token, targetConversationId);
           peerDevices = peer.devices.map((d) => ({ device_id: d.deviceId, public_key: d.publicKey }));
-          replacePeerDevices(conversationId, peerDevices);
+          replacePeerDevices(targetConversationId, peerDevices);
         }
         if (peerDevices.length === 0) {
           throw new Error("recipient has no known devices to encrypt for");
@@ -1694,7 +1914,7 @@ export default function ChatScreen({ route, navigation }: Props) {
           .timeout(SEND_TIMEOUT_MS)
           .emit(
             "message:send",
-            { id, recipientId: conversationId, envelopes },
+            { id, recipientId: targetConversationId, envelopes },
             (err: unknown, response?: { ok: boolean; error?: string }) => {
               if (cancelledSendIdsRef.current.delete(id)) return;
               if (err || !response?.ok) {
@@ -1713,7 +1933,7 @@ export default function ChatScreen({ route, navigation }: Props) {
         setMessages((prev) => prev.map((m) => (m.id === id ? { ...m, status: "failed" } : m)));
       }
     },
-    [conversation, conversationId, email, token]
+    [conversationId, email, token]
   );
 
   const sendEncrypted = useCallback(
@@ -1739,6 +1959,87 @@ export default function ChatScreen({ route, navigation }: Props) {
       sendPayload(id, { kind: "gif", url, width, height, replyTo: replyTo ?? undefined }),
     [sendPayload]
   );
+
+  // Forwards the given (already-sent) messages to one or more target chats —
+  // driven by the selection-mode header's forward button, via ForwardScreen's
+  // picker (see the route.params.forwardTargets effect below). Each target
+  // gets its own fresh copy of each message (new id, no reply context, dropped
+  // reactions/pin state), sent through the same encrypt+socket path as a
+  // normal send (see sendPayload above), just addressed at that target
+  // instead of this screen's own conversationId.
+  const forwardMessagesTo = useCallback(
+    (messageIds: string[], targetConversationIds: string[]) => {
+      if (messageIds.length === 0 || targetConversationIds.length === 0) return;
+      const sourceMessages = messageIds
+        .map((id) => messages.find((m) => m.id === id) ?? getMessageById(id))
+        .filter((m): m is MessageRow => !!m && !m.deleted_at);
+      if (sourceMessages.length === 0) return;
+
+      const batchableCount = sourceMessages.filter((m) => m.kind === "image" || m.kind === "video").length;
+
+      for (const targetId of targetConversationIds) {
+        // A fresh album id shared only by this batch's own image/video
+        // messages sent to this particular target, so a multi-select forward
+        // still lands as one WhatsApp-style grid — see buildListItems.
+        const forwardAlbumId = batchableCount > 1 ? Crypto.randomUUID() : null;
+
+        for (const original of sourceMessages) {
+          const newId = Crypto.randomUUID();
+          const now = Date.now();
+          const isBatchable = original.kind === "image" || original.kind === "video";
+          const forwarded: MessageRow = {
+            ...original,
+            id: newId,
+            conversation_id: targetId,
+            direction: "outgoing",
+            sent_at: now,
+            status: "pending",
+            delivered_at: null,
+            read_at: null,
+            reply_to_id: null,
+            reply_preview: null,
+            pinned_at: null,
+            deleted_at: null,
+            reaction_mine: null,
+            reaction_peer: null,
+            forwarded_at: now,
+            album_id: isBatchable ? forwardAlbumId : null,
+          };
+          insertMessage(forwarded);
+          if (targetId === conversationId) {
+            setMessages((prev) => [...prev, forwarded]);
+          }
+
+          try {
+            const payload = buildForwardPayload(original, forwarded.album_id);
+            void sendPayload(newId, payload, targetId);
+          } catch (err) {
+            console.warn("[chat] failed to forward message", err);
+            markMessageFailed(newId);
+            if (targetId === conversationId) {
+              setMessages((prev) => prev.map((m) => (m.id === newId ? { ...m, status: "failed" } : m)));
+            }
+          }
+        }
+      }
+    },
+    [messages, conversationId, sendPayload]
+  );
+
+  // Consumes ForwardScreen's result: it navigates back here (see
+  // openForwardPicker/ForwardScreen.tsx) with the target chats the user
+  // picked, merged onto this screen's own route params — same pattern as the
+  // openSearch param handled above. Both params are always set together, so
+  // gating on forwardTargets alone is enough.
+  useEffect(() => {
+    const targets = route.params?.forwardTargets;
+    const idsToForward = route.params?.forwardMessageIds;
+    if (!targets || targets.length === 0 || !idsToForward || idsToForward.length === 0) return;
+    navigation.setParams({ forwardTargets: undefined, forwardMessageIds: undefined });
+    forwardMessagesTo(idsToForward, targets);
+    exitSelectionMode();
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- only reacts to the params actually changing, not every render of forwardMessagesTo/exitSelectionMode
+  }, [route.params?.forwardTargets, route.params?.forwardMessageIds]);
 
   // Fraction 0..1 per in-flight attachment upload, keyed by message id — read
   // by the message bubbles to render a percentage over the sending spinner.
@@ -2219,6 +2520,7 @@ export default function ChatScreen({ route, navigation }: Props) {
           media_nonce: null,
           media_status: "uploading",
           album_id: albumId ?? null,
+          forwarded_at: null,
         };
         insertMessage(outgoing);
         setMessages((prev) => [...prev, outgoing]);
@@ -2321,6 +2623,59 @@ export default function ChatScreen({ route, navigation }: Props) {
     },
     [conversation, replyingTo, sendAttachment]
   );
+
+  // Documents get their own picker (rather than reusing pickAndSendAttachment's
+  // "file" branch, which is audio-only — see its DocumentPicker.getDocumentAsync
+  // call above) so unsupported formats and oversized files can be rejected
+  // up front, before ever creating a message bubble that's doomed to fail.
+  const pickAndSendDocument = useCallback(async () => {
+    if (!conversation) return;
+    const result = await DocumentPicker.getDocumentAsync({ type: DOCUMENT_PICKER_MIME_TYPES });
+    if (result.canceled || !result.assets[0]) return;
+    const asset = result.assets[0];
+
+    if (!isSupportedDocument(asset.mimeType, asset.name)) {
+      Alert.alert(
+        "Unsupported file type",
+        "Please choose a PDF, Word, Excel, PowerPoint, text, CSV, or RTF document."
+      );
+      return;
+    }
+
+    const maxBytes = maxBytesForChatMediaKind("file");
+    if (asset.size != null && asset.size > maxBytes) {
+      Alert.alert("File too large", `Documents can't be larger than ${Math.round(maxBytes / (1024 * 1024))} MB.`);
+      return;
+    }
+
+    await sendAttachment(asset.uri, "file", {
+      name: asset.name,
+      mime: asset.mimeType ?? "application/octet-stream",
+    });
+  }, [conversation, sendAttachment]);
+
+  // Opens an already-local file/document in whatever app the OS offers for
+  // its type (share sheet on both platforms) — the closest cross-platform
+  // "preview/open" affordance without bundling a PDF/Office renderer of our
+  // own. Downloading a not-yet-local attachment is a separate action, see
+  // downloadMedia below.
+  const onOpenFile = useCallback(async (message: MessageRow) => {
+    if (!message.file_uri) return;
+    try {
+      const available = await Sharing.isAvailableAsync();
+      if (!available) {
+        Alert.alert("Can't open file", "No app is available to open this file on your device.");
+        return;
+      }
+      await Sharing.shareAsync(message.file_uri, {
+        mimeType: message.file_mime ?? undefined,
+        dialogTitle: message.file_name ?? undefined,
+      });
+    } catch (err) {
+      console.warn("[chat] failed to open file", err);
+      Alert.alert("Couldn't open file", "Please try again.");
+    }
+  }, []);
 
   // Unlike sendAttachment, there's no compression/local-persistence/upload
   // step — the GIF already lives permanently on GIPHY's CDN, so the picked
@@ -2714,12 +3069,19 @@ export default function ChatScreen({ route, navigation }: Props) {
                 <Text style={styles.dateSeparatorText}>{item.label}</Text>
               </View>
             ) : item.type === "call" ? (
-              <CallBubble call={item.call} onRedial={onRedial} onDeleteCall={onDeleteCall} onOpenMenu={openCallMenu} />
+              <CallBubble
+                call={item.call}
+                onRedial={onRedial}
+                onDeleteCall={onDeleteCall}
+                onOpenMenu={openCallMenu}
+                selectionMode={selectionMode}
+              />
             ) : item.type === "album" ? (
               <AlbumBubble
                 messages={item.messages}
                 isGroupEnd={item.isGroupEnd}
                 onReply={onReply}
+                onForward={onForward}
                 onCopy={onCopy}
                 onDelete={onDelete}
                 onRetry={onRetry}
@@ -2732,12 +3094,16 @@ export default function ChatScreen({ route, navigation }: Props) {
                 onDownload={downloadMedia}
                 onOpenMedia={onOpenMedia}
                 uploadProgressById={uploadProgressById}
+                selectionMode={selectionMode}
+                selectedIds={selectedIds}
+                onToggleSelect={toggleSelected}
               />
             ) : (
               <MessageBubble
                 message={item.message}
                 isGroupEnd={item.isGroupEnd}
                 onReply={onReply}
+                onForward={onForward}
                 onCopy={onCopy}
                 onDelete={onDelete}
                 onRetry={onRetry}
@@ -2748,9 +3114,13 @@ export default function ChatScreen({ route, navigation }: Props) {
                 onCancelSend={onCancelSend}
                 onSaveMedia={onSaveMedia}
                 onDownload={downloadMedia}
+                onOpenFile={onOpenFile}
                 onOpenMedia={onOpenMedia}
                 uploadProgress={uploadProgressById[item.message.id]}
                 highlighted={item.message.id === activeMatch?.id}
+                selectionMode={selectionMode}
+                selected={selectedIds.has(item.message.id)}
+                onToggleSelect={toggleSelected}
               />
             )
           }
@@ -2913,6 +3283,7 @@ export default function ChatScreen({ route, navigation }: Props) {
         onPickImages={() => void pickAndSendAttachment("image")}
         onPickVideo={() => void pickAndSendAttachment("video")}
         onPickAudio={() => void pickAndSendAttachment("file")}
+        onPickDocument={() => void pickAndSendDocument()}
       />
     </KeyboardAvoidingView>
   );
@@ -3025,6 +3396,8 @@ const createStyles = (colors: ThemeColors) =>
     reactionBadgeText: { fontSize: 13 },
     outgoingText: { color: "#fff", fontSize: 15.5 },
     incomingText: { color: colors.text, fontSize: 15.5 },
+    outgoingLinkText: { color: "#fff", fontSize: 15.5, textDecorationLine: "underline", fontWeight: "600" },
+    incomingLinkText: { color: colors.accent, fontSize: 15.5, textDecorationLine: "underline" },
     gifAttribution: {
       position: "absolute",
       bottom: 4,
@@ -3045,6 +3418,13 @@ const createStyles = (colors: ThemeColors) =>
     replyQuoteIncoming: { borderLeftWidth: 3, borderLeftColor: colors.accent },
     replyQuoteTextOutgoing: { fontSize: 12, color: "rgba(255,255,255,0.85)", fontStyle: "italic" },
     replyQuoteTextIncoming: { fontSize: 12, color: colors.textSecondary, fontStyle: "italic" },
+    forwardedLabelRow: { flexDirection: "row", alignItems: "center", gap: 4, marginBottom: 4 },
+    forwardedLabelTextOutgoing: { fontSize: 12, color: "rgba(255,255,255,0.75)", fontStyle: "italic" },
+    forwardedLabelTextIncoming: { fontSize: 12, color: colors.textTertiary, fontStyle: "italic" },
+    selectionRow: { flexDirection: "row", alignItems: "center", gap: 8 },
+    selectionCheck: { paddingVertical: 4 },
+    headerTextButton: { paddingHorizontal: 4, paddingVertical: 4 },
+    headerButtonLabel: { fontSize: 16, color: colors.accent },
     metaRow: { flexDirection: "row", alignItems: "center", justifyContent: "flex-end", marginTop: 4, gap: 4 },
     metaTextOutgoing: { fontSize: 11, color: "rgba(255,255,255,0.8)" },
     metaTextIncoming: { fontSize: 11, color: colors.textSecondary },

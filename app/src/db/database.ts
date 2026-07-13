@@ -153,6 +153,11 @@ function runMigrations() {
     // single WhatsApp-style grid bubble (see buildListItems) instead of one
     // bubble per file, without needing to guess groupings from timestamps.
     ["album_id", "ALTER TABLE messages ADD COLUMN album_id TEXT"],
+    // Set to the local send time when this message was created via the
+    // forward flow (see ChatScreen's forwardMessagesTo) rather than composed
+    // directly — null otherwise. Drives the "Forwarded" label above the
+    // bubble content, same slot as reply_preview.
+    ["forwarded_at", "ALTER TABLE messages ADD COLUMN forwarded_at INTEGER"],
   ];
   for (const [column, statement] of migrations) {
     if (!existingColumns.has(column)) {
@@ -179,6 +184,16 @@ function runMigrations() {
   // as display_name/avatar_url above.
   if (!existingConversationColumns.has("contact_number")) {
     db.execSync(`ALTER TABLE conversations ADD COLUMN contact_number TEXT`);
+  }
+  // Archive state, synced from the server (see archivedChats.ts client
+  // module and socketServer.ts's conversation:archive/unarchive/archived:sync)
+  // rather than local-only like blocked_users — see is_archived's own comment
+  // at getConversationSummaries below for why this needs to leave the device.
+  if (!existingConversationColumns.has("is_archived")) {
+    db.execSync(`ALTER TABLE conversations ADD COLUMN is_archived INTEGER NOT NULL DEFAULT 0`);
+  }
+  if (!existingConversationColumns.has("archived_at")) {
+    db.execSync(`ALTER TABLE conversations ADD COLUMN archived_at INTEGER`);
   }
 }
 
@@ -245,13 +260,15 @@ export interface MessageRow {
   media_status: MediaStatus;
   /** Shared id for a batch of images/videos picked together in one send — see the album_id migration above. Null outside of a multi-select batch. */
   album_id: string | null;
+  /** Local send time if this message was created via the forward flow, else null — see the forwarded_at migration above. */
+  forwarded_at: number | null;
 }
 
 export function insertMessage(message: MessageRow) {
   db.runSync(
     `INSERT INTO messages
-       (id, conversation_id, direction, plaintext, sent_at, status, delivered_at, read_at, reply_to_id, reply_preview, pinned_at, deleted_at, reaction_mine, reaction_peer, kind, audio_uri, duration_ms, waveform, image_uri, image_width, image_height, gif_url, gif_width, gif_height, video_uri, video_width, video_height, video_duration_ms, video_size, file_uri, file_name, file_mime, file_size, media_url, media_key, media_nonce, media_status, album_id)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       (id, conversation_id, direction, plaintext, sent_at, status, delivered_at, read_at, reply_to_id, reply_preview, pinned_at, deleted_at, reaction_mine, reaction_peer, kind, audio_uri, duration_ms, waveform, image_uri, image_width, image_height, gif_url, gif_width, gif_height, video_uri, video_width, video_height, video_duration_ms, video_size, file_uri, file_name, file_mime, file_size, media_url, media_key, media_nonce, media_status, album_id, forwarded_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [
       message.id,
       message.conversation_id,
@@ -291,6 +308,7 @@ export function insertMessage(message: MessageRow) {
       message.media_nonce,
       message.media_status,
       message.album_id,
+      message.forwarded_at,
     ]
   );
 }
@@ -329,12 +347,43 @@ export function getMessages(conversationId: string): MessageRow[] {
   );
 }
 
-/** Every image/video/gif shared in this conversation, either direction, most recent first — powers ContactInfoScreen's "Media, links and docs" grid. */
+/** Single message lookup by id, regardless of conversation — used by the forward flow to look up a message that may have scrolled out of the currently-loaded page. */
+export function getMessageById(id: string): MessageRow | null {
+  return db.getFirstSync<MessageRow>(`SELECT * FROM messages WHERE id = ?`, [id]);
+}
+
+/** Every image/video/gif shared in this conversation, either direction, most recent first — powers ContactInfoScreen's Media group and SharedMediaScreen's Media tab. */
 export function getMediaMessages(conversationId: string): MessageRow[] {
   return db.getAllSync<MessageRow>(
     `SELECT * FROM messages
      WHERE conversation_id = ? AND kind IN ('image', 'video', 'gif') AND deleted_at IS NULL
      ORDER BY sent_at DESC`,
+    [conversationId]
+  );
+}
+
+/** Every document/file attachment shared in this conversation, either direction, most recent first — powers ContactInfoScreen's Documents group and SharedMediaScreen's Docs tab. */
+export function getFileMessages(conversationId: string): MessageRow[] {
+  return db.getAllSync<MessageRow>(
+    `SELECT * FROM messages
+     WHERE conversation_id = ? AND kind = 'file' AND deleted_at IS NULL
+     ORDER BY sent_at DESC`,
+    [conversationId]
+  );
+}
+
+/**
+ * Every non-deleted text message in this conversation, most recent first —
+ * the candidate set ContactInfoScreen's Links count and SharedMediaScreen's
+ * Links tab run the URL-detection regex over to find actual links (see
+ * app/src/chat/linkify.ts). Filtering to kind='text' in SQL and doing the
+ * regex match in JS (rather than a LIKE prefilter) keeps this correct for
+ * every URL shape linkify.ts recognizes, including bare domains that don't
+ * contain "http" or "www.".
+ */
+export function getTextMessages(conversationId: string): MessageRow[] {
+  return db.getAllSync<MessageRow>(
+    `SELECT * FROM messages WHERE conversation_id = ? AND kind = 'text' AND deleted_at IS NULL ORDER BY sent_at DESC`,
     [conversationId]
   );
 }
@@ -458,6 +507,9 @@ export interface ConversationRow {
   created_at: number;
   status: ConversationStatus;
   contact_number: string | null;
+  // 0/1 — SQLite has no native boolean type; treat as truthy in TS.
+  is_archived: number;
+  archived_at: number | null;
 }
 
 export function getConversations(): ConversationRow[] {
@@ -476,29 +528,54 @@ export interface ConversationSummary extends ConversationRow {
   last_call_at: number | null;
 }
 
-// Ordered by whichever of (last message, last call, conversation creation)
-// is most recent — a call with no accompanying message (e.g. unanswered)
-// still counts as activity and bumps the conversation to the top, matching
-// WhatsApp. ORDER BY reuses the last_message_at/last_call_at aliases defined
-// in the SELECT list rather than repeating those subqueries. SQLite's
-// multi-arg max() returns NULL if any argument is NULL, so both are coalesced
-// to 0 before comparing (c.created_at is itself never null, so it's the
-// floor when neither a message nor a call exists yet).
+// Shared by getConversationSummaries/getArchivedConversationSummaries below —
+// same shape, filtered to opposite sides of is_archived. ORDER BY reuses the
+// last_message_at/last_call_at aliases defined in the SELECT list rather than
+// repeating those subqueries. SQLite's multi-arg max() returns NULL if any
+// argument is NULL, so both are coalesced to 0 before comparing (c.created_at
+// is itself never null, so it's the floor when neither a message nor a call
+// exists yet).
+const CONVERSATION_SUMMARY_SELECT = `
+  SELECT
+    c.*,
+    (SELECT CASE WHEN m.deleted_at IS NOT NULL THEN 'This message was deleted' ELSE m.plaintext END
+       FROM messages m WHERE m.conversation_id = c.id ORDER BY m.sent_at DESC LIMIT 1) AS last_message,
+    (SELECT sent_at FROM messages m WHERE m.conversation_id = c.id ORDER BY m.sent_at DESC LIMIT 1) AS last_message_at,
+    (SELECT direction FROM messages m WHERE m.conversation_id = c.id ORDER BY m.sent_at DESC LIMIT 1) AS last_message_direction,
+    (SELECT status FROM messages m WHERE m.conversation_id = c.id ORDER BY m.sent_at DESC LIMIT 1) AS last_message_status,
+    (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id AND m.direction = 'incoming' AND m.read_at IS NULL) AS unread_count,
+    EXISTS(SELECT 1 FROM blocked_users b WHERE b.peer_id = c.id) AS is_blocked,
+    (SELECT started_at FROM calls WHERE calls.conversation_id = c.id ORDER BY started_at DESC LIMIT 1) AS last_call_at
+  FROM conversations c
+`;
+const CONVERSATION_SUMMARY_ORDER = `ORDER BY MAX(COALESCE(last_message_at, 0), COALESCE(last_call_at, 0), c.created_at) DESC`;
+
+// Archived chats are deliberately excluded here rather than just sorted
+// last — an archived chat that gets a new message still updates its
+// last_message/unread_count normally (see MessagingContext's onMessage,
+// which doesn't special-case archive status at all) but must stay out of
+// the main list unless the user restores it; see getArchivedConversationSummaries.
 export function getConversationSummaries(): ConversationSummary[] {
   return db.getAllSync<ConversationSummary>(`
-    SELECT
-      c.*,
-      (SELECT CASE WHEN m.deleted_at IS NOT NULL THEN 'This message was deleted' ELSE m.plaintext END
-         FROM messages m WHERE m.conversation_id = c.id ORDER BY m.sent_at DESC LIMIT 1) AS last_message,
-      (SELECT sent_at FROM messages m WHERE m.conversation_id = c.id ORDER BY m.sent_at DESC LIMIT 1) AS last_message_at,
-      (SELECT direction FROM messages m WHERE m.conversation_id = c.id ORDER BY m.sent_at DESC LIMIT 1) AS last_message_direction,
-      (SELECT status FROM messages m WHERE m.conversation_id = c.id ORDER BY m.sent_at DESC LIMIT 1) AS last_message_status,
-      (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id AND m.direction = 'incoming' AND m.read_at IS NULL) AS unread_count,
-      EXISTS(SELECT 1 FROM blocked_users b WHERE b.peer_id = c.id) AS is_blocked,
-      (SELECT started_at FROM calls WHERE calls.conversation_id = c.id ORDER BY started_at DESC LIMIT 1) AS last_call_at
-    FROM conversations c
-    ORDER BY MAX(COALESCE(last_message_at, 0), COALESCE(last_call_at, 0), c.created_at) DESC
+    ${CONVERSATION_SUMMARY_SELECT}
+    WHERE c.is_archived = 0
+    ${CONVERSATION_SUMMARY_ORDER}
   `);
+}
+
+/** Same shape/ordering as getConversationSummaries, just the other side of is_archived — powers the Archived Chats screen. */
+export function getArchivedConversationSummaries(): ConversationSummary[] {
+  return db.getAllSync<ConversationSummary>(`
+    ${CONVERSATION_SUMMARY_SELECT}
+    WHERE c.is_archived = 1
+    ${CONVERSATION_SUMMARY_ORDER}
+  `);
+}
+
+/** Cheap count for the "Archived (N)" entry row on the main chat list — avoids pulling full summaries just for a badge. */
+export function getArchivedConversationCount(): number {
+  return db.getFirstSync<{ count: number }>(`SELECT COUNT(*) AS count FROM conversations WHERE is_archived = 1`)
+    ?.count ?? 0;
 }
 
 export function getConversationByPeerKey(peerPublicKey: string): ConversationRow | null {
@@ -518,7 +595,7 @@ export function getConversationById(id: string): ConversationRow | null {
 // existing row before either one inserts.
 export function insertConversation(conversation: ConversationRow): void {
   db.runSync(
-    `INSERT OR IGNORE INTO conversations (id, peer_public_key, display_name, avatar_url, created_at, status, contact_number) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT OR IGNORE INTO conversations (id, peer_public_key, display_name, avatar_url, created_at, status, contact_number, is_archived, archived_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [
       conversation.id,
       conversation.peer_public_key,
@@ -527,8 +604,46 @@ export function insertConversation(conversation: ConversationRow): void {
       conversation.created_at,
       conversation.status,
       conversation.contact_number,
+      conversation.is_archived,
+      conversation.archived_at,
     ]
   );
+}
+
+// Flips a conversation's archive state — server-confirmed (see
+// chat/archivedChats.ts) or a live push from another of this user's devices
+// (see MessagingContext's conversation:archived/unarchived handlers). Never
+// called directly from UI — see chat/archivedChats.ts's archiveChat/
+// unarchiveChat, which persist server-side first.
+export function archiveConversation(id: string, archivedAt: number): void {
+  db.runSync(`UPDATE conversations SET is_archived = 1, archived_at = ? WHERE id = ?`, [archivedAt, id]);
+}
+
+export function unarchiveConversation(id: string): void {
+  db.runSync(`UPDATE conversations SET is_archived = 0, archived_at = NULL WHERE id = ?`, [id]);
+}
+
+/**
+ * Wholesale-replaces local archive state with the server's authoritative
+ * list (see conversation:archived:sync in socketServer.ts/MessagingContext)
+ * — same "clear then reinsert" idiom as replacePeerDevices, so a chat
+ * archived/unarchived on another device while this one was offline still
+ * ends up correct. A peer id in the list that has no local conversation row
+ * yet (this device has never seen that chat — conversations only ever
+ * materialize lazily here, see ensureConversation in MessagingContext) is
+ * simply a no-op update; nothing to create a stub for without a profile
+ * lookup, and one will be created un-archived if a message ever arrives.
+ */
+export function reconcileArchivedConversations(entries: { peer_id: string; archived_at: number }[]): void {
+  db.withTransactionSync(() => {
+    db.runSync(`UPDATE conversations SET is_archived = 0, archived_at = NULL WHERE is_archived = 1`);
+    for (const entry of entries) {
+      db.runSync(`UPDATE conversations SET is_archived = 1, archived_at = ? WHERE id = ?`, [
+        entry.archived_at,
+        entry.peer_id,
+      ]);
+    }
+  });
 }
 
 // Flips a conversation's request-gate state (e.g. their contact request was

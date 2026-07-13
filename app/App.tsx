@@ -14,8 +14,10 @@ import ConversationListScreen from "./src/screens/ConversationListScreen";
 import CallHistoryScreen from "./src/screens/CallHistoryScreen";
 import ChatScreen from "./src/screens/ChatScreen";
 import ContactsScreen from "./src/screens/ContactsScreen";
+import ArchivedChatsScreen from "./src/screens/ArchivedChatsScreen";
 import ContactInfoScreen from "./src/screens/ContactInfoScreen";
 import SharedMediaScreen from "./src/screens/SharedMediaScreen";
+import ForwardScreen from "./src/screens/ForwardScreen";
 import SettingsScreen from "./src/screens/SettingsScreen";
 import AccountScreen from "./src/screens/AccountScreen";
 import AddContactMethodScreen from "./src/screens/AddContactMethodScreen";
@@ -32,6 +34,7 @@ import ActiveCallScreen from "./src/screens/ActiveCallScreen";
 import FloatingCallWidget from "./src/components/FloatingCallWidget";
 import HeaderAddButton from "./src/components/HeaderAddButton";
 import TabBarAvatar from "./src/components/TabBarAvatar";
+import Logo from "./src/components/Logo";
 import { AuthProvider, useAuth } from "./src/auth/AuthContext";
 import { MessagingProvider } from "./src/messaging/MessagingContext";
 import { PresenceProvider } from "./src/presence/PresenceContext";
@@ -57,10 +60,20 @@ export type MainTabParamList = {
 
 export type MainStackParamList = {
   MainTabs: undefined;
-  Chat: { conversationId: string; openSearch?: boolean };
+  Chat: {
+    conversationId: string;
+    openSearch?: boolean;
+    // Set by ForwardScreen when the user confirms — see ChatScreen's
+    // route.params.forwardTargets effect, which sends messageIds to each of
+    // these conversations then clears both params.
+    forwardTargets?: string[];
+    forwardMessageIds?: string[];
+  };
+  Forward: { messageIds: string[]; sourceConversationId: string };
+  ArchivedChats: undefined;
   Contacts: undefined;
   ContactInfo: { conversationId: string };
-  SharedMedia: { conversationId: string };
+  SharedMedia: { conversationId: string; initialTab?: "media" | "links" | "docs" };
   Account: undefined;
   AddContactMethod: { method: "email" | "phone" };
   Appearance: undefined;
@@ -130,11 +143,21 @@ function MainTabs() {
 
 function RootNavigator() {
   const { status } = useAuth();
+  const { colors } = useTheme();
 
   if (status === "loading") {
     return (
-      <View style={{ flex: 1, alignItems: "center", justifyContent: "center" }}>
-        <ActivityIndicator />
+      <View
+        style={{
+          flex: 1,
+          alignItems: "center",
+          justifyContent: "center",
+          gap: 20,
+          backgroundColor: colors.background,
+        }}
+      >
+        <Logo size={72} />
+        <ActivityIndicator color={colors.accent} />
       </View>
     );
   }
@@ -164,6 +187,8 @@ function RootNavigator() {
     >
       <MainStack.Screen name="MainTabs" component={MainTabs} options={{ headerShown: false }} />
       <MainStack.Screen name="Chat" component={ChatScreen} />
+      <MainStack.Screen name="Forward" component={ForwardScreen} options={{ title: "Forward message" }} />
+      <MainStack.Screen name="ArchivedChats" component={ArchivedChatsScreen} options={{ title: "Archived Chats" }} />
       <MainStack.Screen name="Contacts" component={ContactsScreen} options={{ title: "Add People" }} />
       <MainStack.Screen
         name="ContactInfo"

@@ -62,6 +62,7 @@ function createIntroMessage(): MessageRow {
     media_nonce: null,
     media_status: "ready",
     album_id: null,
+    forwarded_at: null,
   };
 }
 
@@ -96,6 +97,8 @@ export function ensureTestBotConversation() {
       created_at: Date.now(),
       status: "accepted",
       contact_number: null,
+      is_archived: 0,
+      archived_at: null,
     });
   } else {
     syncTestBotConversationMetadata();

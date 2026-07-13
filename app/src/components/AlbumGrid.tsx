@@ -20,6 +20,9 @@ export interface AlbumCellData {
   onCancelSend?: () => void;
   /** Only set on the last visible cell when the album has more items than are shown. */
   extraCount?: number;
+  /** True while the chat is in forward-selection mode — swaps the cell's tap behavior to toggle selection (see ChatScreen) and shows the checkmark overlay below. */
+  selectable?: boolean;
+  selected?: boolean;
 }
 
 interface CellProps {
@@ -29,8 +32,18 @@ interface CellProps {
 }
 
 function CellOverlays({ cell }: { cell: AlbumCellData }) {
+  const { colors } = useTheme();
   return (
     <>
+      {cell.selectable ? (
+        <View style={styles.selectionOverlay} pointerEvents="none">
+          <Ionicons
+            name={cell.selected ? "checkmark-circle" : "ellipse-outline"}
+            size={22}
+            color={cell.selected ? colors.accent : "#fff"}
+          />
+        </View>
+      ) : null}
       {cell.isSending ? (
         <View style={styles.sendingOverlay} pointerEvents={cell.onCancelSend ? "box-none" : "none"}>
           <ActivityIndicator color="#fff" size="small" />
@@ -204,4 +217,9 @@ const styles = StyleSheet.create({
     justifyContent: "center",
   },
   extraOverlayText: { color: "#fff", fontSize: 22, fontWeight: "700" },
+  selectionOverlay: {
+    position: "absolute",
+    top: 6,
+    right: 6,
+  },
 });

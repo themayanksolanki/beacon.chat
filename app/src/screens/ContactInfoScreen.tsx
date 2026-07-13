@@ -11,10 +11,13 @@ import { useAuth } from "../auth/AuthContext";
 import { useCall } from "../calls/CallContext";
 import { clearConversation } from "../chat/clearConversation";
 import { deleteConversation } from "../chat/deleteConversation";
+import { extractLinks } from "../chat/linkify";
 import {
   blockUser,
   getConversationById,
+  getFileMessages,
   getMediaMessages,
+  getTextMessages,
   isUserBlocked,
   unblockUser,
   updateConversationProfile,
@@ -36,6 +39,11 @@ function formatMemberSince(ts: number): string {
   return new Date(ts).toLocaleDateString(undefined, { month: "long", day: "numeric", year: "numeric" });
 }
 
+/** Total link occurrences across every text message in the conversation — same regex the Links tab/inline chat linkification use, see chat/linkify.ts. */
+function countLinks(conversationId: string): number {
+  return getTextMessages(conversationId).reduce((sum, message) => sum + extractLinks(message.plaintext).length, 0);
+}
+
 export default function ContactInfoScreen({ route, navigation }: Props) {
   const { conversationId } = route.params;
   const { token } = useAuth();
@@ -46,9 +54,13 @@ export default function ContactInfoScreen({ route, navigation }: Props) {
   const [peerCreatedAt, setPeerCreatedAt] = useState<number | null>(null);
   const [blocked, setBlocked] = useState(() => isUserBlocked(conversationId));
   const [mediaCount, setMediaCount] = useState(() => getMediaMessages(conversationId).length);
+  const [docsCount, setDocsCount] = useState(() => getFileMessages(conversationId).length);
+  const [linksCount, setLinksCount] = useState(() => countLinks(conversationId));
   useFocusEffect(
     useCallback(() => {
       setMediaCount(getMediaMessages(conversationId).length);
+      setDocsCount(getFileMessages(conversationId).length);
+      setLinksCount(countLinks(conversationId));
     }, [conversationId])
   );
   const { colors } = useTheme();
@@ -86,6 +98,10 @@ export default function ContactInfoScreen({ route, navigation }: Props) {
   }
 
   const name = conversation.display_name ?? "Unknown";
+  // WhatsApp-style single combined count for the "Media, links and docs"
+  // row below — the breakdown by kind only shows up once you tap through to
+  // SharedMediaScreen's tabs.
+  const sharedContentCount = mediaCount + docsCount + linksCount;
 
   const copyFingerprint = async () => {
     await Clipboard.setStringAsync(conversation.peer_public_key);
@@ -241,7 +257,7 @@ export default function ContactInfoScreen({ route, navigation }: Props) {
             <Text style={styles.rowLabel}>Media, links and docs</Text>
           </View>
           <View style={styles.mediaRowLeft}>
-            <Text style={styles.rowValue}>{mediaCount}</Text>
+            <Text style={styles.rowValue}>{sharedContentCount}</Text>
             <Ionicons name="chevron-forward" size={18} color={colors.textTertiary} />
           </View>
         </Pressable>

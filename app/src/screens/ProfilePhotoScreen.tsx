@@ -56,6 +56,8 @@ export default function ProfilePhotoScreen({ navigation, route }: Props) {
   return (
     <AuthScreenLayout
       onBack={() => navigation.goBack()}
+      logo
+      logoSize={56}
       step={{ index: 1, total: 2 }}
       title="Add a profile photo"
       subtitle="Help your contacts recognize you. You can always change this later."

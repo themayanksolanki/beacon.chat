@@ -16,6 +16,8 @@ interface Props {
   isOutgoing: boolean;
   uploadProgress?: number;
   onDownload?: () => void;
+  /** Opens an already-local file via the OS share/open sheet — mutually exclusive with onDownload (isLocal decides which one tapping the bubble triggers). */
+  onOpen?: () => void;
   /** Forwarded to this Pressable directly rather than relying on bubbling to
    * a parent Pressable — a long-press starting here claims the touch
    * responder itself (it's the deepest Pressable), so without this the
@@ -24,7 +26,7 @@ interface Props {
   onLongPress?: () => void;
 }
 
-function formatSize(bytes: number | null): string {
+export function formatSize(bytes: number | null): string {
   if (!bytes) return "";
   const mb = bytes / (1024 * 1024);
   return mb >= 1 ? `${mb.toFixed(1)} MB` : `${Math.max(1, Math.round(bytes / 1024))} KB`;
@@ -40,6 +42,7 @@ export default function FileMessageBubble({
   isOutgoing,
   uploadProgress,
   onDownload,
+  onOpen,
   onLongPress,
 }: Props) {
   const { colors } = useTheme();
@@ -48,13 +51,14 @@ export default function FileMessageBubble({
   const icon = mime?.startsWith("audio/") ? "musical-notes-outline" : "document-outline";
   const inFlight = isSending || mediaStatus === "downloading";
   const canDownload = !isLocal && !inFlight && !!onDownload;
+  const canOpen = isLocal && !inFlight && !!onOpen;
 
   return (
     <Pressable
       style={[styles.container, isOutgoing ? styles.outgoing : styles.incoming]}
-      onPress={canDownload ? onDownload : undefined}
+      onPress={canDownload ? onDownload : canOpen ? onOpen : undefined}
       onLongPress={onLongPress}
-      disabled={!canDownload && !onLongPress}
+      disabled={!canDownload && !canOpen && !onLongPress}
     >
       <View style={styles.iconWrap}>
         {inFlight ? (
@@ -78,7 +82,9 @@ export default function FileMessageBubble({
               ? "Downloading…"
               : !isLocal
                 ? `Tap to download${sizeBytes ? ` · ${formatSize(sizeBytes)}` : ""}`
-                : formatSize(sizeBytes)}
+                : canOpen
+                  ? `Tap to open${sizeBytes ? ` · ${formatSize(sizeBytes)}` : ""}`
+                  : formatSize(sizeBytes)}
         </Text>
       </View>
     </Pressable>

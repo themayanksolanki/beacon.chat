@@ -100,6 +100,8 @@ export default function ContactsScreen({ navigation }: Props) {
                 created_at: Date.now(),
                 status,
                 contact_number: contact.phoneNumber ?? null,
+                is_archived: 0,
+                archived_at: null,
               });
             }
             if (status === "pending_outgoing") {
