@@ -21,7 +21,12 @@
         "UIBackgroundModes": [
           "voip",
           "audio"
-        ]
+        ],
+        "RTCScreenSharingExtension": "com.beaconchat.app.BeaconScreenShare",
+        "RTCAppGroupIdentifier": "group.com.beaconchat.app"
+      },
+      "entitlements": {
+        "com.apple.security.application-groups": ["group.com.beaconchat.app"]
       }
     },
     "android": {
@@ -44,7 +49,8 @@
         "android.permission.FOREGROUND_SERVICE",
         "android.permission.FOREGROUND_SERVICE_MICROPHONE",
         "android.permission.FOREGROUND_SERVICE_CAMERA",
-        "android.permission.FOREGROUND_SERVICE_PHONE_CALL"
+        "android.permission.FOREGROUND_SERVICE_PHONE_CALL",
+        "android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION"
       ]
     },
     "web": {
@@ -56,7 +62,9 @@
       "./plugins/withDisableScriptSandboxing.js",
       "./plugins/withCallKeepAndroid.js",
       "./plugins/withAndroidPip.js",
+      "./plugins/withNotifeeAndroidMavenRepo.js",
       "./plugins/withAndroidReleaseSigning.js",
+      "./plugins/withIosScreenShareExtension.js",
       "@giphy/react-native-sdk",
       [
         "expo-image-picker",
@@ -76,7 +84,13 @@
           "microphonePermission": "Beacon needs microphone access for voice and video calls."
         }
       ],
-      "expo-notifications",
+      [
+        "expo-notifications",
+        {
+          "icon": "./assets/android-icon-monochrome.png",
+          "color": "#007AFF"
+        }
+      ],
       "expo-font",
       "expo-asset",
       "expo-video",

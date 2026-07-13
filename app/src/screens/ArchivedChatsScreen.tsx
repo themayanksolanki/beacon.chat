@@ -151,6 +151,11 @@ export default function ArchivedChatsScreen({ navigation }: Props) {
   );
 
   return (
+    // No wrapping Pressable for "tap outside to dismiss" — it competed with
+    // the FlatList below for scroll gestures and broke dragging on blank
+    // list space. keyboardShouldPersistTaps defaults to "never", which
+    // already dismisses the keyboard on tapping anywhere in the list that
+    // isn't a nested touchable, with no extra wrapper needed.
     <View style={styles.container}>
       <View style={styles.searchWrap}>
         <Ionicons name="search" size={16} color={colors.textTertiary} />
@@ -208,7 +213,7 @@ const createStyles = (colors: ThemeColors) =>
     container: { flex: 1, backgroundColor: colors.background },
     center: { flex: 1, alignItems: "center", justifyContent: "center", padding: 24, gap: 8 },
     empty: { color: colors.textTertiary, textAlign: "center" },
-    list: { padding: 12, paddingTop: 4, gap: 10 },
+    list: { paddingTop: 4, paddingBottom: 12 },
     searchWrap: {
       flexDirection: "row",
       alignItems: "center",

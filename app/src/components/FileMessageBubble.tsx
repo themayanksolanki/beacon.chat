@@ -13,7 +13,6 @@ interface Props {
   isLocal: boolean;
   mediaStatus: MediaStatus;
   isSending: boolean;
-  isOutgoing: boolean;
   uploadProgress?: number;
   onDownload?: () => void;
   /** Opens an already-local file via the OS share/open sheet — mutually exclusive with onDownload (isLocal decides which one tapping the bubble triggers). */
@@ -39,7 +38,6 @@ export default function FileMessageBubble({
   isLocal,
   mediaStatus,
   isSending,
-  isOutgoing,
   uploadProgress,
   onDownload,
   onOpen,
@@ -54,28 +52,27 @@ export default function FileMessageBubble({
   const canOpen = isLocal && !inFlight && !!onOpen;
 
   return (
+    // No background of its own — this renders inside MessageBubble's framed
+    // (bordered, no solid fill) bubble now, same for outgoing and incoming,
+    // so there's no more accent-vs-gray distinction to color icon/text for.
     <Pressable
-      style={[styles.container, isOutgoing ? styles.outgoing : styles.incoming]}
+      style={styles.container}
       onPress={canDownload ? onDownload : canOpen ? onOpen : undefined}
       onLongPress={onLongPress}
       disabled={!canDownload && !canOpen && !onLongPress}
     >
       <View style={styles.iconWrap}>
         {inFlight ? (
-          <ActivityIndicator size="small" color={isOutgoing ? "#fff" : colors.textSecondary} />
+          <ActivityIndicator size="small" color={colors.textSecondary} />
         ) : (
-          <Ionicons name={icon} size={22} color={isOutgoing ? "#fff" : colors.textSecondary} />
+          <Ionicons name={icon} size={22} color={colors.textSecondary} />
         )}
       </View>
       <View style={styles.textWrap}>
-        <Text
-          style={isOutgoing ? styles.nameOutgoing : styles.nameIncoming}
-          numberOfLines={1}
-          ellipsizeMode="middle"
-        >
+        <Text style={styles.name} numberOfLines={1} ellipsizeMode="middle">
           {fileName}
         </Text>
-        <Text style={isOutgoing ? styles.metaOutgoing : styles.metaIncoming}>
+        <Text style={styles.meta}>
           {isSending && uploadProgress != null
             ? `Uploading ${Math.round(uploadProgress * 100)}%`
             : mediaStatus === "downloading"
@@ -103,12 +100,8 @@ const createStyles = (colors: ThemeColors) =>
       minWidth: 180,
       maxWidth: 240,
     },
-    outgoing: { backgroundColor: "rgba(255,255,255,0.15)" },
-    incoming: { backgroundColor: colors.bubbleIncoming },
     iconWrap: { width: 32, height: 32, alignItems: "center", justifyContent: "center" },
     textWrap: { flex: 1, minWidth: 0 },
-    nameOutgoing: { color: "#fff", fontSize: 14, fontWeight: "600" },
-    nameIncoming: { color: colors.text, fontSize: 14, fontWeight: "600" },
-    metaOutgoing: { color: "rgba(255,255,255,0.75)", fontSize: 11, marginTop: 2 },
-    metaIncoming: { color: colors.textTertiary, fontSize: 11, marginTop: 2 },
+    name: { color: colors.text, fontSize: 14, fontWeight: "600" },
+    meta: { color: colors.textTertiary, fontSize: 11, marginTop: 2 },
   });

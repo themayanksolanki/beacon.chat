@@ -143,7 +143,6 @@ export default function ConversationListScreen({ navigation }: Props) {
           {
             label: "Delete Chat",
             icon: "trash-outline",
-            destructive: true,
             onPress: () => {
               deleteConversation(conversationId);
               refresh();
@@ -161,7 +160,6 @@ export default function ConversationListScreen({ navigation }: Props) {
           {
             label: "Delete User",
             icon: "person-remove-outline",
-            destructive: true,
             onPress: () => {
               blockUser(conversationId);
               deleteConversation(conversationId);
@@ -245,7 +243,7 @@ const createStyles = (colors: ThemeColors) =>
     container: { flex: 1, backgroundColor: colors.background },
     center: { flex: 1, alignItems: "center", justifyContent: "center", padding: 24 },
     empty: { color: colors.textTertiary, textAlign: "center" },
-    list: { padding: 12, paddingTop: 4, gap: 10 },
+    list: { paddingTop: 4, paddingBottom: 12 },
     testBotCard: {
       flexDirection: "row",
       alignItems: "center",

@@ -64,86 +64,97 @@ export default function ConversationRow({
   const hasUnread = item.unread_count > 0;
 
   return (
-    <Pressable
-      ref={rowRef}
-      style={({ pressed }) => [styles.card, pressed && styles.cardPressed]}
-      onPress={onPress}
-      onLongPress={() => {
-        rowRef.current?.measureInWindow((x, y, width, height) => {
-          onLongPressAt({ x, y, width, height });
-        });
-      }}
-    >
-      <View style={styles.avatar}>
-        {item.avatar_url ? (
-          <Image source={{ uri: item.avatar_url }} style={StyleSheet.absoluteFill} />
-        ) : (
-          <View style={[StyleSheet.absoluteFill, styles.avatarFallback, { backgroundColor: colorForName(name) }]}>
-            <Text style={styles.avatarText}>{initialFor(name)}</Text>
+    <View>
+      <Pressable
+        ref={rowRef}
+        style={({ pressed }) => [styles.card, pressed && styles.cardPressed]}
+        onPress={onPress}
+        onLongPress={() => {
+          rowRef.current?.measureInWindow((x, y, width, height) => {
+            onLongPressAt({ x, y, width, height });
+          });
+        }}
+      >
+        <View style={styles.avatarWrapper}>
+          <View style={styles.avatar}>
+            {item.avatar_url ? (
+              <Image source={{ uri: item.avatar_url }} style={StyleSheet.absoluteFill} />
+            ) : (
+              <View style={[StyleSheet.absoluteFill, styles.avatarFallback, { backgroundColor: colorForName(name) }]}>
+                <Text style={styles.avatarText}>{initialFor(name)}</Text>
+              </View>
+            )}
           </View>
-        )}
-        {isOnline ? <View style={styles.onlineDot} /> : null}
-      </View>
-      <View style={styles.rowContent}>
-        <View style={styles.rowTop}>
-          <Text style={styles.name} numberOfLines={1}>
-            {name}
-          </Text>
-          {item.last_message_at ? (
-            <Text style={[styles.time, hasUnread && styles.timeUnread]}>
-              {formatListTimestamp(item.last_message_at)}
-            </Text>
-          ) : null}
+          {/* Sibling of the clipped avatar (not a child of it) — the avatar's
+              own overflow:hidden + circular borderRadius was clipping off the
+              half of this dot meant to overlap its edge. */}
+          {isOnline ? <View style={styles.onlineDot} /> : null}
         </View>
-        <View style={styles.rowBottom}>
-          {item.status === "pending_incoming" ? (
-            <>
-              <Text style={styles.requestLabel} numberOfLines={1}>
-                Wants to message you
+        <View style={styles.rowContent}>
+          <View style={styles.rowTop}>
+            <Text style={styles.name} numberOfLines={1}>
+              {name}
+            </Text>
+            {item.last_message_at ? (
+              <Text style={[styles.time, hasUnread && styles.timeUnread]}>
+                {formatListTimestamp(item.last_message_at)}
               </Text>
-              <View style={styles.requestActions}>
-                <Pressable
-                  style={[styles.requestButton, styles.requestButtonAccept]}
-                  onPress={onAccept}
-                  hitSlop={6}
-                >
-                  <Ionicons name="checkmark" size={16} color={colors.tickRead} />
-                </Pressable>
-                <Pressable
-                  style={[styles.requestButton, styles.requestButtonReject]}
-                  onPress={onReject}
-                  hitSlop={6}
-                >
-                  <Ionicons name="close" size={16} color={colors.danger} />
-                </Pressable>
-              </View>
-            </>
-          ) : item.status === "pending_outgoing" ? (
-            <Text style={styles.requestLabel} numberOfLines={1}>
-              Request sent
-            </Text>
-          ) : item.status === "declined" ? (
-            <Text style={styles.requestLabel} numberOfLines={1}>
-              Declined
-            </Text>
-          ) : (
-            <>
-              <View style={styles.previewRow}>
-                <PreviewReceiptTick item={item} colors={colors} />
-                <Text style={[styles.preview, hasUnread && styles.previewUnread]} numberOfLines={1}>
-                  {item.last_message ?? "No messages yet"}
+            ) : null}
+          </View>
+          <View style={styles.rowBottom}>
+            {item.status === "pending_incoming" ? (
+              <>
+                <Text style={styles.requestLabel} numberOfLines={1}>
+                  Wants to message you
                 </Text>
-              </View>
-              {hasUnread ? (
-                <View style={styles.badge}>
-                  <Text style={styles.badgeText}>{item.unread_count > 99 ? "99+" : item.unread_count}</Text>
+                <View style={styles.requestActions}>
+                  <Pressable
+                    style={[styles.requestButton, styles.requestButtonAccept]}
+                    onPress={onAccept}
+                    hitSlop={6}
+                  >
+                    <Ionicons name="checkmark" size={16} color={colors.tickRead} />
+                  </Pressable>
+                  <Pressable
+                    style={[styles.requestButton, styles.requestButtonReject]}
+                    onPress={onReject}
+                    hitSlop={6}
+                  >
+                    <Ionicons name="close" size={16} color={colors.danger} />
+                  </Pressable>
                 </View>
-              ) : null}
-            </>
-          )}
+              </>
+            ) : item.status === "pending_outgoing" ? (
+              <Text style={styles.requestLabel} numberOfLines={1}>
+                Request sent
+              </Text>
+            ) : item.status === "declined" ? (
+              <Text style={styles.requestLabel} numberOfLines={1}>
+                Declined
+              </Text>
+            ) : (
+              <>
+                <View style={styles.previewRow}>
+                  <PreviewReceiptTick item={item} colors={colors} />
+                  <Text style={[styles.preview, hasUnread && styles.previewUnread]} numberOfLines={1}>
+                    {item.last_message ?? "No messages yet"}
+                  </Text>
+                </View>
+                {hasUnread ? (
+                  <View style={styles.badge}>
+                    <Text style={styles.badgeText}>{item.unread_count > 99 ? "99+" : item.unread_count}</Text>
+                  </View>
+                ) : null}
+              </>
+            )}
+          </View>
         </View>
+      </Pressable>
+      <View style={styles.dividerRow}>
+        <View style={styles.dividerSpacer} />
+        <View style={styles.dividerLine} />
       </View>
-    </Pressable>
+    </View>
   );
 }
 
@@ -159,15 +170,26 @@ const createStyles = (colors: ThemeColors) =>
       paddingHorizontal: 14,
       paddingVertical: 12,
       gap: 12,
-      borderRadius: 18,
-      backgroundColor: colors.surface,
-      shadowColor: "#000",
-      shadowOffset: { width: 0, height: 1 },
-      shadowOpacity: 0.05,
-      shadowRadius: 3,
-      elevation: 1,
     },
     cardPressed: { opacity: 0.7 },
+    // Starts past the avatar (avatar width + the row's gap) so the line
+    // lines up under the name/preview text instead of cutting across the
+    // avatar circle. A flat sibling row rather than a border on the
+    // Pressable above, so its position doesn't depend on guessing which box
+    // React Native's absolute-positioning offsets would be relative to.
+    dividerRow: { flexDirection: "row", paddingHorizontal: 14 },
+    dividerSpacer: { width: 56 + 12 },
+    dividerLine: {
+      flex: 1,
+      height: 1,
+      // Plain colors.border reads as barely-there once rows lost their
+      // white/dark card background (it was tuned for that as a hairline
+      // against colors.surface, not against the whole screen's background)
+      // — a translucent textTertiary gives a line that's clearly visible
+      // without going full-strength dark.
+      backgroundColor: colors.textTertiary + "4D",
+    },
+    avatarWrapper: { width: 56, height: 56 },
     avatar: { width: 56, height: 56, borderRadius: 28, overflow: "hidden" },
     avatarFallback: { alignItems: "center", justifyContent: "center" },
     avatarText: { fontSize: 20, fontWeight: "700", color: "#fff" },

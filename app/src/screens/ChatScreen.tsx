@@ -41,6 +41,7 @@ import StickerGifTray from "../components/StickerGifTray";
 import AlbumGrid, { type AlbumCellData } from "../components/AlbumGrid";
 import ImageMessageBubble from "../components/ImageMessageBubble";
 import MediaViewerModal, { type ViewerMedia } from "../components/MediaViewerModal";
+import AttachmentCaptionModal from "../components/AttachmentCaptionModal";
 import MessageActionMenu, { type MessageAction, type MessageMenuAnchor } from "../components/MessageActionMenu";
 import VideoMessageBubble from "../components/VideoMessageBubble";
 import VoiceMessageBubble from "../components/VoiceMessageBubble";
@@ -162,6 +163,9 @@ const CHAT_ITEM_PAGE_SIZE = 40;
 // Trigger the next "load older" fetch once the user has scrolled within this
 // many px of the top, so the page arrives before they hit a hard stop.
 const LOAD_OLDER_SCROLL_THRESHOLD = 150;
+// Show the floating "scroll to bottom" button once the newest message is
+// scrolled at least this many px out of view.
+const SCROLL_TO_BOTTOM_THRESHOLD = 300;
 const DELETE_FOR_EVERYONE_WINDOW_MS = 2 * 60 * 60 * 1000;
 // How long to wait after the last keystroke before telling the peer we
 // stopped typing.
@@ -171,6 +175,30 @@ const TYPING_STOP_DELAY_MS = 2500;
 const TYPING_RECEIVE_TIMEOUT_MS = 6000;
 // Same safety net, for the peer-is-recording indicator.
 const RECORDING_RECEIVE_TIMEOUT_MS = 6000;
+
+// Audio and document attachments both open expo-document-picker's native UI,
+// which is a process-wide singleton — it rejects a second getDocumentAsync
+// call while one is still awaiting the user's pick. Module-scoped (not a
+// component ref) so the lock survives ChatScreen unmounting/remounting while
+// the native picker sheet is still open (e.g. navigating away mid-pick).
+let documentPickerActive = false;
+const DOCUMENT_PICKER_TIMEOUT_MS = 60000;
+
+// Some devices interrupt the native file picker with an OS-level auth
+// challenge (e.g. Face ID prompted by a Files provider) that can leave
+// getDocumentAsync's promise never settling. Without a timeout the module
+// lock above would stay stuck forever, silently no-op'ing every future
+// attempt to attach an audio/document file until the app is restarted.
+async function pickDocumentWithTimeout(
+  options: DocumentPicker.DocumentPickerOptions
+): Promise<DocumentPicker.DocumentPickerResult> {
+  return Promise.race([
+    DocumentPicker.getDocumentAsync(options),
+    new Promise<DocumentPicker.DocumentPickerResult>((_, reject) =>
+      setTimeout(() => reject(new Error("Document picker timed out")), DOCUMENT_PICKER_TIMEOUT_MS)
+    ),
+  ]);
+}
 
 // text.slice cuts by UTF-16 code unit, which can land inside a surrogate
 // pair — most emoji outside the BMP (😀, 🎉, ...) are two code units — and
@@ -264,7 +292,7 @@ function ChatHeaderCallButtons({ conversationId, disabled }: { conversationId: s
   const iconColor = disabled ? colors.textTertiary : colors.accent;
 
   return (
-    <View style={{ flexDirection: "row", gap: 18 }}>
+    <View style={{ flexDirection: "row", gap: 18, paddingRight: 8, paddingLeft: 8}}>
       <Pressable onPress={() => startCall(conversationId, "audio")} disabled={disabled} hitSlop={8}>
         <Ionicons name="call-outline" size={22} color={iconColor} />
       </Pressable>
@@ -441,19 +469,23 @@ function showTimingInfo(message: MessageRow) {
   Alert.alert("Message info", lines.join("\n"));
 }
 
-function StatusTicks({ status }: { status: MessageRow["status"] }) {
+// `framed` is true when this renders inside a bordered (non-text) bubble —
+// see MessageBubble's isFramedKind — which no longer has the solid accent
+// fill the plain white/rgba tone below assumed.
+function StatusTicks({ status, framed }: { status: MessageRow["status"]; framed?: boolean }) {
   const { colors } = useTheme();
+  const mutedColor = framed ? colors.textTertiary : "rgba(255,255,255,0.75)";
   if (status === "failed") {
     return <Ionicons name="alert-circle" size={14} color={colors.danger} />;
   }
   if (status === "pending") {
-    return <Ionicons name="time-outline" size={13} color="rgba(255,255,255,0.75)" />;
+    return <Ionicons name="time-outline" size={13} color={mutedColor} />;
   }
   if (status === "sent") {
-    return <Ionicons name="checkmark" size={15} color="rgba(255,255,255,0.75)" />;
+    return <Ionicons name="checkmark" size={15} color={mutedColor} />;
   }
   if (status === "delivered") {
-    return <Ionicons name="checkmark-done" size={15} color="rgba(255,255,255,0.75)" />;
+    return <Ionicons name="checkmark-done" size={15} color={mutedColor} />;
   }
   return <Ionicons name="checkmark-done" size={15} color={colors.tickRead} />;
 }
@@ -685,6 +717,25 @@ function MessageBubble({
   const isDeleted = !!message.deleted_at;
   const isPinned = !!message.pinned_at;
   const hasReaction = !isDeleted && !!(message.reaction_mine || message.reaction_peer);
+  // plaintext is the fixed "📷 Photo"/"🎬 Video" placeholder for image/video
+  // messages UNLESS the sender actually typed a caption in
+  // AttachmentCaptionModal (see sendAttachment), in which case it holds that
+  // real text instead — this is what distinguishes "no caption" from "has
+  // one" for rendering below.
+  const hasMediaCaption =
+    (message.kind === "image" && message.plaintext !== IMAGE_MESSAGE_LABEL) ||
+    (message.kind === "video" && message.plaintext !== VIDEO_MESSAGE_LABEL);
+  // Photo/video/gif bubbles get a much thinner frame than a text bubble's —
+  // the full 14/8 padding (sized for readable text) left a noticeably thick
+  // band of bubble-color background around the image itself.
+  const isMediaKind = message.kind === "image" || message.kind === "video" || message.kind === "gif";
+  // Every non-text kind (image/video/gif/voice/file) trades the solid
+  // accent/gray bubble fill for a thin bordered frame instead — only plain
+  // text keeps the colored bubble. Content rendered inside a framed bubble
+  // (captions, the deleted/forwarded placeholders) has to use a
+  // direction-independent neutral color instead of outgoingText's white,
+  // which assumed a solid accent-colored background behind it.
+  const isFramedKind = message.kind !== "text";
 
   const onLongPress =
     isDeleted || selectionMode
@@ -728,8 +779,15 @@ function MessageBubble({
           ref={bubbleRef}
           style={[
             styles.bubble,
-            isOutgoing ? styles.outgoing : styles.incoming,
+            isFramedKind
+              ? isOutgoing
+                ? styles.framedOutgoing
+                : styles.framedIncoming
+              : isOutgoing
+                ? styles.outgoing
+                : styles.incoming,
             !isGroupEnd && (isOutgoing ? styles.outgoingGrouped : styles.incomingGrouped),
+            isMediaKind && styles.mediaBubble,
           ]}
           onPress={selectionMode ? () => onToggleSelect?.(message) : undefined}
           onLongPress={onLongPress}
@@ -740,9 +798,9 @@ function MessageBubble({
               <Ionicons
                 name="ban-outline"
                 size={14}
-                color={isOutgoing ? "rgba(255,255,255,0.75)" : colors.textTertiary}
+                color={isOutgoing && !isFramedKind ? "rgba(255,255,255,0.75)" : colors.textTertiary}
               />
-              <Text style={isOutgoing ? styles.outgoingDeletedText : styles.incomingDeletedText}>
+              <Text style={isOutgoing && !isFramedKind ? styles.outgoingDeletedText : styles.incomingDeletedText}>
                 This message was deleted
               </Text>
             </View>
@@ -753,19 +811,28 @@ function MessageBubble({
                   <Ionicons
                     name="arrow-redo-outline"
                     size={12}
-                    color={isOutgoing ? "rgba(255,255,255,0.75)" : colors.textTertiary}
+                    color={isOutgoing && !isFramedKind ? "rgba(255,255,255,0.75)" : colors.textTertiary}
                   />
-                  <Text style={isOutgoing ? styles.forwardedLabelTextOutgoing : styles.forwardedLabelTextIncoming}>
+                  <Text
+                    style={
+                      isOutgoing && !isFramedKind
+                        ? styles.forwardedLabelTextOutgoing
+                        : styles.forwardedLabelTextIncoming
+                    }
+                  >
                     Forwarded
                   </Text>
                 </View>
               ) : null}
               {message.reply_preview ? (
                 <View
-                  style={[styles.replyQuote, isOutgoing ? styles.replyQuoteOutgoing : styles.replyQuoteIncoming]}
+                  style={[
+                    styles.replyQuote,
+                    isOutgoing && !isFramedKind ? styles.replyQuoteOutgoing : styles.replyQuoteIncoming,
+                  ]}
                 >
                   <Text
-                    style={isOutgoing ? styles.replyQuoteTextOutgoing : styles.replyQuoteTextIncoming}
+                    style={isOutgoing && !isFramedKind ? styles.replyQuoteTextOutgoing : styles.replyQuoteTextIncoming}
                     numberOfLines={1}
                   >
                     {message.reply_preview}
@@ -777,7 +844,6 @@ function MessageBubble({
                   audioUri={message.audio_uri}
                   durationMs={message.duration_ms ?? 0}
                   waveform={message.waveform ? JSON.parse(message.waveform) : []}
-                  isOutgoing={isOutgoing}
                   onLongPress={onLongPress}
                 />
               ) : message.kind === "image" ? (
@@ -849,7 +915,6 @@ function MessageBubble({
                   isLocal={!!message.file_uri}
                   mediaStatus={message.media_status}
                   isSending={isOutgoing && message.status === "pending"}
-                  isOutgoing={isOutgoing}
                   uploadProgress={isOutgoing ? uploadProgress : undefined}
                   onDownload={!selectionMode && !isOutgoing ? () => onDownload(message) : undefined}
                   onOpen={!selectionMode && message.file_uri ? () => onOpenFile(message) : undefined}
@@ -860,31 +925,84 @@ function MessageBubble({
                   text={message.plaintext}
                   style={isOutgoing ? styles.outgoingText : styles.incomingText}
                   linkStyle={isOutgoing ? styles.outgoingLinkText : styles.incomingLinkText}
+                  trailing={
+                    <Text
+                      style={isOutgoing ? styles.metaTextOutgoing : styles.metaTextIncoming}
+                      onPress={
+                        !selectionMode && (message.status === "failed" || message.media_status === "download_failed")
+                          ? () => onRetry(message)
+                          : undefined
+                      }
+                    >
+                      {" "}
+                      {isPinned ? (
+                        <>
+                          <Ionicons
+                            name="pin"
+                            size={11}
+                            color={isOutgoing ? "rgba(255,255,255,0.75)" : colors.textTertiary}
+                          />
+                          {" "}
+                        </>
+                      ) : null}
+                      {message.status === "failed"
+                        ? "Not sent · tap to retry"
+                        : message.media_status === "download_failed"
+                          ? "Couldn't load · tap to retry"
+                          : formatTime(message.sent_at)}
+                      {isOutgoing ? " " : ""}
+                      {isOutgoing ? <StatusTicks status={message.status} /> : null}
+                    </Text>
+                  }
                 />
               )}
+              {/* The media components above (ImageMessageBubble/
+                  VideoMessageBubble) never render message.plaintext
+                  themselves — without this, a caption typed in
+                  AttachmentCaptionModal was saved and sent correctly but
+                  never actually appeared anywhere on screen. */}
+              {hasMediaCaption ? (
+                // Always the neutral/incoming colors, never outgoingText's
+                // white — a caption only ever renders inside a framed (image/
+                // video) bubble, which no longer has a solid accent fill
+                // behind it regardless of direction.
+                <Linkify
+                  text={message.plaintext}
+                  style={[styles.incomingText, styles.mediaCaption]}
+                  linkStyle={styles.incomingLinkText}
+                />
+              ) : null}
             </>
           )}
-          <Pressable
-            style={styles.metaRow}
-            onPress={() => onRetry(message)}
-            disabled={selectionMode || (message.status !== "failed" && message.media_status !== "download_failed")}
-          >
-            {isPinned ? (
-              <Ionicons
-                name="pin"
-                size={11}
-                color={isOutgoing ? "rgba(255,255,255,0.75)" : colors.textTertiary}
-              />
-            ) : null}
-            <Text style={isOutgoing ? styles.metaTextOutgoing : styles.metaTextIncoming}>
-              {message.status === "failed"
-                ? "Not sent · tap to retry"
-                : message.media_status === "download_failed"
-                  ? "Couldn't load · tap to retry"
-                  : formatTime(message.sent_at)}
-            </Text>
-            {isOutgoing ? <StatusTicks status={message.status} /> : null}
-          </Pressable>
+          {/* Text messages fold their meta (time/ticks/pin) into the last
+              line of the bubble itself (see Linkify's trailing prop) so a
+              short message shares its line with the timestamp, WhatsApp-
+              style, instead of always giving it its own row below — every
+              other kind (media, deleted) keeps this standalone row since
+              there's no flowing text to merge it into. */}
+          {isDeleted || message.kind !== "text" ? (
+            <Pressable
+              style={[styles.metaRow, isMediaKind && styles.mediaMetaRow]}
+              onPress={() => onRetry(message)}
+              disabled={selectionMode || (message.status !== "failed" && message.media_status !== "download_failed")}
+            >
+              {isPinned ? (
+                <Ionicons
+                  name="pin"
+                  size={11}
+                  color={isOutgoing && !isFramedKind ? "rgba(255,255,255,0.75)" : colors.textTertiary}
+                />
+              ) : null}
+              <Text style={isOutgoing && !isFramedKind ? styles.metaTextOutgoing : styles.metaTextIncoming}>
+                {message.status === "failed"
+                  ? "Not sent · tap to retry"
+                  : message.media_status === "download_failed"
+                    ? "Couldn't load · tap to retry"
+                    : formatTime(message.sent_at)}
+              </Text>
+              {isOutgoing ? <StatusTicks status={message.status} framed={isFramedKind} /> : null}
+            </Pressable>
+          ) : null}
         </Pressable>
 
         {!isDeleted && (message.reaction_mine || message.reaction_peer) ? (
@@ -1117,42 +1235,32 @@ function CallBubble({
 
   return (
     <View style={[styles.bubbleRowSpaced, { alignSelf: isOutgoing ? "flex-end" : "flex-start" }]}>
+      {/* A call log entry is never a "text" kind, so — like image/video/voice/
+          file bubbles (see isFramedKind) — it always gets the bordered-frame
+          treatment, never the solid accent/gray fill. Every color below is
+          therefore direction-independent (no outgoing-white variant to
+          reach for), unlike a plain text bubble's. */}
       <Pressable
         ref={bubbleRef}
-        style={[styles.callBubble, isOutgoing ? styles.outgoing : styles.incoming]}
+        style={[styles.callBubble, isOutgoing ? styles.framedOutgoing : styles.framedIncoming]}
         onPress={selectionMode ? undefined : () => onRedial(call)}
         onLongPress={selectionMode ? undefined : onLongPress}
       >
-        <View style={[styles.callBubbleIcon, isOutgoing ? styles.callBubbleIconOutgoing : styles.callBubbleIconIncoming]}>
-          <Ionicons
-            name={call.kind === "video" ? "videocam" : "call"}
-            size={16}
-            color={isOutgoing ? "#fff" : colors.accent}
-          />
+        <View style={[styles.callBubbleIcon, styles.callBubbleIconIncoming]}>
+          <Ionicons name={call.kind === "video" ? "videocam" : "call"} size={16} color={colors.accent} />
         </View>
         <View style={styles.callBubbleText}>
           <View style={styles.callBubbleLabelRow}>
             <Ionicons
               name={isOutgoing ? "arrow-up-outline" : "arrow-down-outline"}
               size={12}
-              color={
-                isMissedLike
-                  ? colors.danger
-                  : isOutgoing
-                    ? "rgba(255,255,255,0.8)"
-                    : colors.textSecondary
-              }
+              color={isMissedLike ? colors.danger : colors.textSecondary}
             />
-            <Text style={[isOutgoing ? styles.outgoingText : styles.incomingText, styles.callBubbleLabel]}>
+            <Text style={[styles.incomingText, styles.callBubbleLabel]}>
               {call.kind === "video" ? "Video call" : "Audio call"}
             </Text>
           </View>
-          <Text
-            style={[
-              isOutgoing ? styles.metaTextOutgoing : styles.metaTextIncoming,
-              isMissedLike && (isOutgoing ? styles.callMetaMissedOutgoing : styles.callMetaMissedIncoming),
-            ]}
-          >
+          <Text style={[styles.metaTextIncoming, isMissedLike && styles.callMetaMissedIncoming]}>
             {callStatusLabel(call)} · {formatTime(call.started_at)}
           </Text>
         </View>
@@ -1417,6 +1525,9 @@ export default function ChatScreen({ route, navigation }: Props) {
   const isProgrammaticScrollTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const scrollToEndProgrammatically = useCallback(() => {
     isProgrammaticScrollRef.current = true;
+    // handleListScroll bails out early while this ref is set, so the button
+    // wouldn't otherwise clear itself until the next manual scroll sample.
+    setShowScrollToBottom(false);
     if (isProgrammaticScrollTimeoutRef.current) clearTimeout(isProgrammaticScrollTimeoutRef.current);
     isProgrammaticScrollTimeoutRef.current = setTimeout(() => {
       isProgrammaticScrollRef.current = false;
@@ -1439,6 +1550,13 @@ export default function ChatScreen({ route, navigation }: Props) {
     }, 350);
   }, []);
 
+  // Drives the floating "scroll to bottom" button — shown once the user has
+  // scrolled far enough from the newest message that it's no longer visible,
+  // regardless of why (manually scrolling up, or a "load older" prepend
+  // pushing everything down). Not tied to new messages arriving: those
+  // already force scrollToEndProgrammatically via onContentSizeChange below.
+  const [showScrollToBottom, setShowScrollToBottom] = useState(false);
+
   // Throttled (see scrollEventThrottle on the FlatList below) rather than
   // firing on every scroll frame — this only needs to sample position
   // occasionally to catch "user is nearing the top."
@@ -1446,6 +1564,10 @@ export default function ChatScreen({ route, navigation }: Props) {
     (e: NativeSyntheticEvent<NativeScrollEvent>) => {
       if (isProgrammaticScrollRef.current) return;
       if (e.nativeEvent.contentOffset.y < LOAD_OLDER_SCROLL_THRESHOLD) loadOlderMessages();
+
+      const { contentOffset, contentSize, layoutMeasurement } = e.nativeEvent;
+      const distanceFromBottom = contentSize.height - contentOffset.y - layoutMeasurement.height;
+      setShowScrollToBottom(distanceFromBottom > SCROLL_TO_BOTTOM_THRESHOLD);
     },
     [loadOlderMessages]
   );
@@ -1481,6 +1603,17 @@ export default function ChatScreen({ route, navigation }: Props) {
   const [attachmentSheetOpen, setAttachmentSheetOpen] = useState(false);
   const [attachmentAnchor, setAttachmentAnchor] = useState<MessageMenuAnchor | null>(null);
   const attachmentButtonRef = useRef<View>(null);
+  // A single freshly-picked/captured image or video, staged for the caption
+  // preview (see AttachmentCaptionModal) before it actually becomes a
+  // message — only used for a single attachment (not a multi-select batch,
+  // which sends immediately as before; see pickAndSendAttachment).
+  const [pendingCaptionAttachment, setPendingCaptionAttachment] = useState<{
+    uri: string;
+    kind: "image" | "video";
+    width?: number;
+    height?: number;
+    durationMs?: number;
+  } | null>(null);
   // Combined sticker/GIF tray (see StickerGifTray) in place of the keyboard
   // — mobile keyboards already have their own built-in emoji picker, so this
   // only needs to cover stickers and GIFs.
@@ -2065,7 +2198,7 @@ export default function ChatScreen({ route, navigation }: Props) {
       id: string,
       plaintextUri: string,
       kind: AttachmentKind,
-      meta: { width?: number; height?: number; durationMs?: number; name?: string; mime?: string },
+      meta: { width?: number; height?: number; durationMs?: number; name?: string; mime?: string; caption?: string },
       replyTo: ReplyTarget | null,
       albumId?: string | null
     ) => {
@@ -2090,6 +2223,7 @@ export default function ChatScreen({ route, navigation }: Props) {
             size: prepared.plaintextSize,
             replyTo: replyTo ?? undefined,
             albumId: albumId ?? undefined,
+            caption: meta.caption?.trim() || undefined,
           });
         } else if (kind === "video") {
           void sendPayload(id, {
@@ -2103,6 +2237,7 @@ export default function ChatScreen({ route, navigation }: Props) {
             size: prepared.plaintextSize,
             replyTo: replyTo ?? undefined,
             albumId: albumId ?? undefined,
+            caption: meta.caption?.trim() || undefined,
           });
         } else {
           void sendPayload(id, {
@@ -2452,7 +2587,17 @@ export default function ChatScreen({ route, navigation }: Props) {
     async (
       sourceUri: string,
       kind: AttachmentKind,
-      meta: { width?: number; height?: number; durationMs?: number; name?: string; mime?: string },
+      meta: {
+        width?: number;
+        height?: number;
+        durationMs?: number;
+        name?: string;
+        mime?: string;
+        // User-typed text from AttachmentCaptionModal — only ever set for
+        // image/video (see the modal's callers below); a "file" attachment
+        // has no preview/caption step.
+        caption?: string;
+      },
       replyToOverride?: ReplyTarget | null,
       albumId?: string | null
     ) => {
@@ -2482,7 +2627,8 @@ export default function ChatScreen({ route, navigation }: Props) {
           conversation_id: conversationId,
           direction: "outgoing",
           plaintext:
-            kind === "image" ? IMAGE_MESSAGE_LABEL : kind === "video" ? VIDEO_MESSAGE_LABEL : `📎 ${meta.name ?? "file"}`,
+            meta.caption?.trim() ||
+            (kind === "image" ? IMAGE_MESSAGE_LABEL : kind === "video" ? VIDEO_MESSAGE_LABEL : `📎 ${meta.name ?? "file"}`),
           sent_at: Date.now(),
           status: "pending",
           delivered_at: null,
@@ -2536,7 +2682,7 @@ export default function ChatScreen({ route, navigation }: Props) {
           id,
           plaintextUri,
           kind,
-          { width, height, durationMs: meta.durationMs, name: meta.name, mime: meta.mime },
+          { width, height, durationMs: meta.durationMs, name: meta.name, mime: meta.mime, caption: meta.caption },
           activeReply,
           albumId
         );
@@ -2559,11 +2705,15 @@ export default function ChatScreen({ route, navigation }: Props) {
       return;
     }
 
-    const result = await ImagePicker.launchCameraAsync({ mediaTypes: ["images"], quality: 0.9 });
+    // allowsEditing surfaces the OS's native crop UI right after the shot is
+    // taken — same picker option ProfilePhotoScreen already uses for avatars
+    // (just without forcing its [1, 1] aspect, since a chat photo shouldn't
+    // be locked to square).
+    const result = await ImagePicker.launchCameraAsync({ mediaTypes: ["images"], quality: 0.9, allowsEditing: true });
     if (result.canceled || !result.assets[0]) return;
     const asset = result.assets[0];
-    await sendAttachment(asset.uri, "image", { width: asset.width, height: asset.height });
-  }, [conversation, sendAttachment]);
+    setPendingCaptionAttachment({ uri: asset.uri, kind: "image", width: asset.width, height: asset.height });
+  }, [conversation]);
 
   // "+" attachment menu: Images/Video pick from the gallery via
   // expo-image-picker (already a dependency, and already supports video
@@ -2574,13 +2724,22 @@ export default function ChatScreen({ route, navigation }: Props) {
       if (!conversation) return;
 
       if (kind === "file") {
-        const result = await DocumentPicker.getDocumentAsync({ type: "audio/*" });
-        if (result.canceled || !result.assets[0]) return;
-        const asset = result.assets[0];
-        await sendAttachment(asset.uri, "file", {
-          name: asset.name,
-          mime: asset.mimeType ?? "application/octet-stream",
-        });
+        if (documentPickerActive) return;
+        documentPickerActive = true;
+        try {
+          const result = await pickDocumentWithTimeout({ type: "audio/*" });
+          if (result.canceled || !result.assets[0]) return;
+          const asset = result.assets[0];
+          await sendAttachment(asset.uri, "file", {
+            name: asset.name,
+            mime: asset.mimeType ?? "application/octet-stream",
+          });
+        } catch (err) {
+          console.warn("[chat] failed to pick audio file", err);
+          Alert.alert("Couldn't open picker", "Please try again.");
+        } finally {
+          documentPickerActive = false;
+        }
         return;
       }
 
@@ -2596,6 +2755,26 @@ export default function ChatScreen({ route, navigation }: Props) {
         orderedSelection: true,
       });
       if (result.canceled || result.assets.length === 0) return;
+
+      // A single picked image/video goes through the caption preview first
+      // (see AttachmentCaptionModal) rather than sending immediately — a
+      // multi-select batch still sends right away below: captioning would
+      // mean either one caption for the whole album (nowhere in AlbumGrid's
+      // UI to show it) or a per-photo captioning flow, neither of which this
+      // pass adds. replyingTo is deliberately left untouched here (only
+      // cleared once the modal's onSend actually fires) so cancelling the
+      // preview doesn't silently drop whatever the composer was replying to.
+      if (result.assets.length === 1) {
+        const asset = result.assets[0];
+        setPendingCaptionAttachment({
+          uri: asset.uri,
+          kind,
+          width: asset.width,
+          height: asset.height,
+          durationMs: kind === "video" ? (asset.duration ?? undefined) : undefined,
+        });
+        return;
+      }
 
       // A batch of 2+ shares one album id (see the album_id migration) so
       // ChatScreen can render them as a single WhatsApp-style grid bubble
@@ -2624,34 +2803,62 @@ export default function ChatScreen({ route, navigation }: Props) {
     [conversation, replyingTo, sendAttachment]
   );
 
+  // Confirms AttachmentCaptionModal — reads replyingTo fresh here (rather
+  // than at pick time) so cancelling the preview never touches it.
+  const sendPendingCaptionAttachment = useCallback(
+    (caption: string) => {
+      const pending = pendingCaptionAttachment;
+      if (!pending) return;
+      setPendingCaptionAttachment(null);
+      const activeReply = replyingTo;
+      setReplyingTo(null);
+      void sendAttachment(
+        pending.uri,
+        pending.kind,
+        { width: pending.width, height: pending.height, durationMs: pending.durationMs, caption },
+        activeReply
+      );
+    },
+    [pendingCaptionAttachment, replyingTo, sendAttachment]
+  );
+
   // Documents get their own picker (rather than reusing pickAndSendAttachment's
   // "file" branch, which is audio-only — see its DocumentPicker.getDocumentAsync
   // call above) so unsupported formats and oversized files can be rejected
   // up front, before ever creating a message bubble that's doomed to fail.
   const pickAndSendDocument = useCallback(async () => {
     if (!conversation) return;
-    const result = await DocumentPicker.getDocumentAsync({ type: DOCUMENT_PICKER_MIME_TYPES });
-    if (result.canceled || !result.assets[0]) return;
-    const asset = result.assets[0];
+    if (documentPickerActive) return;
+    documentPickerActive = true;
+    try {
+      const result = await pickDocumentWithTimeout({ type: DOCUMENT_PICKER_MIME_TYPES });
+      if (result.canceled || !result.assets[0]) return;
+      const asset = result.assets[0];
 
-    if (!isSupportedDocument(asset.mimeType, asset.name)) {
-      Alert.alert(
-        "Unsupported file type",
-        "Please choose a PDF, Word, Excel, PowerPoint, text, CSV, or RTF document."
-      );
-      return;
+      if (!isSupportedDocument(asset.mimeType, asset.name)) {
+        Alert.alert(
+          "Unsupported file type",
+          "Please choose a PDF, Word, Excel, PowerPoint, text, CSV, or RTF document."
+        );
+        return;
+      }
+
+      const maxBytes = maxBytesForChatMediaKind("file");
+      if (asset.size != null && asset.size > maxBytes) {
+        Alert.alert("File too large", `Documents can't be larger than ${Math.round(maxBytes / (1024 * 1024))} MB.`);
+        return;
+      }
+
+      await sendAttachment(asset.uri, "file", {
+        name: asset.name,
+        mime: asset.mimeType ?? "application/octet-stream",
+      });
+    } catch (err) {
+      console.warn("[chat] failed to pick document", err);
+      Alert.alert("Couldn't open picker", "Please try again.");
+    } finally {
+      documentPickerActive = false;
     }
-
-    const maxBytes = maxBytesForChatMediaKind("file");
-    if (asset.size != null && asset.size > maxBytes) {
-      Alert.alert("File too large", `Documents can't be larger than ${Math.round(maxBytes / (1024 * 1024))} MB.`);
-      return;
-    }
-
-    await sendAttachment(asset.uri, "file", {
-      name: asset.name,
-      mime: asset.mimeType ?? "application/octet-stream",
-    });
   }, [conversation, sendAttachment]);
 
   // Opens an already-local file/document in whatever app the OS offers for
@@ -3026,6 +3233,14 @@ export default function ChatScreen({ route, navigation }: Props) {
           </Pressable>
         ) : null}
 
+        {/* No wrapping Pressable here for "tap outside to dismiss the
+            keyboard" (unlike SettingsScreen/ContactsScreen/etc, which have
+            no scrollable container of their own) — a Pressable around this
+            FlatList competed with its own pan responder for scroll gestures
+            and broke dragging on blank list space. keyboardShouldPersistTaps
+            is left at its default ("never"), which already dismisses the
+            keyboard on tapping anywhere in the list that isn't a nested
+            touchable — no extra wrapper needed or wanted. */}
         <FlatList
           ref={listRef}
           style={styles.flex}
@@ -3061,6 +3276,22 @@ export default function ChatScreen({ route, navigation }: Props) {
               <View style={styles.loadingOlderContainer}>
                 <ActivityIndicator size="small" color={colors.textTertiary} />
               </View>
+            ) : !hasMoreOlderMessages && !isTestBot ? (
+              // !hasMoreOlderMessages means pagination has reached the actual
+              // start of the conversation (see loadOlderMessages) — same
+              // condition the "loading" spinner above uses, so this can only
+              // ever show once, at the true top, never partway through a
+              // long history. Skipped for the local test-bot conversation,
+              // which isn't actually a real E2E peer.
+              <Pressable
+                style={styles.encryptionNotice}
+                onPress={() => navigation.navigate("ContactInfo", { conversationId })}
+              >
+                <Ionicons name="lock-closed" size={12} color={colors.textSecondary} />
+                <Text style={styles.encryptionNoticeText}>
+                  Messages and calls here are end-to-end encrypted. Tap to view your verification key.
+                </Text>
+              </Pressable>
             ) : null
           }
           renderItem={({ item }) =>
@@ -3126,6 +3357,16 @@ export default function ChatScreen({ route, navigation }: Props) {
           }
         />
 
+      {showScrollToBottom ? (
+        <Pressable
+          style={[styles.scrollToBottomButton, { bottom: 72 + insets.bottom }]}
+          onPress={scrollToEndProgrammatically}
+          hitSlop={8}
+        >
+          <Ionicons name="chevron-down" size={22} color={colors.textSecondary} />
+        </Pressable>
+      ) : null}
+
       <MessageActionMenu
         visible={!!menu}
         anchor={menu?.anchor ?? null}
@@ -3147,6 +3388,14 @@ export default function ChatScreen({ route, navigation }: Props) {
         items={viewerGallery?.items ?? []}
         initialIndex={viewerGallery?.initialIndex ?? 0}
         onClose={() => setViewerGallery(null)}
+      />
+
+      <AttachmentCaptionModal
+        visible={!!pendingCaptionAttachment}
+        uri={pendingCaptionAttachment?.uri ?? null}
+        kind={pendingCaptionAttachment?.kind ?? null}
+        onCancel={() => setPendingCaptionAttachment(null)}
+        onSend={sendPendingCaptionAttachment}
       />
 
       {replyingTo ? (
@@ -3221,9 +3470,6 @@ export default function ChatScreen({ route, navigation }: Props) {
             >
               <Ionicons name="add-outline" size={24} color={colors.textSecondary} />
             </Pressable>
-            <Pressable style={styles.emojiButton} onPress={() => void pickImageFromCamera()} hitSlop={8}>
-              <Ionicons name="camera-outline" size={22} color={colors.textSecondary} />
-            </Pressable>
             <View style={styles.inputWrapper}>
               <TextInput
                 style={styles.input}
@@ -3249,6 +3495,13 @@ export default function ChatScreen({ route, navigation }: Props) {
                 </Pressable>
               ) : null}
             </View>
+            <Pressable
+              style={[styles.emojiButton, styles.cameraButton]}
+              onPress={() => void pickImageFromCamera()}
+              hitSlop={8}
+            >
+              <Ionicons name="camera-outline" size={22} color={colors.textSecondary} />
+            </Pressable>
           </>
         )}
 
@@ -3294,7 +3547,7 @@ const createStyles = (colors: ThemeColors) =>
     flex: { flex: 1, backgroundColor: colors.background },
     center: { flex: 1, alignItems: "center", justifyContent: "center" },
     missing: { color: colors.textTertiary },
-    headerTitleRow: { flexDirection: "row", alignItems: "center", gap: 10 },
+    headerTitleRow: { flexDirection: "row", flex: 1, justifyContent: "flex-start", alignItems: "center", gap: 10 },
     headerTitleRowPressed: { opacity: 0.6 },
     headerTextCol: { flexShrink: 1, maxWidth: 175, justifyContent: "center" },
     // 70% of the previous 17px size, per request.
@@ -3312,6 +3565,28 @@ const createStyles = (colors: ThemeColors) =>
       paddingVertical: 4,
       borderRadius: 10,
       overflow: "hidden",
+    },
+    // Same soft pill language as the date separator above, just wider (a
+    // fixed maxWidth so the sentence wraps to 2-3 lines instead of one long
+    // one) and with a leading lock icon, WhatsApp-notice-style.
+    encryptionNotice: {
+      flexDirection: "row",
+      alignItems: "center",
+      alignSelf: "center",
+      gap: 6,
+      maxWidth: "85%",
+      marginVertical: 10,
+      paddingHorizontal: 12,
+      paddingVertical: 8,
+      borderRadius: 12,
+      backgroundColor: "rgba(120,120,128,0.12)",
+    },
+    encryptionNoticeText: {
+      flex: 1,
+      fontSize: 12,
+      lineHeight: 16,
+      color: colors.textSecondary,
+      textAlign: "center",
     },
     bubbleRowSpaced: { marginBottom: 10 },
     bubbleRowTight: { marginBottom: 2 },
@@ -3349,12 +3624,10 @@ const createStyles = (colors: ThemeColors) =>
       alignItems: "center",
       justifyContent: "center",
     },
-    callBubbleIconOutgoing: { backgroundColor: "rgba(255,255,255,0.2)" },
     callBubbleIconIncoming: { backgroundColor: colors.accentSoft },
     callBubbleText: { gap: 2 },
     callBubbleLabelRow: { flexDirection: "row", alignItems: "center", gap: 5 },
     callBubbleLabel: { fontSize: 15 },
-    callMetaMissedOutgoing: { color: "rgba(255,214,214,0.95)" },
     callMetaMissedIncoming: { color: colors.danger },
     bubble: {
       maxWidth: "80%",
@@ -3368,12 +3641,34 @@ const createStyles = (colors: ThemeColors) =>
       elevation: 1,
       overflow: "hidden",
     },
+    // Photo/video/gif bubbles: much thinner frame than a text bubble's 14/8
+    // (sized for readable paragraph text) — that padding around an image
+    // just read as a thick band of bubble-color background.
+    mediaBubble: { paddingHorizontal: 3, paddingVertical: 3 },
     searchHighlightOverlay: {
       ...StyleSheet.absoluteFill,
       backgroundColor: "rgba(255, 213, 0, 0.35)",
     },
     outgoing: { alignSelf: "flex-end", backgroundColor: colors.accent, borderBottomRightRadius: 6 },
     incoming: { alignSelf: "flex-start", backgroundColor: colors.bubbleIncoming, borderBottomLeftRadius: 6 },
+    // Every non-text kind (see isFramedKind) uses this instead of the solid
+    // accent/gray fill above — a thin bordered frame around a neutral card
+    // color, same direction-independent surface for both sides since there's
+    // no more colored fill to distinguish outgoing from incoming by.
+    framedOutgoing: {
+      alignSelf: "flex-end",
+      backgroundColor: colors.surface,
+      borderWidth: 1,
+      borderColor: colors.border,
+      borderBottomRightRadius: 6,
+    },
+    framedIncoming: {
+      alignSelf: "flex-start",
+      backgroundColor: colors.surface,
+      borderWidth: 1,
+      borderColor: colors.border,
+      borderBottomLeftRadius: 6,
+    },
     outgoingGrouped: { borderBottomRightRadius: 20 },
     incomingGrouped: { borderBottomLeftRadius: 20 },
     reactionBadge: {
@@ -3396,6 +3691,10 @@ const createStyles = (colors: ThemeColors) =>
     reactionBadgeText: { fontSize: 13 },
     outgoingText: { color: "#fff", fontSize: 15.5 },
     incomingText: { color: colors.text, fontSize: 15.5 },
+    // mediaBubble shrank the bubble's own padding to almost nothing (see
+    // above) — without this, caption text would run right up against the
+    // bubble's rounded edge instead of keeping a readable inset.
+    mediaCaption: { marginTop: 6, paddingHorizontal: 8 },
     outgoingLinkText: { color: "#fff", fontSize: 15.5, textDecorationLine: "underline", fontWeight: "600" },
     incomingLinkText: { color: colors.accent, fontSize: 15.5, textDecorationLine: "underline" },
     gifAttribution: {
@@ -3426,6 +3725,8 @@ const createStyles = (colors: ThemeColors) =>
     headerTextButton: { paddingHorizontal: 4, paddingVertical: 4 },
     headerButtonLabel: { fontSize: 16, color: colors.accent },
     metaRow: { flexDirection: "row", alignItems: "center", justifyContent: "flex-end", marginTop: 4, gap: 4 },
+    // Same reasoning as mediaCaption — restores a bit of the inset mediaBubble removed.
+    mediaMetaRow: { paddingHorizontal: 8, paddingBottom: 2 },
     metaTextOutgoing: { fontSize: 11, color: "rgba(255,255,255,0.8)" },
     metaTextIncoming: { fontSize: 11, color: colors.textSecondary },
     replyBanner: {
@@ -3484,8 +3785,9 @@ const createStyles = (colors: ThemeColors) =>
     inputRow: {
       flexDirection: "row",
       alignItems: "flex-end",
-      padding: 8,
-      gap: 2,
+      paddingHorizontal: 4,
+      paddingVertical: 8,
+      gap: 0,
       backgroundColor: colors.surface,
       borderTopWidth: StyleSheet.hairlineWidth,
       borderTopColor: colors.border,
@@ -3512,11 +3814,15 @@ const createStyles = (colors: ThemeColors) =>
     requestBannerReject: { backgroundColor: colors.background, borderWidth: 1, borderColor: colors.border },
     requestBannerButtonText: { fontSize: 15, fontWeight: "600" },
     emojiButton: {
-      width: 34,
+      width: 28,
       height: 40,
       alignItems: "center",
       justifyContent: "center",
     },
+    // Nudges the camera button a bit further from the text input than the
+    // row's own tight 2px gap gives it — emojiButton is shared with other
+    // icon buttons in this row, so this stays a separate override.
+    cameraButton: { marginLeft: 6 },
     inputWrapper: {
       flex: 1,
       justifyContent: "center",
@@ -3551,6 +3857,22 @@ const createStyles = (colors: ThemeColors) =>
       borderRadius: 20,
       alignItems: "center",
       justifyContent: "center",
+    },
+    scrollToBottomButton: {
+      position: "absolute",
+      right: 12,
+      bottom: 12,
+      width: 36,
+      height: 36,
+      borderRadius: 18,
+      backgroundColor: colors.surface,
+      alignItems: "center",
+      justifyContent: "center",
+      shadowColor: "#000",
+      shadowOpacity: 0.15,
+      shadowRadius: 6,
+      shadowOffset: { width: 0, height: 2 },
+      elevation: 4,
     },
     micButton: {
       width: 40,

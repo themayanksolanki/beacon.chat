@@ -1,3 +1,4 @@
+import type { ReactNode } from "react";
 import { Text, type StyleProp, type TextStyle } from "react-native";
 
 import { openLink, splitIntoLinkSegments } from "../chat/linkify";
@@ -8,6 +9,13 @@ interface Props {
   style: StyleProp<TextStyle>;
   linkStyle?: StyleProp<TextStyle>;
   numberOfLines?: number;
+  // Rendered as a final nested <Text> child, in the same flowing paragraph
+  // as `text` — lets a trailing bit (e.g. ChatScreen's inline timestamp)
+  // share the last line with short text instead of always sitting on its
+  // own line below. Only makes sense as inline Text-compatible content
+  // (nested Text/icon-font components), same constraint nested Text always
+  // has in React Native.
+  trailing?: ReactNode;
 }
 
 /**
@@ -18,7 +26,7 @@ interface Props {
  * same regex at render time for every message, old or new, so link
  * recognition needs no migration or stored flag on the message itself.
  */
-export default function Linkify({ text, style, linkStyle, numberOfLines }: Props) {
+export default function Linkify({ text, style, linkStyle, numberOfLines, trailing }: Props) {
   const { colors } = useTheme();
   const segments = splitIntoLinkSegments(text);
 
@@ -26,6 +34,7 @@ export default function Linkify({ text, style, linkStyle, numberOfLines }: Props
     return (
       <Text style={style} numberOfLines={numberOfLines}>
         {text}
+        {trailing}
       </Text>
     );
   }
@@ -45,6 +54,7 @@ export default function Linkify({ text, style, linkStyle, numberOfLines }: Props
           <Text key={index}>{segment.text}</Text>
         )
       )}
+      {trailing}
     </Text>
   );
 }

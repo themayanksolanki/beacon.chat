@@ -259,6 +259,11 @@ export default function CallHistoryScreen({ navigation }: Props) {
   ]);
 
   return (
+    // No wrapping Pressable for "tap outside to dismiss" — it competed with
+    // the FlatList below for scroll gestures and broke dragging on blank
+    // list space. keyboardShouldPersistTaps defaults to "never", which
+    // already dismisses the keyboard on tapping anywhere in the list that
+    // isn't a nested touchable, with no extra wrapper needed.
     <View style={themedStyles.container}>
       {searchOpen ? (
         <View style={themedStyles.searchBar}>

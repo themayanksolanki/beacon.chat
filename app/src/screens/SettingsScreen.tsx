@@ -1,5 +1,5 @@
 import { useMemo, useState } from "react";
-import { Image, Pressable, StyleSheet, Text, TextInput, View } from "react-native";
+import { Image, Keyboard, Pressable, StyleSheet, Text, TextInput, View } from "react-native";
 import type { BottomTabScreenProps } from "@react-navigation/bottom-tabs";
 import type { CompositeScreenProps } from "@react-navigation/native";
 import type { NativeStackScreenProps } from "@react-navigation/native-stack";
@@ -36,7 +36,11 @@ export default function SettingsScreen({ navigation }: Props) {
   const noResults = query.length > 0 && !showProfile && !showAppearance && !showAccount && !showBlockedUsers;
 
   return (
-    <View style={styles.container}>
+    // Dismisses the keyboard (and blurs the search input) on a tap that
+    // doesn't land on anything else — nested Pressables/the TextInput itself
+    // claim the touch before it ever reaches this one, same pattern as
+    // ChatScreen's composer.
+    <Pressable style={styles.container} onPress={() => Keyboard.dismiss()}>
       <View style={styles.searchBar}>
         <Ionicons name="search" size={16} color={colors.textTertiary} />
         <TextInput
@@ -135,7 +139,7 @@ export default function SettingsScreen({ navigation }: Props) {
           ) : null}
         </>
       )}
-    </View>
+    </Pressable>
   );
 }
 
@@ -158,11 +162,20 @@ const createStyles = (colors: ThemeColors) =>
       borderColor: colors.border,
     },
     searchInput: { flex: 1, fontSize: 15, color: colors.text, padding: 0 },
+    // Same floating-card treatment as ContactInfoScreen's grouped sections —
+    // inset from the screen edges with rounded corners and a subtle shadow,
+    // instead of the old edge-to-edge banded look.
     section: {
       backgroundColor: colors.surface,
-      borderTopWidth: StyleSheet.hairlineWidth,
-      borderBottomWidth: StyleSheet.hairlineWidth,
-      borderColor: colors.border,
+      marginHorizontal: 16,
+      marginBottom: 4,
+      borderRadius: 16,
+      overflow: "hidden",
+      shadowColor: "#000",
+      shadowOffset: { width: 0, height: 1 },
+      shadowOpacity: 0.05,
+      shadowRadius: 3,
+      elevation: 1,
     },
     sectionHeader: {
       fontSize: 13,

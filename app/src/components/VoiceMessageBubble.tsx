@@ -27,7 +27,6 @@ interface Props {
   audioUri: string | null;
   durationMs: number;
   waveform: number[];
-  isOutgoing: boolean;
   /** Forwarded to this Pressable directly rather than relying on bubbling to
    * a parent Pressable — a long-press starting here claims the touch
    * responder itself (it's the deepest Pressable), so without this the
@@ -36,7 +35,7 @@ interface Props {
   onLongPress?: () => void;
 }
 
-export default function VoiceMessageBubble({ audioUri, durationMs, waveform, isOutgoing, onLongPress }: Props) {
+export default function VoiceMessageBubble({ audioUri, durationMs, waveform, onLongPress }: Props) {
   const { colors } = useTheme();
   const styles = useMemo(() => createStyles(colors), [colors]);
   const player = useAudioPlayer(audioUri ? { uri: audioUri } : null);
@@ -59,8 +58,11 @@ export default function VoiceMessageBubble({ audioUri, durationMs, waveform, isO
     player.play();
   };
 
-  const playedColor = isOutgoing ? "rgba(255,255,255,0.9)" : colors.accent;
-  const unplayedColor = isOutgoing ? "rgba(255,255,255,0.4)" : colors.textTertiary;
+  // No more outgoing/incoming distinction — this renders inside
+  // MessageBubble's framed (bordered, no solid fill) bubble now, the same
+  // neutral surface for both directions.
+  const playedColor = colors.accent;
+  const unplayedColor = colors.textTertiary;
 
   return (
     <Pressable
@@ -69,7 +71,7 @@ export default function VoiceMessageBubble({ audioUri, durationMs, waveform, isO
       onLongPress={onLongPress}
       disabled={!audioUri && !onLongPress}
     >
-      <Ionicons name={status.playing ? "pause-circle" : "play-circle"} size={30} color={isOutgoing ? "#fff" : colors.accent} />
+      <Ionicons name={status.playing ? "pause-circle" : "play-circle"} size={30} color={colors.accent} />
       <View style={styles.waveform}>
         {waveform.map((amplitude, index) => (
           <View
@@ -84,10 +86,7 @@ export default function VoiceMessageBubble({ audioUri, durationMs, waveform, isO
           />
         ))}
       </View>
-      <Text
-        style={[styles.duration, isOutgoing ? styles.durationOutgoing : styles.durationIncoming]}
-        numberOfLines={1}
-      >
+      <Text style={styles.duration} numberOfLines={1}>
         {formatDuration(displaySeconds)}
       </Text>
     </Pressable>
@@ -106,7 +105,11 @@ const createStyles = (colors: ThemeColors) =>
       overflow: "hidden",
     },
     bar: { width: BAR_WIDTH, borderRadius: BAR_WIDTH / 2 },
-    duration: { fontSize: 11, width: DURATION_WIDTH, textAlign: "right", fontVariant: ["tabular-nums"] },
-    durationOutgoing: { color: "rgba(255,255,255,0.8)" },
-    durationIncoming: { color: colors.textSecondary },
+    duration: {
+      fontSize: 11,
+      width: DURATION_WIDTH,
+      textAlign: "right",
+      fontVariant: ["tabular-nums"],
+      color: colors.textSecondary,
+    },
   });

@@ -19,6 +19,7 @@ import {
   MediaStreamTrack,
   RTCIceCandidate,
   RTCPeerConnection,
+  RTCRtpSender,
   RTCSessionDescription,
 } from "react-native-webrtc";
 
@@ -169,6 +170,12 @@ interface CallContextValue {
   isSpeakerOn: boolean;
   isCameraOff: boolean;
   isRemoteCameraOff: boolean;
+  // True while our outgoing video is a screen capture rather than the
+  // camera — same underlying video sender/m-line, just a different source
+  // track (see toggleScreenShare), so this is tracked independently of
+  // isCameraOff rather than as a kind of camera state.
+  isScreenSharing: boolean;
+  isRemoteScreenSharing: boolean;
   // True while the front camera is active — used to mirror the local
   // preview (feels like a real mirror) without mirroring the back camera
   // (which should show the true, unflipped scene, same as what the peer
@@ -188,6 +195,7 @@ interface CallContextValue {
   toggleSpeaker: () => void;
   toggleCamera: () => void;
   switchCamera: () => void;
+  toggleScreenShare: () => Promise<void>;
 }
 
 const CallContext = createContext<CallContextValue | null>(null);
@@ -204,12 +212,27 @@ export function CallProvider({ children }: { children: ReactNode }) {
   const [isSpeakerOn, setIsSpeakerOn] = useState(false);
   const [isCameraOff, setIsCameraOff] = useState(false);
   const [isRemoteCameraOff, setIsRemoteCameraOff] = useState(false);
+  const [isScreenSharing, setIsScreenSharing] = useState(false);
+  const [isRemoteScreenSharing, setIsRemoteScreenSharing] = useState(false);
   const [isFrontCamera, setIsFrontCamera] = useState(true);
   const [callDurationSec, setCallDurationSec] = useState(0);
   const [isSystemInterrupted, setIsSystemInterrupted] = useState(false);
 
   const peerConnectionRef = useRef<RTCPeerConnection | null>(null);
   const localStreamRef = useRef<MediaStream | null>(null);
+  // The RTCRtpSender carrying our outgoing video, captured whenever a video
+  // track is first added (initial call setup or toggleCamera's addTrack
+  // branch) — screen sharing swaps its track via replaceTrack rather than
+  // hunting for "the video sender" by track identity each time, since a
+  // sender's .track goes null/changes exactly when this is used.
+  const videoSenderRef = useRef<RTCRtpSender | null>(null);
+  // Holds the getDisplayMedia() stream while screen sharing is active, so
+  // its track(s) can be stopped when sharing ends (replaceTrack alone
+  // doesn't release the underlying capturer).
+  const screenStreamRef = useRef<MediaStream | null>(null);
+  // Guards toggleScreenShare against a second tap landing while the first
+  // getDisplayMedia()/replaceTrack call is still in flight.
+  const screenShareTogglingRef = useRef(false);
   // Fallback accumulator for the remote track handler below — only used
   // when a "track" event arrives with an empty event.streams (a known
   // react-native-webrtc Android gap). Tracks every remote track seen so far;
@@ -391,6 +414,10 @@ export function CallProvider({ children }: { children: ReactNode }) {
     peerConnectionRef.current = null;
     localStreamRef.current?.getTracks().forEach((t) => t.stop());
     localStreamRef.current = null;
+    videoSenderRef.current = null;
+    screenStreamRef.current?.getTracks().forEach((t) => t.stop());
+    screenStreamRef.current = null;
+    screenShareTogglingRef.current = false;
     remoteStreamAccumulatorRef.current?.release(false);
     remoteStreamAccumulatorRef.current = null;
     remoteTracksRef.current = [];
@@ -411,6 +438,8 @@ export function CallProvider({ children }: { children: ReactNode }) {
     setIsSpeakerOn(false);
     setIsCameraOff(true);
     setIsRemoteCameraOff(true);
+    setIsScreenSharing(false);
+    setIsRemoteScreenSharing(false);
     setIsFrontCamera(true);
     setCallDurationSec(0);
     setCall(null);
@@ -728,7 +757,10 @@ export function CallProvider({ children }: { children: ReactNode }) {
           return;
         }
 
-        localStream.getTracks().forEach((track) => pc.addTrack(track, localStream));
+        localStream.getTracks().forEach((track) => {
+          const sender = pc.addTrack(track, localStream);
+          if (track.kind === "video") videoSenderRef.current = sender;
+        });
 
         const offer = await pc.createOffer();
         await pc.setLocalDescription(offer);
@@ -984,7 +1016,10 @@ export function CallProvider({ children }: { children: ReactNode }) {
         return;
       }
 
-      localStream.getTracks().forEach((track) => pc.addTrack(track, localStream));
+      localStream.getTracks().forEach((track) => {
+        const sender = pc.addTrack(track, localStream);
+        if (track.kind === "video") videoSenderRef.current = sender;
+      });
 
       await pc.setRemoteDescription(new RTCSessionDescription(invite.sdp));
       remoteDescriptionSetRef.current = true;
@@ -1071,6 +1106,11 @@ export function CallProvider({ children }: { children: ReactNode }) {
   const handleRemoteCameraState = useCallback((payload: { callId: string; cameraOn: boolean }) => {
     if (callRef.current?.callId !== payload.callId) return;
     setIsRemoteCameraOff(!payload.cameraOn);
+  }, []);
+
+  const handleRemoteScreenShareState = useCallback((payload: { callId: string; sharing: boolean }) => {
+    if (callRef.current?.callId !== payload.callId) return;
+    setIsRemoteScreenSharing(payload.sharing);
   }, []);
 
   const handleRemoteMuteState = useCallback((payload: { callId: string; muted: boolean }) => {
@@ -1227,6 +1267,7 @@ export function CallProvider({ children }: { children: ReactNode }) {
     socket.on("call:ice-candidate", handleRemoteIceCandidate);
     socket.on("call:end", handleRemoteEnd);
     socket.on("call:camera-state", handleRemoteCameraState);
+    socket.on("call:screen-share-state", handleRemoteScreenShareState);
     socket.on("call:mute-state", handleRemoteMuteState);
     socket.on("call:renegotiate-offer", handleRenegotiateOffer);
     socket.on("call:renegotiate-answer", handleRenegotiateAnswer);
@@ -1238,6 +1279,7 @@ export function CallProvider({ children }: { children: ReactNode }) {
       socket.off("call:ice-candidate", handleRemoteIceCandidate);
       socket.off("call:end", handleRemoteEnd);
       socket.off("call:camera-state", handleRemoteCameraState);
+      socket.off("call:screen-share-state", handleRemoteScreenShareState);
       socket.off("call:mute-state", handleRemoteMuteState);
       socket.off("call:renegotiate-offer", handleRenegotiateOffer);
       socket.off("call:renegotiate-answer", handleRenegotiateAnswer);
@@ -1251,6 +1293,7 @@ export function CallProvider({ children }: { children: ReactNode }) {
     handleRemoteIceCandidate,
     handleRemoteEnd,
     handleRemoteCameraState,
+    handleRemoteScreenShareState,
     handleRemoteMuteState,
     handleRenegotiateOffer,
     handleRenegotiateAnswer,
@@ -1426,7 +1469,7 @@ export function CallProvider({ children }: { children: ReactNode }) {
       const videoTrack = videoStream.getVideoTracks()[0];
       if (!videoTrack) throw new Error("no video track from getUserMedia");
       localStream.addTrack(videoTrack);
-      pc.addTrack(videoTrack, localStream);
+      videoSenderRef.current = pc.addTrack(videoTrack, localStream);
 
       const offer = await pc.createOffer();
       await pc.setLocalDescription(offer);
@@ -1459,6 +1502,104 @@ export function CallProvider({ children }: { children: ReactNode }) {
     setIsFrontCamera((prev) => !prev);
   }, []);
 
+  const emitScreenShareState = useCallback((sharing: boolean) => {
+    const callId = callRef.current?.callId;
+    if (!callId) return;
+    getSocket().emit("call:screen-share-state", { callId, sharing });
+  }, []);
+
+  // Restores the video sender back to the camera track (or to nothing, if
+  // the call never had one) and releases the capture stream — shared by the
+  // manual "stop sharing" tap and the capture track's own "ended" event
+  // (fired when the user stops the broadcast from the OS's UI/status bar
+  // instead of ours).
+  const stopScreenShare = useCallback(async () => {
+    const cameraTrack = localStreamRef.current?.getVideoTracks()[0] ?? null;
+    try {
+      if (videoSenderRef.current) await videoSenderRef.current.replaceTrack(cameraTrack);
+    } catch (err) {
+      console.warn("[call] failed to restore camera track after screen share", err);
+    }
+    screenStreamRef.current?.getTracks().forEach((t) => t.stop());
+    screenStreamRef.current = null;
+    setIsScreenSharing(false);
+    emitScreenShareState(false);
+  }, [emitScreenShareState]);
+
+  // Screen sharing swaps the outgoing video sender's track between the
+  // camera and a getDisplayMedia() capture rather than adding a second video
+  // m-line — one video sender per call, whichever source is currently live.
+  // Once that sender already exists, replaceTrack() is negotiation-free (no
+  // SDP round-trip, unlike toggleCamera's very first addTrack), so starting/
+  // stopping a share mid-call never re-triggers negotiationneeded. The
+  // original camera track is never removed from localStreamRef's stream —
+  // just no longer attached to the sender while sharing — so stopping a
+  // share can restore it (and whatever mute/off state it was already in)
+  // via stopScreenShare instead of re-acquiring the camera.
+  const toggleScreenShare = useCallback(async () => {
+    const pc = peerConnectionRef.current;
+    const callId = callRef.current?.callId;
+    if (!pc || !callId || screenShareTogglingRef.current) return;
+    screenShareTogglingRef.current = true;
+
+    try {
+      if (isScreenSharing) {
+        await stopScreenShare();
+        return;
+      }
+
+      const screenStream = await mediaDevices.getDisplayMedia();
+      const screenTrack = screenStream.getVideoTracks()[0];
+      if (!screenTrack) throw new Error("no video track from getDisplayMedia");
+
+      // Re-checked after the getDisplayMedia await (the user could pick
+      // "Cancel" and take a while doing it, or hang up entirely) — same
+      // stale-attempt guard used throughout this file.
+      if (callRef.current?.callId !== callId) {
+        screenStream.getTracks().forEach((t) => t.stop());
+        return;
+      }
+
+      if (videoSenderRef.current) {
+        await videoSenderRef.current.replaceTrack(screenTrack);
+      } else {
+        // Audio-only call with no video sender yet — same addTrack +
+        // renegotiate dance as toggleCamera's first-time-video branch.
+        videoSenderRef.current = pc.addTrack(screenTrack, screenStream);
+        const offer = await pc.createOffer();
+        await pc.setLocalDescription(offer);
+        getSocket().emit("call:renegotiate-offer", {
+          callId,
+          sdp: pc.localDescription!.toJSON(),
+          kind: "video",
+        });
+        setCall((prev) => (prev ? { ...prev, kind: "video" } : prev));
+      }
+
+      screenStreamRef.current = screenStream;
+      setIsScreenSharing(true);
+      emitScreenShareState(true);
+
+      // The extension/OS can end the broadcast out from under us (user taps
+      // "Stop Broadcast" in the system UI/status bar rather than our own
+      // button) — react-native-webrtc still surfaces that as the capture
+      // track ending, same as any other track's "ended" event. Cast around
+      // the same event-target-shim typing gap as the pc addEventListener
+      // calls above (addEventListener works fine at runtime).
+      (screenTrack as unknown as { addEventListener(type: "ended", listener: () => void): void }).addEventListener(
+        "ended",
+        () => {
+          if (screenStreamRef.current !== screenStream) return;
+          void stopScreenShare();
+        }
+      );
+    } catch (err) {
+      console.warn("[call] failed to toggle screen share", err);
+    } finally {
+      screenShareTogglingRef.current = false;
+    }
+  }, [emitScreenShareState, isScreenSharing, stopScreenShare]);
+
   const value = useMemo<CallContextValue>(
     () => ({
       phase,
@@ -1470,6 +1611,8 @@ export function CallProvider({ children }: { children: ReactNode }) {
       isSpeakerOn,
       isCameraOff,
       isRemoteCameraOff,
+      isScreenSharing,
+      isRemoteScreenSharing,
       isFrontCamera,
       callDurationSec,
       isSystemInterrupted,
@@ -1481,6 +1624,7 @@ export function CallProvider({ children }: { children: ReactNode }) {
       toggleSpeaker,
       toggleCamera,
       switchCamera,
+      toggleScreenShare,
     }),
     [
       phase,
@@ -1492,6 +1636,8 @@ export function CallProvider({ children }: { children: ReactNode }) {
       isSpeakerOn,
       isCameraOff,
       isRemoteCameraOff,
+      isScreenSharing,
+      isRemoteScreenSharing,
       isFrontCamera,
       callDurationSec,
       isSystemInterrupted,
@@ -1503,6 +1649,7 @@ export function CallProvider({ children }: { children: ReactNode }) {
       toggleSpeaker,
       toggleCamera,
       switchCamera,
+      toggleScreenShare,
     ]
   );
 

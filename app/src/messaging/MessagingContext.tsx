@@ -80,6 +80,9 @@ export type MessagePayload =
       // grid bubble the sender sees — see the album_id column/MessageRow field.
       albumId?: string;
       forwarded?: boolean;
+      // User-typed caption from AttachmentCaptionModal — only offered for a
+      // single (non-batch) image, so this and albumId are never both set.
+      caption?: string;
     }
   | { kind: "gif"; url: string; width: number; height: number; replyTo?: ReplyRef; forwarded?: boolean }
   | {
@@ -94,6 +97,7 @@ export type MessagePayload =
       replyTo?: ReplyRef;
       albumId?: string;
       forwarded?: boolean;
+      caption?: string;
     }
   | {
       kind: "file";
@@ -177,8 +181,9 @@ export function MessagingProvider({ children }: { children: ReactNode }) {
 
     // Catches the notification that launched the app (cold start); warm/
     // background taps are caught by the listener below instead.
-    const coldStartPayload = consumeLastNotificationResponse();
-    if (coldStartPayload) handleTap(coldStartPayload);
+    void consumeLastNotificationResponse().then((coldStartPayload) => {
+      if (coldStartPayload) handleTap(coldStartPayload);
+    });
 
     const subscription = addNotificationTapListener(handleTap);
     return () => subscription.remove();
@@ -294,11 +299,11 @@ export function MessagingProvider({ children }: { children: ReactNode }) {
             payload.kind === "voice"
               ? VOICE_MESSAGE_LABEL
               : payload.kind === "image"
-                ? IMAGE_MESSAGE_LABEL
+                ? (payload.transport === "s3" ? payload.caption?.trim() : undefined) || IMAGE_MESSAGE_LABEL
                 : payload.kind === "gif"
                   ? GIF_MESSAGE_LABEL
                   : payload.kind === "video"
-                    ? VIDEO_MESSAGE_LABEL
+                    ? payload.caption?.trim() || VIDEO_MESSAGE_LABEL
                     : payload.kind === "file"
                       ? `📎 ${payload.name}`
                       : payload.text,
@@ -362,6 +367,7 @@ export function MessagingProvider({ children }: { children: ReactNode }) {
           conversationId: message.sender_id,
           senderId: message.sender_id,
           senderName: conversation.display_name ?? "Unknown",
+          senderAvatarUrl: conversation.avatar_url,
           messageId: message.id,
           messagePreview: row.plaintext,
           timestamp: message.created_at,

@@ -187,6 +187,11 @@ export default function ContactsScreen({ navigation }: Props) {
       style={styles.flex}
       behavior={Platform.OS === "ios" ? "padding" : "height"}
     >
+    {/* No wrapping Pressable for "tap outside to dismiss" — it competed with
+        this FlatList for scroll gestures and broke dragging on blank list
+        space. keyboardShouldPersistTaps="handled" below already dismisses
+        the keyboard on tapping anywhere in the list that isn't a nested
+        touchable, with no extra wrapper needed. */}
     <FlatList
       data={contacts ?? []}
       keyExtractor={(item) => item.id}

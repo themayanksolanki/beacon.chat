@@ -107,11 +107,19 @@ export default function BlockedUsersScreen({}: Props) {
 const createStyles = (colors: ThemeColors) =>
   StyleSheet.create({
     container: { flex: 1, backgroundColor: colors.background, paddingTop: 20 },
+    // Same floating-card treatment as ContactInfoScreen/SettingsScreen's
+    // grouped sections — inset with rounded corners and a subtle shadow,
+    // instead of the old edge-to-edge banded look.
     section: {
       backgroundColor: colors.surface,
-      borderTopWidth: StyleSheet.hairlineWidth,
-      borderBottomWidth: StyleSheet.hairlineWidth,
-      borderColor: colors.border,
+      marginHorizontal: 16,
+      borderRadius: 16,
+      overflow: "hidden",
+      shadowColor: "#000",
+      shadowOffset: { width: 0, height: 1 },
+      shadowOpacity: 0.05,
+      shadowRadius: 3,
+      elevation: 1,
     },
     sectionHeader: {
       fontSize: 13,

@@ -1,5 +1,5 @@
-import { useEffect, useMemo, useRef } from "react";
-import { Animated, Dimensions, Modal, Pressable, StyleSheet, Text, View } from "react-native";
+import { useCallback, useEffect, useMemo, useRef } from "react";
+import { Animated, Dimensions, Modal, Platform, Pressable, StyleSheet, Text, View } from "react-native";
 import { Ionicons } from "@expo/vector-icons";
 
 import { useTheme } from "../ThemeContext";
@@ -48,6 +48,21 @@ export default function AttachmentSheet({
   const styles = useMemo(() => createStyles(colors), [colors]);
   const opacity = useRef(new Animated.Value(0)).current;
   const scale = useRef(new Animated.Value(0.92)).current;
+  // On iOS, presenting a native picker (esp. UIDocumentPickerViewController)
+  // at the same instant this Modal starts dismissing can race for the view
+  // controller hierarchy and leave the picker's promise never resolving —
+  // worse when iOS stacks its own Face ID re-auth overlay on top (e.g. for
+  // a Face ID-locked Photos app). So on iOS, defer the picker until this
+  // Modal's onDismiss fires (its dismissal animation has actually finished)
+  // instead of firing both at once. Android's Modal doesn't call onDismiss
+  // reliably, but it isn't affected by this race, so it keeps firing immediately.
+  const pendingActionRef = useRef<(() => void) | null>(null);
+
+  const handleDismiss = useCallback(() => {
+    const action = pendingActionRef.current;
+    pendingActionRef.current = null;
+    action?.();
+  }, []);
 
   useEffect(() => {
     if (!visible) return;
@@ -76,7 +91,7 @@ export default function AttachmentSheet({
   ];
 
   return (
-    <Modal visible={visible} transparent animationType="fade" onRequestClose={onClose}>
+    <Modal visible={visible} transparent animationType="fade" onRequestClose={onClose} onDismiss={handleDismiss}>
       <Pressable style={styles.backdrop} onPress={onClose}>
         <Animated.View style={[styles.menuWrap, { bottom, left, opacity, transform: [{ scale }] }]}>
           <Pressable style={styles.card} onPress={(e) => e.stopPropagation()}>
@@ -85,8 +100,13 @@ export default function AttachmentSheet({
                 key={row.label}
                 style={styles.item}
                 onPress={() => {
-                  row.onPress();
-                  onClose();
+                  if (Platform.OS === "ios") {
+                    pendingActionRef.current = row.onPress;
+                    onClose();
+                  } else {
+                    row.onPress();
+                    onClose();
+                  }
                 }}
               >
                 <View style={styles.iconBackground}>

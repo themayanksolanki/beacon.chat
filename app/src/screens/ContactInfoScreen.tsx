@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { Alert, Image, Pressable, StyleSheet, Text, View } from "react-native";
+import { Alert, Image, Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
 import { useFocusEffect } from "@react-navigation/native";
 import type { NativeStackScreenProps } from "@react-navigation/native-stack";
 import { Ionicons, MaterialCommunityIcons } from "@expo/vector-icons";
@@ -35,6 +35,18 @@ function formatFingerprint(key: string): string {
   return key.replace(/[^a-zA-Z0-9]/g, "").match(/.{1,4}/g)?.join(" ") ?? key;
 }
 
+// Same chunk count/shape as formatFingerprint's output, so hiding it doesn't
+// change the row's layout width when it's later revealed.
+function maskFingerprint(key: string): string {
+  return (
+    key
+      .replace(/[^a-zA-Z0-9]/g, "")
+      .match(/.{1,4}/g)
+      ?.map(() => "••••")
+      .join(" ") ?? "••••"
+  );
+}
+
 function formatMemberSince(ts: number): string {
   return new Date(ts).toLocaleDateString(undefined, { month: "long", day: "numeric", year: "numeric" });
 }
@@ -56,6 +68,7 @@ export default function ContactInfoScreen({ route, navigation }: Props) {
   const [mediaCount, setMediaCount] = useState(() => getMediaMessages(conversationId).length);
   const [docsCount, setDocsCount] = useState(() => getFileMessages(conversationId).length);
   const [linksCount, setLinksCount] = useState(() => countLinks(conversationId));
+  const [showFingerprint, setShowFingerprint] = useState(false);
   useFocusEffect(
     useCallback(() => {
       setMediaCount(getMediaMessages(conversationId).length);
@@ -106,6 +119,10 @@ export default function ContactInfoScreen({ route, navigation }: Props) {
   const copyFingerprint = async () => {
     await Clipboard.setStringAsync(conversation.peer_public_key);
     Alert.alert("Copied", "Encryption key copied to clipboard.");
+  };
+
+  const confirmComingSoonPay = () => {
+    Alert.alert("Coming soon", "UPI payments are coming soon.");
   };
 
   const confirmClearChat = () => {
@@ -183,8 +200,11 @@ export default function ContactInfoScreen({ route, navigation }: Props) {
   };
 
   return (
-    <View style={styles.container}>
-      <View style={styles.section}>
+    <ScrollView style={styles.container} contentContainerStyle={styles.scrollContent}>
+      {/* Plain, not a card like the grouped sections below — this is the
+          identity header, not a "group of settings," so it sits directly on
+          the screen background instead of floating in its own surface. */}
+      <View style={styles.profileSection}>
         <View style={styles.profile}>
           {conversation.avatar_url ? (
             <Image source={{ uri: conversation.avatar_url }} style={styles.avatar} />
@@ -221,32 +241,10 @@ export default function ContactInfoScreen({ route, navigation }: Props) {
             <Ionicons name="search" size={20} color={colors.accent} />
             <Text style={styles.actionLabel}>Search</Text>
           </Pressable>
-        </View>
-      </View>
-
-      <View style={styles.section}>
-        <Text style={styles.sectionTitle}>Encryption</Text>
-        <Pressable style={styles.row} onPress={copyFingerprint}>
-          <View style={styles.info}>
-            <Text style={styles.rowLabel}>Verification key</Text>
-            <Text style={styles.fingerprint} numberOfLines={2}>
-              {formatFingerprint(conversation.peer_public_key)}
-            </Text>
-          </View>
-          <Ionicons name="copy-outline" size={18} color={colors.textTertiary} />
-        </Pressable>
-      </View>
-
-      <View style={styles.section}>
-        {conversation.contact_number ? (
-          <View style={styles.row}>
-            <Text style={styles.rowLabel}>Contact number</Text>
-            <Text style={styles.rowValue}>{conversation.contact_number}</Text>
-          </View>
-        ) : null}
-        <View style={styles.row}>
-          <Text style={styles.rowLabel}>In Beacon since</Text>
-          <Text style={styles.rowValue}>{formatMemberSince(peerCreatedAt ?? conversation.created_at)}</Text>
+          <Pressable style={styles.actionButton} onPress={confirmComingSoonPay}>
+            <MaterialCommunityIcons name="currency-inr" size={20} color={colors.accent} />
+            <Text style={styles.actionLabel}>Pay</Text>
+          </Pressable>
         </View>
       </View>
 
@@ -262,6 +260,41 @@ export default function ContactInfoScreen({ route, navigation }: Props) {
           </View>
         </Pressable>
       </View>
+
+      <View style={styles.section}>
+        <View style={styles.sectionTitleRow}>
+          <Ionicons name="lock-closed" size={11} color={colors.textSecondary} />
+          <Text style={styles.sectionTitle}>Encryption</Text>
+        </View>
+        <Pressable style={styles.row} onPress={() => setShowFingerprint((prev) => !prev)}>
+          <View style={styles.info}>
+            <Text style={styles.rowLabel}>Verification key</Text>
+            <Text style={styles.fingerprint} numberOfLines={2}>
+              {showFingerprint
+                ? formatFingerprint(conversation.peer_public_key)
+                : maskFingerprint(conversation.peer_public_key)}
+            </Text>
+          </View>
+          <Pressable
+            onPress={(e) => {
+              e.stopPropagation();
+              void copyFingerprint();
+            }}
+            hitSlop={8}
+          >
+            <Ionicons name="copy-outline" size={18} color={colors.textTertiary} />
+          </Pressable>
+        </Pressable>
+      </View>
+
+      {conversation.contact_number ? (
+        <View style={styles.section}>
+          <View style={styles.row}>
+            <Text style={styles.rowLabel}>Contact number</Text>
+            <Text style={styles.rowValue}>{conversation.contact_number}</Text>
+          </View>
+        </View>
+      ) : null}
 
       {/* Clear Chat gets its own container, separate from the account-level
           actions below — it's a lighter-weight, non-destructive-to-the-
@@ -295,44 +328,91 @@ export default function ContactInfoScreen({ route, navigation }: Props) {
           <Text style={[styles.optionLabel, { color: colors.text }]}>Remove User</Text>
         </Pressable>
       </View>
-    </View>
+
+      <View style={styles.section}>
+        <View style={styles.row}>
+          <Text style={styles.rowLabel}>In Beacon since</Text>
+          <Text style={styles.rowValue}>{formatMemberSince(peerCreatedAt ?? conversation.created_at)}</Text>
+        </View>
+      </View>
+    </ScrollView>
   );
 }
 
 const createStyles = (colors: ThemeColors) =>
   StyleSheet.create({
-    container: { flex: 1, backgroundColor: colors.background, paddingTop: 20 },
+    container: { flex: 1, backgroundColor: colors.background },
+    scrollContent: { paddingTop: 20, paddingBottom: 32 },
+    // Grouped rows below (encryption, contact details, media, chat/account
+    // actions) each get their own floating card — inset from the screen
+    // edges with rounded corners, instead of the old edge-to-edge banded
+    // sections — while the profile header above stays plain (see
+    // profileSection).
     section: {
       backgroundColor: colors.surface,
-      marginBottom: 24,
-      borderTopWidth: StyleSheet.hairlineWidth,
-      borderBottomWidth: StyleSheet.hairlineWidth,
-      borderColor: colors.border,
+      marginHorizontal: 16,
+      marginBottom: 20,
+      borderRadius: 16,
+      overflow: "hidden",
+      shadowColor: "#000",
+      shadowOffset: { width: 0, height: 1 },
+      shadowOpacity: 0.05,
+      shadowRadius: 3,
+      elevation: 1,
     },
+    // Deliberately not a card like `section` above — this is the identity
+    // header (who this is), not a group of settings rows, so it sits
+    // directly on the screen background.
+    profileSection: { marginBottom: 20 },
     profile: { alignItems: "center", paddingVertical: 24, paddingHorizontal: 0, },
     avatar: { width: 88, height: 88, borderRadius: 44, alignItems: "center", justifyContent: "center" },
     avatarInitial: { fontSize: 32, fontWeight: "700", color: "#fff" },
     name: { fontSize: 20, fontWeight: "600", color: colors.text, marginTop: 6 },
-    status: { fontSize: 13, color: colors.textSecondary },
+    // Brighter than the usual textSecondary dim gray — now that this sits
+    // directly on the plain screen background instead of a card surface, the
+    // old secondary tone read too faint next to the name above it.
+    status: { fontSize: 13, color: colors.text },
     actionsRow: {
       flexDirection: "row",
       justifyContent: "center",
-      gap: 32,
+      gap: 16,
       paddingBottom: 20,
       borderTopWidth: StyleSheet.hairlineWidth,
       borderTopColor: colors.border,
       paddingTop: 16,
     },
-    actionButton: { alignItems: "center", gap: 6 },
+    // Same rounded-corner radius and shadow as the grouped cards below
+    // (`section`) — Audio/Video/Search read as small versions of the same
+    // card language rather than bare icon+label pairs floating on the
+    // screen background.
+    actionButton: {
+      alignItems: "center",
+      gap: 6,
+      minWidth: 76,
+      paddingHorizontal: 16,
+      paddingVertical: 12,
+      borderRadius: 16,
+      backgroundColor: colors.surface,
+      shadowColor: "#000",
+      shadowOffset: { width: 0, height: 1 },
+      shadowOpacity: 0.05,
+      shadowRadius: 3,
+      elevation: 1,
+    },
     actionLabel: { fontSize: 12, color: colors.accent, fontWeight: "500" },
+    sectionTitleRow: {
+      flexDirection: "row",
+      alignItems: "center",
+      gap: 4,
+      paddingHorizontal: 16,
+      paddingTop: 12,
+      paddingBottom: 4,
+    },
     sectionTitle: {
       fontSize: 13,
       fontWeight: "600",
       color: colors.textSecondary,
       textTransform: "uppercase",
-      paddingHorizontal: 16,
-      paddingTop: 12,
-      paddingBottom: 4,
     },
     row: {
       flexDirection: "row",

@@ -71,6 +71,11 @@ export default function ForwardScreen({ route, navigation }: Props) {
   }, [navigation, confirmForward, selectedIds, colors]);
 
   return (
+    // No wrapping Pressable for "tap outside to dismiss" — it competed with
+    // the FlatList below for scroll gestures and broke dragging on blank
+    // list space. keyboardShouldPersistTaps defaults to "never", which
+    // already dismisses the keyboard on tapping anywhere in the list that
+    // isn't a nested touchable, with no extra wrapper needed.
     <View style={styles.container}>
       <View style={styles.previewBar}>
         <Ionicons name="arrow-redo-outline" size={16} color={colors.textSecondary} />

@@ -1,14 +1,31 @@
-import { useEffect, useState } from "react";
-import { Alert, Pressable, StyleSheet, Text, View } from "react-native";
+import { useEffect, useRef, useState, type ComponentType, type Ref } from "react";
+import { Alert, findNodeHandle, NativeModules, Platform, Pressable, StyleSheet, Text, View } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { Ionicons } from "@expo/vector-icons";
-import { RTCView } from "react-native-webrtc";
+import { RTCView, ScreenCapturePickerView } from "react-native-webrtc";
 
 import ExpoCallPip from "../../modules/expo-call-pip";
 import { useCall } from "../calls/CallContext";
 import { statusText } from "../calls/callFormat";
 import { navigationRef } from "../navigation/navigationRef";
 import Avatar from "../components/Avatar";
+
+// iOS-only: react-native-webrtc's ScreenCapturePickerView is a hidden native
+// view wrapping ReplayKit's RPSystemBroadcastPickerView — showing it (via
+// this manager, keyed by the view's node handle, not a ref method) simulates
+// a tap on its button, which pops the system "Start Broadcast" sheet for our
+// Broadcast Upload Extension (see ios/BeaconScreenShare and
+// docs/ios-screen-share-setup.md). Android needs no such picker: its
+// MediaProjection permission prompt is triggered directly by
+// getDisplayMedia() itself.
+const { ScreenCapturePickerViewManager } = NativeModules;
+// react-native-webrtc types this as HostComponent<unknown> (no declared
+// props at all) since it's a bare requireNativeComponent with no JS-side
+// prop typings — cast so it can take a ref and a style like any other view.
+const TypedScreenCapturePickerView = ScreenCapturePickerView as unknown as ComponentType<{
+  ref?: Ref<unknown>;
+  style?: object;
+}>;
 
 // A typical portrait-ish call view aspect ratio for the floating PiP window;
 // react-native-webrtc doesn't surface live track dimensions to this screen,
@@ -38,6 +55,8 @@ export default function ActiveCallScreen() {
     isSpeakerOn,
     isCameraOff,
     isRemoteCameraOff,
+    isScreenSharing,
+    isRemoteScreenSharing,
     isFrontCamera,
     callDurationSec,
     isSystemInterrupted,
@@ -46,7 +65,17 @@ export default function ActiveCallScreen() {
     toggleSpeaker,
     toggleCamera,
     switchCamera,
+    toggleScreenShare,
   } = useCall();
+  const screenCapturePickerRef = useRef<unknown>(null);
+
+  const onToggleScreenShare = async () => {
+    if (Platform.OS === "ios" && !isScreenSharing) {
+      const nodeHandle = findNodeHandle(screenCapturePickerRef.current as any);
+      if (nodeHandle != null) ScreenCapturePickerViewManager?.show(nodeHandle);
+    }
+    await toggleScreenShare();
+  };
   // Static per app run in practice (depends on OS version/feature support,
   // not anything that changes mid-call) — checked once rather than on every
   // render. False on iOS/web today; see modules/expo-call-pip.
@@ -62,7 +91,15 @@ export default function ActiveCallScreen() {
   // *my* camera is on shouldn't hide the peer's video on my own screen, and
   // vice versa (isRemoteCameraOff comes from the peer's call:camera-state).
   const remoteVideoActive = call?.kind === "video" && !isRemoteCameraOff && !!remoteStreamURL;
-  const localVideoActive = call?.kind === "video" && !isCameraOff && !!localStreamURL;
+  // Screen sharing suppresses our own preview entirely rather than showing
+  // the capture in the small self-view — a live self-view of your own
+  // screen capture is at best a pointless recursive thumbnail and at worst
+  // (depending on capture region) an actual infinite hall-of-mirrors.
+  const localVideoActive = call?.kind === "video" && !isCameraOff && !!localStreamURL && !isScreenSharing;
+  // Screen content shouldn't be center-cropped the way a face/camera feed
+  // is — "contain" keeps the whole shared screen visible letterboxed
+  // instead of chopping off its edges.
+  const remoteObjectFit = isRemoteScreenSharing ? "contain" : "cover";
   // Only meaningful to swap which side is "big" when both feeds are actually
   // on screen — with only one active there's nothing to swap it with.
   const bothVideoActive = remoteVideoActive && localVideoActive;
@@ -113,7 +150,7 @@ export default function ActiveCallScreen() {
   return (
     <View style={styles.container}>
       {showRemotePrimary ? (
-        <RTCView streamURL={remoteStreamURL!} style={StyleSheet.absoluteFill} objectFit="cover" zOrder={0} />
+        <RTCView streamURL={remoteStreamURL!} style={StyleSheet.absoluteFill} objectFit={remoteObjectFit} zOrder={0} />
       ) : showLocalPrimary ? (
         <RTCView
           streamURL={localStreamURL!}
@@ -143,7 +180,7 @@ export default function ActiveCallScreen() {
               normal view draw order, so two overlapping RTCViews left at the same
               (default 0) zOrder z-fight/flicker against each other. */}
           {bothVideoActive && swapped ? (
-            <RTCView streamURL={remoteStreamURL!} style={StyleSheet.absoluteFill} objectFit="cover" zOrder={1} />
+            <RTCView streamURL={remoteStreamURL!} style={StyleSheet.absoluteFill} objectFit={remoteObjectFit} zOrder={1} />
           ) : (
             <RTCView
               streamURL={localStreamURL!}
@@ -175,6 +212,18 @@ export default function ActiveCallScreen() {
             <Text style={styles.mutedText}>{call.peerName} is muted</Text>
           </View>
         ) : null}
+        {isScreenSharing ? (
+          <View style={styles.mutedBanner}>
+            <Ionicons name="desktop-outline" size={12} color={palette.text} />
+            <Text style={styles.mutedText}>You're sharing your screen</Text>
+          </View>
+        ) : null}
+        {isRemoteScreenSharing ? (
+          <View style={styles.mutedBanner}>
+            <Ionicons name="desktop-outline" size={12} color={palette.text} />
+            <Text style={styles.mutedText}>{call.peerName} is sharing their screen</Text>
+          </View>
+        ) : null}
         {isSystemInterrupted ? (
           <View style={styles.interruptedBanner}>
             <Ionicons name="alert-circle" size={14} color={palette.text} />
@@ -197,7 +246,19 @@ export default function ActiveCallScreen() {
             onPress={toggleCamera}
           />
           <ControlButton icon="camera-reverse" onPress={switchCamera} disabled={isCameraOff} />
+          <ControlButton
+            icon="desktop-outline"
+            active={isScreenSharing}
+            onPress={() => void onToggleScreenShare()}
+          />
         </View>
+        {/* Hidden native view — never actually seen, just gives
+            ScreenCapturePickerViewManager.show() a node handle to target on
+            iOS (see onToggleScreenShare above). No-ops as a plain empty view
+            on Android. */}
+        {Platform.OS === "ios" ? (
+          <TypedScreenCapturePickerView ref={screenCapturePickerRef} style={styles.hiddenScreenPicker} />
+        ) : null}
         <Pressable style={styles.endButton} onPress={endCall}>
           <Ionicons name="call" size={28} color="#fff" style={styles.endIcon} />
         </Pressable>
@@ -288,6 +349,7 @@ const styles = StyleSheet.create({
   },
   mutedText: { color: palette.text, fontSize: 12, fontWeight: "600" },
   controls: { position: "absolute", bottom: 0, left: 0, right: 0, alignItems: "center", gap: 28 },
+  hiddenScreenPicker: { width: 0, height: 0 },
   controlsRow: { flexDirection: "row", gap: 20 },
   controlButton: { width: 52, height: 52, borderRadius: 26, alignItems: "center", justifyContent: "center" },
   endButton: {
