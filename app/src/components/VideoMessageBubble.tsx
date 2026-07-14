@@ -1,5 +1,5 @@
 import { useMemo } from "react";
-import { ActivityIndicator, Pressable, StyleSheet, Text, View } from "react-native";
+import { ActivityIndicator, Image, Pressable, StyleSheet, Text, View } from "react-native";
 import { Ionicons } from "@expo/vector-icons";
 import { useVideoPlayer, VideoView } from "expo-video";
 
@@ -13,6 +13,8 @@ const MIN_SIZE = 120;
 
 interface Props {
   videoUri: string | null;
+  /** Sender-local poster frame (see media/videoCompression.ts) — only ever set on the sender's own outgoing bubble, never on an incoming one. When present, this renders instead of mounting the video decoder just to show a static frame. */
+  thumbnailUri?: string | null;
   width: number;
   height: number;
   durationMs: number;
@@ -50,6 +52,7 @@ function formatSize(bytes: number): string {
 // populated (see media/chatMediaDownload.ts), then a real player once local.
 export default function VideoMessageBubble({
   videoUri,
+  thumbnailUri,
   width,
   height,
   durationMs,
@@ -89,7 +92,11 @@ export default function VideoMessageBubble({
         onLongPress={onLongPress}
         disabled={!onExpand && !onLongPress}
       >
-        <VideoView player={player} style={styles.video} nativeControls={false} contentFit="cover" />
+        {thumbnailUri ? (
+          <Image source={{ uri: thumbnailUri }} style={styles.video} resizeMode="cover" />
+        ) : (
+          <VideoView player={player} style={styles.video} nativeControls={false} contentFit="cover" />
+        )}
         {!isSending ? (
           <>
             <View style={styles.playOverlay} pointerEvents="none">

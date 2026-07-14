@@ -63,6 +63,12 @@ function createIntroMessage(): MessageRow {
     media_status: "ready",
     album_id: null,
     forwarded_at: null,
+    contact_user_id: null,
+    contact_name: null,
+    contact_avatar_url: null,
+    contact_phone_number: null,
+    video_thumbnail_uri: null,
+    edited_at: null,
   };
 }
 

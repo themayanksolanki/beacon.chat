@@ -18,6 +18,7 @@ import ArchivedChatsScreen from "./src/screens/ArchivedChatsScreen";
 import ContactInfoScreen from "./src/screens/ContactInfoScreen";
 import SharedMediaScreen from "./src/screens/SharedMediaScreen";
 import ForwardScreen from "./src/screens/ForwardScreen";
+import SelectContactScreen from "./src/screens/SelectContactScreen";
 import SettingsScreen from "./src/screens/SettingsScreen";
 import AccountScreen from "./src/screens/AccountScreen";
 import AddContactMethodScreen from "./src/screens/AddContactMethodScreen";
@@ -68,8 +69,13 @@ export type MainStackParamList = {
     // these conversations then clears both params.
     forwardTargets?: string[];
     forwardMessageIds?: string[];
+    // Set by SelectContactScreen when the user picks a contact — see
+    // ChatScreen's route.params.shareContact effect, which sends it as a
+    // contact-card message then clears this param.
+    shareContact?: { userId: string; name: string; avatarUrl: string | null };
   };
   Forward: { messageIds: string[]; sourceConversationId: string };
+  SelectContact: { conversationId: string };
   ArchivedChats: undefined;
   Contacts: undefined;
   ContactInfo: { conversationId: string };
@@ -188,6 +194,7 @@ function RootNavigator() {
       <MainStack.Screen name="MainTabs" component={MainTabs} options={{ headerShown: false }} />
       <MainStack.Screen name="Chat" component={ChatScreen} />
       <MainStack.Screen name="Forward" component={ForwardScreen} options={{ title: "Forward message" }} />
+      <MainStack.Screen name="SelectContact" component={SelectContactScreen} options={{ title: "Share Contact" }} />
       <MainStack.Screen name="ArchivedChats" component={ArchivedChatsScreen} options={{ title: "Archived Chats" }} />
       <MainStack.Screen name="Contacts" component={ContactsScreen} options={{ title: "Add People" }} />
       <MainStack.Screen

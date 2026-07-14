@@ -21,6 +21,7 @@ function forwardPreviewLabel(messageIds: string[]): string {
   if (message.kind === "gif") return "🎞️ GIF";
   if (message.kind === "video") return "🎬 Video";
   if (message.kind === "file") return `📎 ${message.file_name ?? "File"}`;
+  if (message.kind === "contact") return `👤 ${message.contact_name ?? "Contact"}`;
   return message.plaintext;
 }
 

@@ -137,6 +137,18 @@ function safeCallKeep(action: () => void) {
   }
 }
 
+// Two devices testing a call at once both log through the SAME Metro
+// terminal (any RN client pointed at one dev server funnels console output
+// there, physical device or simulator alike) with no built-in way to tell
+// which line came from which — this tags every diagnostic [call] line below
+// with a short id generated once per app launch, so two interleaved
+// device logs can still be told apart by grepping for one tag.
+const callLogTag = Math.random().toString(36).slice(2, 6);
+function callLog(msg: string) {
+  console.log(`[call:${callLogTag}] ${msg}`);
+}
+console.log(`[call:${callLogTag}] session started, platform=${Platform.OS}`);
+
 export type CallPhase =
   | "idle"
   | "outgoing-ringing"
@@ -402,6 +414,20 @@ export function CallProvider({ children }: { children: ReactNode }) {
   }, []);
 
   const cleanup = useCallback(() => {
+    // Set synchronously, ahead of the setPhase/setCall calls at the bottom
+    // of this function: phaseRef/callRef otherwise only pick up "idle"/null
+    // once React runs the effects that sync them from state, which happens
+    // strictly after this function returns. peerConnectionRef.current?.close()
+    // below can turn right around and re-enter this same teardown path
+    // SYNCHRONOUSLY, via the "closed" connectionstatechange listener calling
+    // endCallForConnectionFailure() (see createPeerConnection) — without this,
+    // that guard's `phaseRef.current === "idle"` check still saw the stale
+    // pre-cleanup phase, so it ran a second, redundant call:end + cleanup(),
+    // and a second RNCallKeep.reportEndCallWithUUID for a callId CallKit had
+    // already finished ending — observed natively as CallKit's
+    // "CXErrorCodeRequestTransactionErrorUnknownCallUUID" (code 4).
+    phaseRef.current = "idle";
+    callRef.current = null;
     clearRingTimeout();
     if (iceRecoveryTimeoutRef.current) {
       clearTimeout(iceRecoveryTimeoutRef.current);
@@ -533,6 +559,12 @@ export function CallProvider({ children }: { children: ReactNode }) {
               setCallDurationSec(Math.floor((Date.now() - connectedAtRef.current) / 1000));
             }
           }, 1000);
+          // Completes the outgoing-call progress report started in
+          // performOutgoingCallSetup (reportConnectingOutgoingCallWithUUID) —
+          // only meaningful for a call THIS device placed via CXStartCallAction.
+          if (callKeepReadyRef.current && callRef.current?.direction === "outgoing") {
+            safeCallKeep(() => RNCallKeep.reportConnectedOutgoingCallWithUUID(callId));
+          }
         }
       });
 
@@ -704,6 +736,20 @@ export function CallProvider({ children }: { children: ReactNode }) {
       // entirely rather than acquiring it just to release it once the
       // checks further down catch the same mismatch.
       if (callRef.current?.callId !== callId) return;
+      callLog(`performOutgoingCallSetup starting, callId=${callId}`);
+      // CallKit expects the app to report progress on an outgoing call once
+      // it accepts the CXStartCallAction (didReceiveStartCallAction, above) —
+      // without ever hearing back, iOS assumes the attempt failed and ends
+      // the call itself after a short internal timeout. That's what was
+      // producing the native "endCall" event moments after
+      // didReceiveStartCallAction, with nothing in this file having asked
+      // for the call to end: CallKit was killing its own outgoing call
+      // because reportConnecting/reportConnectedOutgoingCallWithUUID were
+      // never called (reportConnectedOutgoingCallWithUUID is called once the
+      // call actually connects — see the "track" event handler below).
+      if (callKeepReadyRef.current) {
+        safeCallKeep(() => RNCallKeep.reportConnectingOutgoingCallWithUUID(callId));
+      }
       try {
         await ensureAndroidCallPermissions(true, kind === "video");
         const localStream = await mediaDevices.getUserMedia({
@@ -741,6 +787,7 @@ export function CallProvider({ children }: { children: ReactNode }) {
           return;
         }
 
+        callLog(`got local media, callId=${callId}`);
         localStreamRef.current = localStream;
         setLocalStreamURL(localStream.toURL());
         setIsCameraOff(kind !== "video");
@@ -748,6 +795,7 @@ export function CallProvider({ children }: { children: ReactNode }) {
         InCallManager.start({ media: kind === "video" ? "video" : "audio" });
 
         const pc = await createPeerConnection(callId);
+        callLog(`peer connection created, callId=${callId}`);
 
         // The user can hang up while the TURN-credential fetch above was
         // still in flight — same race as the getUserMedia check below, just
@@ -764,6 +812,7 @@ export function CallProvider({ children }: { children: ReactNode }) {
 
         const offer = await pc.createOffer();
         await pc.setLocalDescription(offer);
+        callLog(`offer created, callId=${callId}`);
 
         // Same race, checked again — cancellation could just as easily have
         // landed during createOffer/setLocalDescription instead.
@@ -772,6 +821,7 @@ export function CallProvider({ children }: { children: ReactNode }) {
           return;
         }
 
+        callLog(`emitting call:invite, callId=${callId}, calleeId=${conversationId}`);
         getSocket()
           .timeout(15000)
           .emit(
@@ -780,7 +830,7 @@ export function CallProvider({ children }: { children: ReactNode }) {
             (err: unknown, ack?: { ok: true } | { ok: false; error: string }) => {
               if (err || !ack?.ok) {
                 const reason = err ? "no response from the server" : ack && !ack.ok ? ack.error : "unknown error";
-                console.warn("[call] call:invite rejected", reason);
+                callLog(`call:invite rejected by server, callId=${callId}, reason=${reason}`);
                 Alert.alert("Call failed", reason === "busy" ? "That person is on another call." : "Couldn't reach the other person. Please try again.");
                 logCallOutcome("failed");
                 if (callKeepReadyRef.current) {
@@ -788,12 +838,15 @@ export function CallProvider({ children }: { children: ReactNode }) {
                 }
                 dismissCallScreen();
                 cleanup();
+              } else {
+                callLog(`call:invite acked ok by server, callId=${callId}`);
               }
             }
           );
 
         ringTimeoutRef.current = setTimeout(() => {
           if (phaseRef.current === "outgoing-ringing") {
+            callLog(`outgoing ring timed out after ${RING_TIMEOUT_MS}ms, callId=${callId}`);
             getSocket().emit("call:end", { callId });
             if (callKeepReadyRef.current) safeCallKeep(() => RNCallKeep.endCall(callId));
             logCallOutcome("missed");
@@ -802,6 +855,7 @@ export function CallProvider({ children }: { children: ReactNode }) {
           }
         }, RING_TIMEOUT_MS);
       } catch (err) {
+        callLog(`performOutgoingCallSetup threw, callId=${callId}, err=${String(err)}`);
         console.warn("[call] failed to start call", err);
         Alert.alert("Can't start call", getUserMediaErrorMessage(err));
         logCallOutcome("failed");
@@ -823,6 +877,7 @@ export function CallProvider({ children }: { children: ReactNode }) {
       if (!conversation) return;
 
       const callId = Crypto.randomUUID();
+      callLog(`placing outgoing call, callId=${callId}, calleeId=${conversationId}, kind=${kind}`);
       const info: CallInfo = {
         callId,
         conversationId,
@@ -848,6 +903,7 @@ export function CallProvider({ children }: { children: ReactNode }) {
       notifyConversationActivity();
 
       if (!callKeepReadyRef.current) {
+        callLog(`CallKeep not ready, calling performOutgoingCallSetup directly, callId=${callId}`);
         void performOutgoingCallSetup(callId, conversationId, kind);
         return;
       }
@@ -855,7 +911,9 @@ export function CallProvider({ children }: { children: ReactNode }) {
       pendingOutgoingRef.current = { callId, conversationId, kind };
       try {
         RNCallKeep.startCall(callId, conversationId, info.peerName, "generic", kind === "video");
+        callLog(`RNCallKeep.startCall requested, awaiting didReceiveStartCallAction, callId=${callId}`);
       } catch (err) {
+        callLog(`RNCallKeep.startCall threw, callId=${callId}, err=${String(err)}`);
         console.warn("[call] RNCallKeep.startCall failed, proceeding without it", err);
         pendingOutgoingRef.current = null;
         void performOutgoingCallSetup(callId, conversationId, kind);
@@ -863,6 +921,7 @@ export function CallProvider({ children }: { children: ReactNode }) {
       }
       setTimeout(() => {
         if (pendingOutgoingRef.current?.callId !== callId) return;
+        callLog(`didReceiveStartCallAction never fired within ${CALLKEEP_START_TIMEOUT_MS}ms, proceeding without it, callId=${callId}`);
         console.warn("[call] didReceiveStartCallAction never fired, proceeding without CallKeep");
         pendingOutgoingRef.current = null;
         void performOutgoingCallSetup(callId, conversationId, kind);
@@ -877,7 +936,11 @@ export function CallProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     const listener = RNCallKeep.addEventListener("didReceiveStartCallAction", ({ callUUID }) => {
       const pending = pendingOutgoingRef.current;
-      if (!pending || !callUUID || pending.callId !== callUUID) return;
+      if (!pending || !callUUID || pending.callId !== callUUID) {
+        callLog(`didReceiveStartCallAction fired for unmatched/stale callUUID=${callUUID}, pending=${pending?.callId}`);
+        return;
+      }
+      callLog(`didReceiveStartCallAction fired, callId=${pending.callId}`);
       pendingOutgoingRef.current = null;
       void performOutgoingCallSetup(pending.callId, pending.conversationId, pending.kind);
     });
@@ -885,14 +948,19 @@ export function CallProvider({ children }: { children: ReactNode }) {
   }, [performOutgoingCallSetup]);
 
   const handleInvite = useCallback((payload: IncomingInvite) => {
-    if (phaseRef.current !== "idle") return; // server already prevents this via busy tracking, belt & suspenders
+    if (phaseRef.current !== "idle") {
+      callLog(`dropping invite ${payload.callId} — already in phase=${phaseRef.current}`);
+      return; // server already prevents this via busy tracking, belt & suspenders
+    }
     if (isUserBlocked(payload.callerId)) {
       // No server-side concept of blocking (see database.ts) — the caller's
       // client still emits the invite, so silently decline it here rather
       // than ringing/vibrating/showing the incoming-call screen.
+      callLog(`auto-rejecting invite from blocked user ${payload.callerId}, callId=${payload.callId}`);
       getSocket().emit("call:reject", { callId: payload.callId });
       return;
     }
+    callLog(`showing incoming call UI, callId=${payload.callId}, callerId=${payload.callerId}, kind=${payload.kind}`);
     const conversation = getConversationById(payload.callerId);
     incomingInviteRef.current = payload;
 
@@ -947,6 +1015,7 @@ export function CallProvider({ children }: { children: ReactNode }) {
 
     ringTimeoutRef.current = setTimeout(() => {
       if (phaseRef.current === "incoming-ringing") {
+        callLog(`incoming ring timed out after ${RING_TIMEOUT_MS}ms, callId=${payload.callId}`);
         getSocket().emit("call:reject", { callId: payload.callId });
         if (callKeepReadyRef.current) safeCallKeep(() => RNCallKeep.rejectCall(payload.callId));
         logCallOutcome("missed");
@@ -1052,6 +1121,7 @@ export function CallProvider({ children }: { children: ReactNode }) {
   const rejectIncomingCall = useCallback(() => {
     const invite = incomingInviteRef.current;
     if (!invite) return;
+    callLog(`user tapped Decline, callId=${invite.callId}`);
     getSocket().emit("call:reject", { callId: invite.callId });
     if (callKeepReadyRef.current) safeCallKeep(() => RNCallKeep.rejectCall(invite.callId));
     logCallOutcome("declined");
@@ -1191,6 +1261,7 @@ export function CallProvider({ children }: { children: ReactNode }) {
   const handleRemoteEnd = useCallback(
     (payload: { callId: string; reason: string }) => {
       if (callRef.current?.callId !== payload.callId) return;
+      callLog(`received call:end from server, reason=${payload.reason}, callId=${payload.callId}, phase=${phaseRef.current}`);
       const status: CallStatus =
         payload.reason === "rejected" ? "declined" : phaseRef.current === "connected" ? "completed" : "missed";
       logCallOutcome(status);
@@ -1219,6 +1290,7 @@ export function CallProvider({ children }: { children: ReactNode }) {
   const handleRemoteCancel = useCallback(
     (payload: { callId: string }) => {
       if (callRef.current?.callId !== payload.callId) return;
+      callLog(`received call:cancel from server, callId=${payload.callId}, phase=${phaseRef.current}`);
       clearRingTimeout();
       Vibration.cancel();
       logCallOutcome("missed");
@@ -1328,6 +1400,7 @@ export function CallProvider({ children }: { children: ReactNode }) {
   // instead of going through our button, so it has to trigger the same flow.
   useEffect(() => {
     const listener = RNCallKeep.addEventListener("answerCall", ({ callUUID }) => {
+      callLog(`native answerCall event, callUUID=${callUUID}, matchesIncoming=${incomingInviteRef.current?.callId === callUUID}`);
       if (incomingInviteRef.current?.callId !== callUUID) return;
       void acceptIncomingCall();
     });
@@ -1338,6 +1411,7 @@ export function CallProvider({ children }: { children: ReactNode }) {
   // system call banner) rather than our own end/decline buttons.
   useEffect(() => {
     const listener = RNCallKeep.addEventListener("endCall", ({ callUUID }) => {
+      callLog(`native endCall event, callUUID=${callUUID}, ourCallId=${callRef.current?.callId}, phase=${phaseRef.current}`);
       if (callRef.current?.callId !== callUUID) return;
       if (phaseRef.current === "incoming-ringing") {
         rejectIncomingCall();
@@ -1478,6 +1552,19 @@ export function CallProvider({ children }: { children: ReactNode }) {
         sdp: pc.localDescription!.toJSON(),
         kind: "video",
       });
+
+      // Same Android RTCView quirk documented on the remote track handler in
+      // createPeerConnection above: addTrack() mutates `localStream` in
+      // place, so its toURL() id never changes, and Android's RTCView never
+      // re-resolves to pick up the freshly-added video track — the local
+      // preview would stay black even though the peer receives video fine.
+      // Wrapping the same tracks in a brand-new MediaStream gives it a fresh
+      // id (the SDP-level track/sender associations above already reference
+      // the original `localStream`, so this swap is purely for rendering).
+      const freshLocalStream = new MediaStream(localStream.getTracks());
+      localStream.release(false);
+      localStreamRef.current = freshLocalStream;
+      setLocalStreamURL(freshLocalStream.toURL());
 
       setIsCameraOff(false);
       // A fresh getUserMedia call always starts on the front camera,

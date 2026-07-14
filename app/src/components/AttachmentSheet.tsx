@@ -14,6 +14,7 @@ export interface AttachmentSheetProps {
   onPickVideo: () => void;
   onPickAudio: () => void;
   onPickDocument: () => void;
+  onPickContact: () => void;
 }
 
 interface Row {
@@ -22,7 +23,7 @@ interface Row {
   onPress: () => void;
 }
 
-const CARD_WIDTH = 200;
+const CARD_WIDTH = 240;
 const SCREEN_MARGIN = 12;
 const ANCHOR_GAP = 8;
 
@@ -43,6 +44,7 @@ export default function AttachmentSheet({
   onPickVideo,
   onPickAudio,
   onPickDocument,
+  onPickContact,
 }: AttachmentSheetProps) {
   const { colors } = useTheme();
   const styles = useMemo(() => createStyles(colors), [colors]);
@@ -88,6 +90,7 @@ export default function AttachmentSheet({
     { label: "Video", icon: "videocam-outline", onPress: onPickVideo },
     { label: "Audio", icon: "musical-notes-outline", onPress: onPickAudio },
     { label: "Document", icon: "document-text-outline", onPress: onPickDocument },
+    { label: "Contact", icon: "person-outline", onPress: onPickContact },
   ];
 
   return (

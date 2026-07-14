@@ -17,6 +17,7 @@ import {
   markMessageRead,
   reconcileArchivedConversations,
   setConversationStatus,
+  setMessageEdited,
   setPeerReaction,
   unarchiveConversation,
   updateConversationPeerKey,
@@ -41,6 +42,7 @@ const VOICE_MESSAGE_LABEL = "🎤 Voice message";
 const IMAGE_MESSAGE_LABEL = "📷 Photo";
 const GIF_MESSAGE_LABEL = "🎞️ GIF";
 const VIDEO_MESSAGE_LABEL = "🎬 Video";
+const contactMessageLabel = (name: string) => `👤 ${name}`;
 
 interface ReplyRef {
   id: string;
@@ -109,10 +111,22 @@ export type MessagePayload =
       size: number;
       replyTo?: ReplyRef;
       forwarded?: boolean;
+    }
+  | {
+      kind: "contact";
+      name: string;
+      phoneNumber: string;
+      replyTo?: ReplyRef;
+      forwarded?: boolean;
     };
 
 export interface ReactionPayload {
   emoji: string;
+}
+
+/** Wire shape for editing an already-sent message's text or a media caption — see ChatScreen's onEditMessage. Applies to text/image/video/file kinds only. */
+export interface EditPayload {
+  text: string;
 }
 
 interface IncomingServerMessage {
@@ -138,6 +152,19 @@ interface IncomingServerReaction {
   ciphertext: string;
   nonce: string;
   // Same reasoning as IncomingServerMessage.sender_public_key above.
+  sender_public_key: string | null;
+}
+
+// Relayed by the server as "message:edited" once it's validated the editing
+// socket actually owns message_id (mirrors message:delete's ownership check)
+// — see ChatScreen's onEditMessage for the emitting side.
+interface IncomingServerEdit {
+  message_id: string;
+  sender_id: string;
+  recipient_id: string;
+  ciphertext: string;
+  nonce: string;
+  edited_at: number;
   sender_public_key: string | null;
 }
 
@@ -306,7 +333,9 @@ export function MessagingProvider({ children }: { children: ReactNode }) {
                     ? payload.caption?.trim() || VIDEO_MESSAGE_LABEL
                     : payload.kind === "file"
                       ? `📎 ${payload.name}`
-                      : payload.text,
+                      : payload.kind === "contact"
+                        ? contactMessageLabel(payload.name)
+                        : payload.text,
           sent_at: message.created_at,
           status: "delivered",
           delivered_at: message.created_at,
@@ -347,6 +376,16 @@ export function MessagingProvider({ children }: { children: ReactNode }) {
               ? (payload.albumId ?? null)
               : null,
           forwarded_at: payload.forwarded ? message.created_at : null,
+          contact_user_id: null,
+          contact_name: payload.kind === "contact" ? payload.name : null,
+          contact_avatar_url: null,
+          contact_phone_number: payload.kind === "contact" ? payload.phoneNumber : null,
+          // Poster frames are a sender-local artifact (see
+          // media/videoCompression.ts) — never sent over the wire.
+          video_thumbnail_uri: null,
+          // A freshly-arrived message is never edited yet — edits arrive
+          // later as their own "message:edited" event (see onMessageEdited).
+          edited_at: null,
         };
         insertMessage(row);
         getSocket().emit("message:delivered", { id: message.id });
@@ -425,6 +464,35 @@ export function MessagingProvider({ children }: { children: ReactNode }) {
       if (isUserBlocked(senderId)) return;
       setPeerReaction(messageId, null);
       bump();
+    };
+
+    const onMessageEdited = async (edit: IncomingServerEdit) => {
+      if (isUserBlocked(edit.sender_id)) return;
+      const conversation = await ensureConversation(edit.sender_id);
+      if (!conversation) return;
+      try {
+        const identity = await getOrCreateIdentity(email);
+        await sodium.ready;
+        const decrypted = edit.sender_public_key
+          ? await decryptMessage(
+              edit.ciphertext,
+              edit.nonce,
+              sodium.from_base64(edit.sender_public_key),
+              identity.privateKey
+            )
+          : await decryptFromPeer(
+              edit.sender_id,
+              conversation.peer_public_key,
+              edit.ciphertext,
+              edit.nonce,
+              identity.privateKey
+            );
+        const payload: EditPayload = JSON.parse(decrypted);
+        setMessageEdited(edit.message_id, payload.text, edit.edited_at);
+        bump();
+      } catch (err) {
+        console.warn("[messaging] failed to process incoming edit", err);
+      }
     };
 
     // Someone else's contact:request/accept/reject relayed to us — see
@@ -536,6 +604,7 @@ export function MessagingProvider({ children }: { children: ReactNode }) {
     socket.on("message:deleted", onDeletedRemote);
     socket.on("reaction:set", onReactionSet);
     socket.on("reaction:cleared", onReactionCleared);
+    socket.on("message:edited", onMessageEdited);
     socket.on("contact:request", onContactRequest);
     socket.on("contact:accepted", onContactAccepted);
     socket.on("contact:declined", onContactDeclined);
@@ -549,6 +618,7 @@ export function MessagingProvider({ children }: { children: ReactNode }) {
       socket.off("message:deleted", onDeletedRemote);
       socket.off("reaction:set", onReactionSet);
       socket.off("reaction:cleared", onReactionCleared);
+      socket.off("message:edited", onMessageEdited);
       socket.off("contact:request", onContactRequest);
       socket.off("contact:accepted", onContactAccepted);
       socket.off("contact:declined", onContactDeclined);

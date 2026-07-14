@@ -20,6 +20,7 @@ import { Ionicons, MaterialCommunityIcons } from "@expo/vector-icons";
 import * as Clipboard from "expo-clipboard";
 import * as Crypto from "expo-crypto";
 import * as DocumentPicker from "expo-document-picker";
+import { File } from "expo-file-system";
 import * as ImagePicker from "expo-image-picker";
 import * as Sharing from "expo-sharing";
 import sodium from "react-native-libsodium";
@@ -35,6 +36,8 @@ import { acceptContactRequest, rejectContactRequest } from "../chat/contactReque
 import { persistRecordedVoice, readVoiceMessageBase64 } from "../audio/voiceStorage";
 import AttachmentSheet from "../components/AttachmentSheet";
 import Avatar from "../components/Avatar";
+import ContactMessageBubble from "../components/ContactMessageBubble";
+import EditMessageModal from "../components/EditMessageModal";
 import FileMessageBubble from "../components/FileMessageBubble";
 import Linkify from "../components/Linkify";
 import StickerGifTray from "../components/StickerGifTray";
@@ -60,6 +63,7 @@ import {
   getRecentCalls,
   getRecentMessages,
   getUnreadIncomingMessages,
+  getUploadingMessages,
   insertMessage,
   isUserBlocked,
   markMessageDelivered,
@@ -70,12 +74,14 @@ import {
   markMessageSent,
   pinMessage,
   replacePeerDevices,
+  setMessageEdited,
   setMessageMediaStatus,
   setMyReaction,
   unpinMessage,
   updateConversationPeerKey,
   updateConversationProfile,
   type CallRow,
+  type MessageKind,
   type MessageRow,
 } from "../db/database";
 import {
@@ -88,10 +94,19 @@ import {
 } from "../media/chatMediaUpload";
 import { fetchAndStoreChatMedia } from "../media/chatMediaDownload";
 import { DOCUMENT_PICKER_MIME_TYPES, isSupportedDocument } from "../media/documentTypes";
+import { compressAudio } from "../media/audioCompression";
+import { cancelQueuedUpload, enqueueUpload } from "../media/uploadQueue";
 import { compressImage } from "../media/imageCompression";
+import { compressVideo } from "../media/videoCompression";
 import { deleteImageMessage, persistPickedImage, readImageMessageBase64 } from "../media/imageStorage";
 import { deleteFileMessage, persistPickedFile, readFileMessageBase64 } from "../media/fileStorage";
-import { deleteVideoMessage, persistPickedVideo, readVideoMessageBase64 } from "../media/videoStorage";
+import {
+  deleteVideoMessage,
+  deleteVideoThumbnail,
+  persistPickedVideo,
+  persistVideoThumbnail,
+  readVideoMessageBase64,
+} from "../media/videoStorage";
 import { type PickedGif } from "../media/gifPicker";
 import {
   base64FromRemoteUrl,
@@ -101,7 +116,7 @@ import {
 } from "../media/downloadStorage";
 import { useCall } from "../calls/CallContext";
 import { getSocket } from "../network/socket";
-import { useMessaging, type MessagePayload, type ReactionPayload } from "../messaging/MessagingContext";
+import { useMessaging, type EditPayload, type MessagePayload, type ReactionPayload } from "../messaging/MessagingContext";
 import { setActiveConversationId } from "../notifications/activeChatTracker";
 import { clearNotificationsForConversation } from "../notifications/notificationService";
 import { usePresence } from "../presence/PresenceContext";
@@ -143,6 +158,12 @@ const NO_MEDIA_FIELDS = {
   // (text/voice/gif/legacy inline image) can be part of one.
   album_id: null,
   forwarded_at: null,
+  contact_user_id: null,
+  contact_name: null,
+  contact_avatar_url: null,
+  contact_phone_number: null,
+  video_thumbnail_uri: null,
+  edited_at: null,
 } as const;
 
 type Props = NativeStackScreenProps<MainStackParamList, "Chat">;
@@ -575,6 +596,28 @@ function buildForwardPayload(message: MessageRow, albumId: string | null): Messa
         size: message.file_size ?? 0,
         forwarded: true,
       };
+    case "contact":
+      if (!message.contact_name || !message.contact_phone_number) throw new Error("contact no longer available");
+      return {
+        kind: "contact",
+        name: message.contact_name,
+        phoneNumber: message.contact_phone_number,
+        forwarded: true,
+      };
+  }
+}
+
+/** The user-typed part of a message's plaintext, for prefilling EditMessageModal — strips the kind's own placeholder label back out to blank so an uncaptioned image/video/file doesn't start "edit" with "📷 Photo" etc. already in the box. */
+function currentEditableText(message: MessageRow): string {
+  switch (message.kind) {
+    case "image":
+      return message.plaintext === IMAGE_MESSAGE_LABEL ? "" : message.plaintext;
+    case "video":
+      return message.plaintext === VIDEO_MESSAGE_LABEL ? "" : message.plaintext;
+    case "file":
+      return message.plaintext === `📎 ${message.file_name ?? "file"}` ? "" : message.plaintext;
+    default:
+      return message.plaintext;
   }
 }
 
@@ -583,12 +626,18 @@ function buildForwardPayload(message: MessageRow, albumId: string | null): Messa
  * MessageBubble (one bubble) and AlbumBubble (one grid cell per message, see
  * below) so both get the same Reply/Copy/Save/Info/Pin/Delete set.
  */
+// Kinds with editable text/caption content — voice/gif/contact have no
+// user-typed text to change (voice is a recording, gif/contact are fixed
+// reference data), so editing is never offered for them.
+const EDITABLE_MESSAGE_KINDS: MessageKind[] = ["text", "image", "video", "file"];
+
 function buildMessageActions(
   message: MessageRow,
   callbacks: {
     onReply: (message: MessageRow) => void;
     onForward: (message: MessageRow) => void;
     onCopy: (message: MessageRow) => void;
+    onEdit: (message: MessageRow) => void;
     onSaveMedia: (message: MessageRow) => void;
     onPin: (message: MessageRow) => void;
     onUnpin: (message: MessageRow) => void;
@@ -596,17 +645,25 @@ function buildMessageActions(
     onDelete: (message: MessageRow) => void;
   }
 ): MessageAction[] {
-  const { onReply, onForward, onCopy, onSaveMedia, onPin, onUnpin, onDeleteForEveryone, onDelete } = callbacks;
+  const { onReply, onForward, onCopy, onEdit, onSaveMedia, onPin, onUnpin, onDeleteForEveryone, onDelete } = callbacks;
   const isOutgoing = message.direction === "outgoing";
   const isPinned = !!message.pinned_at;
   const canDeleteForEveryone =
     isOutgoing && !message.deleted_at && Date.now() - message.sent_at <= DELETE_FOR_EVERYONE_WINDOW_MS;
+  // Only the sender can edit their own message/caption — the server must
+  // enforce this too (mirroring message:delete's ownership check) since a
+  // client-side-only gate can't stop a modified client from emitting
+  // message:edit for someone else's message id.
+  const canEdit = isOutgoing && !message.deleted_at && EDITABLE_MESSAGE_KINDS.includes(message.kind);
 
   const actions: MessageAction[] = [
     { label: "Reply", icon: "arrow-undo-outline", onPress: () => onReply(message) },
     { label: "Forward", icon: "arrow-redo-outline", onPress: () => onForward(message) },
     { label: "Copy", icon: "copy-outline", onPress: () => onCopy(message) },
   ];
+  if (canEdit) {
+    actions.push({ label: "Edit", icon: "create-outline", onPress: () => onEdit(message) });
+  }
   if (message.kind !== "text" && isDownloadAvailable()) {
     actions.push({ label: "Save to device", icon: "download-outline", onPress: () => onSaveMedia(message) });
   }
@@ -636,6 +693,7 @@ interface MessageBubbleProps {
   onReply: (message: MessageRow) => void;
   onForward: (message: MessageRow) => void;
   onCopy: (message: MessageRow) => void;
+  onEdit: (message: MessageRow) => void;
   onDelete: (message: MessageRow) => void;
   onRetry: (message: MessageRow) => void;
   onPin: (message: MessageRow) => void;
@@ -649,6 +707,8 @@ interface MessageBubbleProps {
   onOpenFile: (message: MessageRow) => void;
   /** Opens the full-screen gallery (see MediaViewerModal) — items is every viewable item in this bubble's batch (just 1 for a non-grouped bubble), initialIndex is which one was tapped. */
   onOpenMedia: (items: ViewerMedia[], initialIndex: number) => void;
+  /** Opens a shared contact's own chat, for kind === 'contact' bubbles — see ChatScreen's onOpenContact. */
+  onOpenContact: (message: MessageRow) => void;
   /** Fraction 0..1 of an in-flight attachment upload for this message, if any. */
   uploadProgress?: number;
   /** True while this is the currently-active in-chat search match (see the searchMatches/activeMatch state) — tints the bubble so it stands out, WhatsApp-style. */
@@ -665,6 +725,7 @@ function MessageBubble({
   onReply,
   onForward,
   onCopy,
+  onEdit,
   onDelete,
   onRetry,
   onPin,
@@ -676,6 +737,7 @@ function MessageBubble({
   onDownload,
   onOpenFile,
   onOpenMedia,
+  onOpenContact,
   uploadProgress,
   highlighted,
   selectionMode,
@@ -745,6 +807,7 @@ function MessageBubble({
             onReply,
             onForward,
             onCopy,
+            onEdit,
             onSaveMedia,
             onPin,
             onUnpin,
@@ -889,6 +952,7 @@ function MessageBubble({
               ) : message.kind === "video" ? (
                 <VideoMessageBubble
                   videoUri={message.video_uri}
+                  thumbnailUri={message.video_thumbnail_uri}
                   width={message.video_width ?? 0}
                   height={message.video_height ?? 0}
                   durationMs={message.video_duration_ms ?? 0}
@@ -920,6 +984,12 @@ function MessageBubble({
                   onOpen={!selectionMode && message.file_uri ? () => onOpenFile(message) : undefined}
                   onLongPress={onLongPress}
                 />
+              ) : message.kind === "contact" ? (
+                <ContactMessageBubble
+                  name={message.contact_name ?? "Contact"}
+                  phoneNumber={message.contact_phone_number}
+                  onLongPress={onLongPress}
+                />
               ) : (
                 <Linkify
                   text={message.plaintext}
@@ -949,7 +1019,7 @@ function MessageBubble({
                         ? "Not sent · tap to retry"
                         : message.media_status === "download_failed"
                           ? "Couldn't load · tap to retry"
-                          : formatTime(message.sent_at)}
+                          : `${formatTime(message.sent_at)}${message.edited_at ? " · Edited" : ""}`}
                       {isOutgoing ? " " : ""}
                       {isOutgoing ? <StatusTicks status={message.status} /> : null}
                     </Text>
@@ -998,7 +1068,7 @@ function MessageBubble({
                   ? "Not sent · tap to retry"
                   : message.media_status === "download_failed"
                     ? "Couldn't load · tap to retry"
-                    : formatTime(message.sent_at)}
+                    : `${formatTime(message.sent_at)}${message.edited_at ? " · Edited" : ""}`}
               </Text>
               {isOutgoing ? <StatusTicks status={message.status} framed={isFramedKind} /> : null}
             </Pressable>
@@ -1024,6 +1094,7 @@ interface AlbumBubbleProps {
   onReply: (message: MessageRow) => void;
   onForward: (message: MessageRow) => void;
   onCopy: (message: MessageRow) => void;
+  onEdit: (message: MessageRow) => void;
   onDelete: (message: MessageRow) => void;
   onRetry: (message: MessageRow) => void;
   onPin: (message: MessageRow) => void;
@@ -1055,6 +1126,7 @@ function AlbumBubble({
   onReply,
   onForward,
   onCopy,
+  onEdit,
   onDelete,
   onRetry,
   onPin,
@@ -1127,6 +1199,7 @@ function AlbumBubble({
               onReply,
               onForward,
               onCopy,
+              onEdit,
               onSaveMedia,
               onPin,
               onUnpin,
@@ -1574,6 +1647,20 @@ export default function ChatScreen({ route, navigation }: Props) {
 
   const [draft, setDraft] = useState("");
   const [replyingTo, setReplyingTo] = useState<ReplyTarget | null>(null);
+
+  // Drives the camera button's collapse/fade as the input grows to fill its
+  // spot once the user starts typing (see the input row below) — a single
+  // 0..1 value interpolated into width/margin/opacity so the button shrinks
+  // away instead of just popping out.
+  const hasDraftText = draft.trim().length > 0;
+  const cameraButtonAnim = useRef(new Animated.Value(hasDraftText ? 0 : 1)).current;
+  useEffect(() => {
+    Animated.timing(cameraButtonAnim, {
+      toValue: hasDraftText ? 0 : 1,
+      duration: 200,
+      useNativeDriver: false,
+    }).start();
+  }, [cameraButtonAnim, hasDraftText]);
 
   // Forward flow: long-pressing a message and tapping "Forward" (see
   // buildMessageActions) enters this WhatsApp-style multi-select mode —
@@ -2093,6 +2180,11 @@ export default function ChatScreen({ route, navigation }: Props) {
     [sendPayload]
   );
 
+  const sendContactEncrypted = useCallback(
+    (id: string, name: string, phoneNumber: string) => sendPayload(id, { kind: "contact", name, phoneNumber }),
+    [sendPayload]
+  );
+
   // Forwards the given (already-sent) messages to one or more target chats —
   // driven by the selection-mode header's forward button, via ForwardScreen's
   // picker (see the route.params.forwardTargets effect below). Each target
@@ -2178,6 +2270,16 @@ export default function ChatScreen({ route, navigation }: Props) {
   // by the message bubbles to render a percentage over the sending spinner.
   const [uploadProgressById, setUploadProgressById] = useState<Record<string, number>>({});
 
+  // Compression happens before a message row even exists (see sendAttachment/
+  // onVoiceRecorded below), so it can't be surfaced via the per-bubble
+  // upload-progress overlay above — this drives a small banner over the
+  // composer instead ("Compressing image...", "Compressing video (45%)",
+  // "Generating thumbnail...", "Compressing voice note..."). The ref is the
+  // actual single-flight lock (checked synchronously at the top of every
+  // entry point below); the state is only for rendering that lock's status.
+  const [processingStatus, setProcessingStatus] = useState<{ label: string } | null>(null);
+  const mediaProcessingRef = useRef(false);
+
   const clearUploadProgress = useCallback((id: string) => {
     setUploadProgressById((prev) => {
       if (!(id in prev)) return prev;
@@ -2193,6 +2295,12 @@ export default function ChatScreen({ route, navigation }: Props) {
   // media/chatMediaUpload.ts for why this preserves the app's E2E guarantee.
   // Used both for a fresh send (via sendAttachment below) and for retrying an
   // upload that previously failed (see onRetry), from the same local file.
+  //
+  // Throws on failure rather than swallowing it — this always runs as a task
+  // handed to media/uploadQueue's enqueueUpload (see sendAttachment/onRetry/
+  // the resume-on-reopen effect below), which decides whether to retry with
+  // backoff or give up; onUploadGiveUp below is only what happens once it
+  // truly gives up, not on every transient failure.
   const uploadThenSend = useCallback(
     async (
       id: string,
@@ -2203,76 +2311,87 @@ export default function ChatScreen({ route, navigation }: Props) {
       albumId?: string | null
     ) => {
       if (!token) return;
-      try {
-        const prepared = await encryptFileForUpload(plaintextUri, id, maxBytesForChatMediaKind(kind));
-        const { publicUrl } = await uploadChatMedia(token, id, kind, prepared, (fraction) => {
-          setUploadProgressById((prev) => ({ ...prev, [id]: fraction }));
-        });
-        clearUploadProgress(id);
-        setMessageMediaStatus(id, "ready");
+      const prepared = await encryptFileForUpload(plaintextUri, id, maxBytesForChatMediaKind(kind));
+      const { publicUrl } = await uploadChatMedia(token, id, kind, prepared, (fraction) => {
+        setUploadProgressById((prev) => ({ ...prev, [id]: fraction }));
+      });
+      clearUploadProgress(id);
+      setMessageMediaStatus(id, "ready");
 
-        if (kind === "image") {
-          void sendPayload(id, {
-            kind: "image",
-            transport: "s3",
-            url: publicUrl,
-            keyB64: prepared.keyB64,
-            nonceB64: prepared.nonceB64,
-            width: meta.width ?? 0,
-            height: meta.height ?? 0,
-            size: prepared.plaintextSize,
-            replyTo: replyTo ?? undefined,
-            albumId: albumId ?? undefined,
-            caption: meta.caption?.trim() || undefined,
-          });
-        } else if (kind === "video") {
-          void sendPayload(id, {
-            kind: "video",
-            url: publicUrl,
-            keyB64: prepared.keyB64,
-            nonceB64: prepared.nonceB64,
-            width: meta.width ?? 0,
-            height: meta.height ?? 0,
-            durationMs: meta.durationMs ?? 0,
-            size: prepared.plaintextSize,
-            replyTo: replyTo ?? undefined,
-            albumId: albumId ?? undefined,
-            caption: meta.caption?.trim() || undefined,
-          });
-        } else {
-          void sendPayload(id, {
-            kind: "file",
-            url: publicUrl,
-            keyB64: prepared.keyB64,
-            nonceB64: prepared.nonceB64,
-            name: meta.name ?? "file",
-            mime: meta.mime ?? "application/octet-stream",
-            size: prepared.plaintextSize,
-            replyTo: replyTo ?? undefined,
-          });
-        }
-      } catch (err) {
-        clearUploadProgress(id);
-        console.warn("[chat] failed to upload attachment", err);
-        setMessageMediaStatus(id, "upload_failed");
-        markMessageFailed(id);
-        setMessages((prev) =>
-          prev.map((m) => (m.id === id ? { ...m, status: "failed", media_status: "upload_failed" } : m))
-        );
-        if (err instanceof ChatMediaTooLargeError) {
-          Alert.alert("File too large", err.message);
-        } else if (err instanceof ChatMediaUploadUnavailableError) {
-          Alert.alert("Uploads unavailable", "Media uploads aren't available right now. Please try again later.");
-        }
-        // Any other failure (network blip, etc.) surfaces via the existing
-        // "Not sent · tap to retry" affordance, same as a failed text send.
+      if (kind === "image") {
+        void sendPayload(id, {
+          kind: "image",
+          transport: "s3",
+          url: publicUrl,
+          keyB64: prepared.keyB64,
+          nonceB64: prepared.nonceB64,
+          width: meta.width ?? 0,
+          height: meta.height ?? 0,
+          size: prepared.plaintextSize,
+          replyTo: replyTo ?? undefined,
+          albumId: albumId ?? undefined,
+          caption: meta.caption?.trim() || undefined,
+        });
+      } else if (kind === "video") {
+        void sendPayload(id, {
+          kind: "video",
+          url: publicUrl,
+          keyB64: prepared.keyB64,
+          nonceB64: prepared.nonceB64,
+          width: meta.width ?? 0,
+          height: meta.height ?? 0,
+          durationMs: meta.durationMs ?? 0,
+          size: prepared.plaintextSize,
+          replyTo: replyTo ?? undefined,
+          albumId: albumId ?? undefined,
+          caption: meta.caption?.trim() || undefined,
+        });
+      } else {
+        void sendPayload(id, {
+          kind: "file",
+          url: publicUrl,
+          keyB64: prepared.keyB64,
+          nonceB64: prepared.nonceB64,
+          name: meta.name ?? "file",
+          mime: meta.mime ?? "application/octet-stream",
+          size: prepared.plaintextSize,
+          replyTo: replyTo ?? undefined,
+        });
       }
     },
     [token, sendPayload, clearUploadProgress]
   );
 
+  // Only errors that no amount of retrying will fix — everything else
+  // (network blips, server hiccups) gets the queue's backoff-retry treatment.
+  const isPermanentUploadFailure = useCallback(
+    (err: unknown) => err instanceof ChatMediaTooLargeError || err instanceof ChatMediaUploadUnavailableError,
+    []
+  );
+
+  // Invoked by the upload queue exactly once a task is finally abandoned —
+  // either a permanent error, or all its backoff retries were exhausted.
+  // This is the same "Not sent · tap to retry" UI state a failed send has
+  // always ended up in; only how many silent attempts happen before reaching
+  // it is new.
+  const onUploadGiveUp = useCallback((id: string, err: unknown) => {
+    clearUploadProgress(id);
+    console.warn("[chat] giving up on attachment upload", err);
+    setMessageMediaStatus(id, "upload_failed");
+    markMessageFailed(id);
+    setMessages((prev) =>
+      prev.map((m) => (m.id === id ? { ...m, status: "failed", media_status: "upload_failed" } : m))
+    );
+    if (err instanceof ChatMediaTooLargeError) {
+      Alert.alert("File too large", err.message);
+    } else if (err instanceof ChatMediaUploadUnavailableError) {
+      Alert.alert("Uploads unavailable", "Media uploads aren't available right now. Please try again later.");
+    }
+  }, [clearUploadProgress]);
+
   const onCancelSend = useCallback((message: MessageRow) => {
     cancelledSendIdsRef.current.add(message.id);
+    cancelQueuedUpload(message.id);
     deleteMessage(message.id);
     setMessages((prev) => prev.filter((m) => m.id !== message.id));
     clearUploadProgress(message.id);
@@ -2280,6 +2399,7 @@ export default function ChatScreen({ route, navigation }: Props) {
     if (message.image_uri) deleteImageMessage(message.image_uri);
     if (message.video_uri) deleteVideoMessage(message.video_uri);
     if (message.file_uri) deleteFileMessage(message.file_uri);
+    if (message.video_thumbnail_uri) deleteVideoThumbnail(message.video_thumbnail_uri);
   }, [clearUploadProgress]);
 
   // Shared by onRetry (a previously-failed download) and the video/file
@@ -2314,18 +2434,23 @@ export default function ChatScreen({ route, navigation }: Props) {
         setMessages((prev) =>
           prev.map((m) => (m.id === message.id ? { ...m, status: "pending", media_status: "uploading" } : m))
         );
-        void uploadThenSend(
+        enqueueUpload(
           message.id,
-          localUri,
-          message.kind as AttachmentKind,
-          {
-            width: message.image_width ?? message.video_width ?? undefined,
-            height: message.image_height ?? message.video_height ?? undefined,
-            durationMs: message.video_duration_ms ?? undefined,
-            name: message.file_name ?? undefined,
-            mime: message.file_mime ?? undefined,
-          },
-          replyTo
+          () =>
+            uploadThenSend(
+              message.id,
+              localUri,
+              message.kind as AttachmentKind,
+              {
+                width: message.image_width ?? message.video_width ?? undefined,
+                height: message.image_height ?? message.video_height ?? undefined,
+                durationMs: message.video_duration_ms ?? undefined,
+                name: message.file_name ?? undefined,
+                mime: message.file_mime ?? undefined,
+              },
+              replyTo
+            ),
+          { isPermanentFailure: isPermanentUploadFailure, onGiveUp: (err) => onUploadGiveUp(message.id, err) }
         );
         return;
       }
@@ -2363,8 +2488,55 @@ export default function ChatScreen({ route, navigation }: Props) {
         void sendEncrypted(message.id, message.plaintext, replyTo);
       }
     },
-    [conversationId, sendEncrypted, sendVoiceEncrypted, sendGifEncrypted, sendPayload, uploadThenSend, downloadMedia]
+    [
+      conversationId,
+      sendEncrypted,
+      sendVoiceEncrypted,
+      sendGifEncrypted,
+      sendPayload,
+      uploadThenSend,
+      downloadMedia,
+      isPermanentUploadFailure,
+      onUploadGiveUp,
+    ]
   );
+
+  // Resumes any attachment upload left stuck at media_status 'uploading' —
+  // this is only ever true if the app was killed (or crashed) mid-upload,
+  // since a normal failure already flips it to 'upload_failed'. Runs once
+  // whenever this conversation is opened, rather than requiring the user to
+  // notice and manually tap retry. Deliberately scoped to "resumes when the
+  // user reopens this chat" rather than a fully global background resumer —
+  // enqueueUpload's own dedupe means this is also a no-op for anything
+  // already mid-flight from this same screen session.
+  useEffect(() => {
+    if (!conversation || isTestBot) return;
+    for (const message of getUploadingMessages(conversationId)) {
+      const localUri = message.image_uri ?? message.video_uri ?? message.file_uri;
+      if (!localUri) continue;
+      const replyTo = message.reply_to_id ? { id: message.reply_to_id, preview: message.reply_preview ?? "" } : null;
+      enqueueUpload(
+        message.id,
+        () =>
+          uploadThenSend(
+            message.id,
+            localUri,
+            message.kind as AttachmentKind,
+            {
+              width: message.image_width ?? message.video_width ?? undefined,
+              height: message.image_height ?? message.video_height ?? undefined,
+              durationMs: message.video_duration_ms ?? undefined,
+              name: message.file_name ?? undefined,
+              mime: message.file_mime ?? undefined,
+            },
+            replyTo,
+            message.album_id
+          ),
+        { isPermanentFailure: isPermanentUploadFailure, onGiveUp: (err) => onUploadGiveUp(message.id, err) }
+      );
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- only re-sweeps when the conversation itself changes, not on every message list update
+  }, [conversationId, conversation, isTestBot]);
 
   const onSend = useCallback(async () => {
     const text = draft.trim();
@@ -2465,12 +2637,25 @@ export default function ChatScreen({ route, navigation }: Props) {
 
   const onVoiceRecorded = useCallback(
     async ({ uri, durationMs, waveform }: RecordedVoice) => {
-      if (!conversation) return;
+      if (!conversation || mediaProcessingRef.current) return;
       const activeReply = replyingTo;
       setReplyingTo(null);
 
+      mediaProcessingRef.current = true;
+      setProcessingStatus({ label: "Compressing voice note..." });
+      let recordedUri = uri;
+      try {
+        const compressed = await compressAudio(uri);
+        recordedUri = compressed.uri;
+      } catch (err) {
+        console.warn("[chat] voice compression failed, using original recording", err);
+      } finally {
+        mediaProcessingRef.current = false;
+        setProcessingStatus(null);
+      }
+
       const id = Crypto.randomUUID();
-      const persistedUri = await persistRecordedVoice(uri, id);
+      const persistedUri = await persistRecordedVoice(recordedUri, id);
       const outgoing: MessageRow = {
         id,
         conversation_id: conversationId,
@@ -2602,22 +2787,58 @@ export default function ChatScreen({ route, navigation }: Props) {
       albumId?: string | null
     ) => {
       if (!conversation) return;
+      // Single-flight lock across the whole screen — held only from here
+      // until the row is inserted/upload is kicked off (see the finally
+      // below), so a second pick can't start compressing while one is
+      // already running, but doesn't block multiple uploads from being
+      // in-flight together afterward (see uploadThenSend, fired-and-forgotten).
+      if (mediaProcessingRef.current) return;
       const activeReply = replyToOverride !== undefined ? replyToOverride : replyingTo;
       if (replyToOverride === undefined) setReplyingTo(null);
 
       const id = Crypto.randomUUID();
+      mediaProcessingRef.current = true;
       try {
         let plaintextUri: string;
         let width = meta.width ?? 0;
         let height = meta.height ?? 0;
+        let videoThumbnailUri: string | null = null;
 
         if (kind === "image") {
-          const compressed = await compressImage(sourceUri, width, height);
-          plaintextUri = await persistPickedImage(compressed.uri, id);
-          width = compressed.width;
-          height = compressed.height;
+          setProcessingStatus({ label: "Compressing image..." });
+          try {
+            const compressed = await compressImage(sourceUri, width, height);
+            plaintextUri = await persistPickedImage(compressed.uri, id);
+            width = compressed.width;
+            height = compressed.height;
+          } catch (err) {
+            console.warn("[chat] image compression failed, falling back to original", err);
+            const originalSize = new File(sourceUri).size ?? 0;
+            if (originalSize === 0 || originalSize > maxBytesForChatMediaKind("image")) throw err;
+            Alert.alert("Compression failed", "Sending the original photo instead.");
+            plaintextUri = await persistPickedImage(sourceUri, id);
+          }
         } else if (kind === "video") {
-          plaintextUri = await persistPickedVideo(sourceUri, id);
+          setProcessingStatus({ label: "Compressing video..." });
+          try {
+            const compressed = await compressVideo(sourceUri, width, height, {
+              onProgress: (fraction) =>
+                setProcessingStatus({ label: `Compressing video (${Math.round(fraction * 100)}%)` }),
+              onThumbnailStart: () => setProcessingStatus({ label: "Generating thumbnail..." }),
+            });
+            plaintextUri = await persistPickedVideo(compressed.uri, id);
+            width = compressed.width;
+            height = compressed.height;
+            videoThumbnailUri = compressed.thumbnailUri
+              ? await persistVideoThumbnail(compressed.thumbnailUri, id)
+              : null;
+          } catch (err) {
+            console.warn("[chat] video compression failed, falling back to original", err);
+            const originalSize = new File(sourceUri).size ?? 0;
+            if (originalSize === 0 || originalSize > maxBytesForChatMediaKind("video")) throw err;
+            Alert.alert("Compression failed", "Sending the original video instead.");
+            plaintextUri = await persistPickedVideo(sourceUri, id);
+          }
         } else {
           plaintextUri = await persistPickedFile(sourceUri, id, meta.name ?? "file");
         }
@@ -2667,6 +2888,11 @@ export default function ChatScreen({ route, navigation }: Props) {
           media_status: "uploading",
           album_id: albumId ?? null,
           forwarded_at: null,
+          contact_user_id: null,
+          contact_name: null,
+          contact_avatar_url: null,
+          video_thumbnail_uri: kind === "video" ? videoThumbnailUri : null,
+          edited_at: null,
         };
         insertMessage(outgoing);
         setMessages((prev) => [...prev, outgoing]);
@@ -2678,27 +2904,35 @@ export default function ChatScreen({ route, navigation }: Props) {
           return;
         }
 
-        void uploadThenSend(
+        enqueueUpload(
           id,
-          plaintextUri,
-          kind,
-          { width, height, durationMs: meta.durationMs, name: meta.name, mime: meta.mime, caption: meta.caption },
-          activeReply,
-          albumId
+          () =>
+            uploadThenSend(
+              id,
+              plaintextUri,
+              kind,
+              { width, height, durationMs: meta.durationMs, name: meta.name, mime: meta.mime, caption: meta.caption },
+              activeReply,
+              albumId
+            ),
+          { isPermanentFailure: isPermanentUploadFailure, onGiveUp: (err) => onUploadGiveUp(id, err) }
         );
       } catch (err) {
         console.warn("[chat] failed to prepare attachment for sending", err);
         const title = kind === "image" ? "Couldn't send photo" : kind === "video" ? "Couldn't send video" : "Couldn't send file";
         Alert.alert(title, "Please try again.");
+      } finally {
+        mediaProcessingRef.current = false;
+        setProcessingStatus(null);
       }
     },
-    [conversation, conversationId, isTestBot, replyingTo, uploadThenSend]
+    [conversation, conversationId, isTestBot, replyingTo, uploadThenSend, isPermanentUploadFailure, onUploadGiveUp]
   );
 
   // The camera button now only ever launches the device camera (no gallery
   // chooser) — picking from the gallery lives in the "+" attachment menu.
   const pickImageFromCamera = useCallback(async () => {
-    if (!conversation) return;
+    if (!conversation || mediaProcessingRef.current) return;
     const permission = await ImagePicker.requestCameraPermissionsAsync();
     if (!permission.granted) {
       Alert.alert("Camera access needed", "Enable access in Settings to share photos.");
@@ -2721,7 +2955,7 @@ export default function ChatScreen({ route, navigation }: Props) {
   // expo-document-picker, since expo-image-picker can't select audio files.
   const pickAndSendAttachment = useCallback(
     async (kind: "image" | "video" | "file") => {
-      if (!conversation) return;
+      if (!conversation || mediaProcessingRef.current) return;
 
       if (kind === "file") {
         if (documentPickerActive) return;
@@ -2935,6 +3169,70 @@ export default function ChatScreen({ route, navigation }: Props) {
     [conversation, conversationId, isTestBot, replyingTo, sendGifEncrypted]
   );
 
+  // Shares one of the user's own contacts (picked via SelectContactScreen,
+  // see the route.params.shareContact effect below) as a contact-card message
+  // — no media of its own, so this mirrors sendGif's shape/local-insert flow.
+  const sendContact = useCallback(
+    (contactUserId: string, name: string, avatarUrl: string | null) => {
+      if (!conversation) return;
+
+      const id = Crypto.randomUUID();
+      const outgoing: MessageRow = {
+        id,
+        conversation_id: conversationId,
+        direction: "outgoing",
+        plaintext: `👤 ${name}`,
+        sent_at: Date.now(),
+        status: "pending",
+        delivered_at: null,
+        read_at: null,
+        reply_to_id: null,
+        reply_preview: null,
+        pinned_at: null,
+        deleted_at: null,
+        reaction_mine: null,
+        reaction_peer: null,
+        kind: "contact",
+        audio_uri: null,
+        duration_ms: null,
+        waveform: null,
+        image_uri: null,
+        image_width: null,
+        image_height: null,
+        gif_url: null,
+        gif_width: null,
+        gif_height: null,
+        ...NO_MEDIA_FIELDS,
+        contact_user_id: contactUserId,
+        contact_name: name,
+        contact_avatar_url: avatarUrl,
+      };
+      insertMessage(outgoing);
+      setMessages((prev) => [...prev, outgoing]);
+
+      if (isTestBot) {
+        markMessageSent(id);
+        setMessages((prev) => prev.map((m) => (m.id === id ? { ...m, status: "sent" } : m)));
+        return;
+      }
+
+      void sendContactEncrypted(id, contactUserId, name, avatarUrl);
+    },
+    [conversation, conversationId, isTestBot, sendContactEncrypted]
+  );
+
+  // Consumes SelectContactScreen's result: it navigates back here (see
+  // AttachmentSheet's onPickContact below) with the contact the user picked,
+  // merged onto this screen's own route params — same pattern as
+  // forwardTargets above.
+  useEffect(() => {
+    const shareContact = route.params?.shareContact;
+    if (!shareContact) return;
+    navigation.setParams({ shareContact: undefined });
+    sendContact(shareContact.userId, shareContact.name, shareContact.avatarUrl);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- only reacts to the param actually changing, not every render of sendContact
+  }, [route.params?.shareContact]);
+
   // Toggles the sticker/GIF tray in place of the keyboard (see
   // StickerGifTray) rather than opening a full-screen native dialog. Emoji
   // entry is deliberately not duplicated here — every mobile keyboard
@@ -3109,6 +3407,99 @@ export default function ChatScreen({ route, navigation }: Props) {
         );
     },
     [isTestBot]
+  );
+
+  // Edit flow: long-press "Edit" opens EditMessageModal (see onEditMessage,
+  // wired to buildMessageActions' onEdit callback), which then calls
+  // onConfirmEdit with the new text once the user taps Save.
+  const [editingMessage, setEditingMessage] = useState<MessageRow | null>(null);
+
+  const onEditMessage = useCallback((message: MessageRow) => {
+    setEditingMessage(message);
+  }, []);
+
+  const onConfirmEdit = useCallback(
+    (newText: string) => {
+      const message = editingMessage;
+      setEditingMessage(null);
+      if (!message) return;
+
+      const finalText =
+        newText ||
+        (message.kind === "image"
+          ? IMAGE_MESSAGE_LABEL
+          : message.kind === "video"
+            ? VIDEO_MESSAGE_LABEL
+            : message.kind === "file"
+              ? `📎 ${message.file_name ?? "file"}`
+              : newText);
+      if (message.kind === "text" && !finalText.trim()) return;
+
+      const previousPlaintext = message.plaintext;
+      const previousEditedAt = message.edited_at;
+      const editedAt = Date.now();
+      setMessageEdited(message.id, finalText, editedAt);
+      setMessages((prev) =>
+        prev.map((m) => (m.id === message.id ? { ...m, plaintext: finalText, edited_at: editedAt } : m))
+      );
+
+      if (isTestBot || !conversation || !email) return;
+
+      const revert = () => {
+        setMessageEdited(message.id, previousPlaintext, previousEditedAt);
+        setMessages((prev) =>
+          prev.map((m) => (m.id === message.id ? { ...m, plaintext: previousPlaintext, edited_at: previousEditedAt } : m))
+        );
+        Alert.alert("Couldn't save edit", "Please try again.");
+      };
+
+      void (async () => {
+        try {
+          const identity = await getOrCreateIdentity(email);
+          await sodium.ready;
+
+          // Same per-device fan-out as sendPayload/onReact — encrypt once
+          // per active recipient device rather than a single stale cached key.
+          let peerDevices = getPeerDevices(conversationId);
+          if (peerDevices.length === 0 && token) {
+            const peer = await getUserById(token, conversationId);
+            peerDevices = peer.devices.map((d) => ({ device_id: d.deviceId, public_key: d.publicKey }));
+            replacePeerDevices(conversationId, peerDevices);
+          }
+          if (peerDevices.length === 0) throw new Error("recipient has no known devices to encrypt for");
+
+          const payload: EditPayload = { text: finalText };
+          const plaintext = JSON.stringify(payload);
+          const envelopes = await Promise.all(
+            peerDevices.map(async (device) => {
+              const { ciphertext, nonce } = await encryptMessage(
+                plaintext,
+                sodium.from_base64(device.public_key),
+                identity.privateKey
+              );
+              return { deviceId: device.device_id, ciphertext, nonce };
+            })
+          );
+
+          getSocket()
+            .timeout(SEND_TIMEOUT_MS)
+            .emit(
+              "message:edit",
+              { id: message.id, recipientId: conversationId, envelopes, editedAt },
+              (err: unknown, response?: { ok: boolean; error?: string }) => {
+                if (err || !response?.ok) {
+                  console.warn("[chat] failed to sync edit", err ?? response?.error);
+                  revert();
+                }
+              }
+            );
+        } catch (err) {
+          console.warn("[chat] failed to encrypt edit", err);
+          revert();
+        }
+      })();
+    },
+    [editingMessage, conversation, conversationId, isTestBot, email, token]
   );
 
   const scrollToMessage = useCallback(
@@ -3314,6 +3705,7 @@ export default function ChatScreen({ route, navigation }: Props) {
                 onReply={onReply}
                 onForward={onForward}
                 onCopy={onCopy}
+                onEdit={onEditMessage}
                 onDelete={onDelete}
                 onRetry={onRetry}
                 onPin={onPin}
@@ -3336,6 +3728,7 @@ export default function ChatScreen({ route, navigation }: Props) {
                 onReply={onReply}
                 onForward={onForward}
                 onCopy={onCopy}
+                onEdit={onEditMessage}
                 onDelete={onDelete}
                 onRetry={onRetry}
                 onPin={onPin}
@@ -3347,6 +3740,7 @@ export default function ChatScreen({ route, navigation }: Props) {
                 onDownload={downloadMedia}
                 onOpenFile={onOpenFile}
                 onOpenMedia={onOpenMedia}
+                onOpenContact={onOpenContact}
                 uploadProgress={uploadProgressById[item.message.id]}
                 highlighted={item.message.id === activeMatch?.id}
                 selectionMode={selectionMode}
@@ -3398,6 +3792,14 @@ export default function ChatScreen({ route, navigation }: Props) {
         onSend={sendPendingCaptionAttachment}
       />
 
+      <EditMessageModal
+        visible={!!editingMessage}
+        initialText={editingMessage ? currentEditableText(editingMessage) : ""}
+        kind={editingMessage?.kind ?? null}
+        onCancel={() => setEditingMessage(null)}
+        onSave={onConfirmEdit}
+      />
+
       {replyingTo ? (
         <View style={styles.replyBanner}>
           <View style={styles.replyBannerText}>
@@ -3435,6 +3837,15 @@ export default function ChatScreen({ route, navigation }: Props) {
           onReject={onRejectRequest}
         />
       ) : (
+      <>
+      {processingStatus ? (
+        <View style={styles.processingBar}>
+          <ActivityIndicator size="small" color={colors.accent} />
+          <Text style={styles.processingText} numberOfLines={1}>
+            {processingStatus.label}
+          </Text>
+        </View>
+      ) : null}
       <View style={[styles.inputRow, { paddingBottom: 8 + insets.bottom, marginBottom: androidKeyboardHeight }]}>
         {voiceRecorder.isRecording ? (
           <Animated.View
@@ -3466,9 +3877,14 @@ export default function ChatScreen({ route, navigation }: Props) {
                   setAttachmentSheetOpen(true);
                 });
               }}
+              disabled={!!processingStatus}
               hitSlop={8}
             >
-              <Ionicons name="add-outline" size={24} color={colors.textSecondary} />
+              <Ionicons
+                name="add-outline"
+                size={24}
+                color={processingStatus ? colors.textTertiary : colors.textSecondary}
+              />
             </Pressable>
             <View style={styles.inputWrapper}>
               <TextInput
@@ -3495,13 +3911,30 @@ export default function ChatScreen({ route, navigation }: Props) {
                 </Pressable>
               ) : null}
             </View>
-            <Pressable
-              style={[styles.emojiButton, styles.cameraButton]}
-              onPress={() => void pickImageFromCamera()}
-              hitSlop={8}
+            <Animated.View
+              style={[
+                styles.cameraButtonAnimated,
+                {
+                  width: cameraButtonAnim.interpolate({ inputRange: [0, 1], outputRange: [0, 28] }),
+                  marginLeft: cameraButtonAnim.interpolate({ inputRange: [0, 1], outputRange: [0, 6] }),
+                  opacity: cameraButtonAnim,
+                },
+              ]}
+              pointerEvents={hasDraftText ? "none" : "auto"}
             >
-              <Ionicons name="camera-outline" size={22} color={colors.textSecondary} />
-            </Pressable>
+              <Pressable
+                style={styles.emojiButton}
+                onPress={() => void pickImageFromCamera()}
+                disabled={!!processingStatus}
+                hitSlop={8}
+              >
+                <Ionicons
+                  name="camera-outline"
+                  size={22}
+                  color={processingStatus ? colors.textTertiary : colors.textSecondary}
+                />
+              </Pressable>
+            </Animated.View>
           </>
         )}
 
@@ -3523,6 +3956,7 @@ export default function ChatScreen({ route, navigation }: Props) {
           </View>
         )}
       </View>
+      </>
       )}
 
       {pickerOpen ? (
@@ -3537,6 +3971,7 @@ export default function ChatScreen({ route, navigation }: Props) {
         onPickVideo={() => void pickAndSendAttachment("video")}
         onPickAudio={() => void pickAndSendAttachment("file")}
         onPickDocument={() => void pickAndSendDocument()}
+        onPickContact={() => navigation.navigate("SelectContact", { conversationId })}
       />
     </KeyboardAvoidingView>
   );
@@ -3819,10 +4254,10 @@ const createStyles = (colors: ThemeColors) =>
       alignItems: "center",
       justifyContent: "center",
     },
-    // Nudges the camera button a bit further from the text input than the
-    // row's own tight 2px gap gives it — emojiButton is shared with other
-    // icon buttons in this row, so this stays a separate override.
-    cameraButton: { marginLeft: 6 },
+    // Collapses to width 0 while typing so inputWrapper's flex:1 reclaims
+    // the space smoothly instead of the input snapping wider on each
+    // keystroke — see cameraButtonAnim above.
+    cameraButtonAnimated: { height: 40, overflow: "hidden" },
     inputWrapper: {
       flex: 1,
       justifyContent: "center",
@@ -3882,6 +4317,18 @@ const createStyles = (colors: ThemeColors) =>
       justifyContent: "center",
     },
     micButtonActive: { backgroundColor: colors.danger },
+    processingBar: {
+      flexDirection: "row",
+      alignItems: "center",
+      gap: 8,
+      marginHorizontal: 12,
+      marginBottom: 6,
+      paddingHorizontal: 14,
+      paddingVertical: 8,
+      borderRadius: 12,
+      backgroundColor: colors.accentSoft,
+    },
+    processingText: { flex: 1, fontSize: 13, color: colors.textSecondary },
     recordingBar: {
       flex: 1,
       flexDirection: "row",

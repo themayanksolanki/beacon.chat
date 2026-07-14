@@ -158,6 +158,26 @@ function runMigrations() {
     // directly — null otherwise. Drives the "Forwarded" label above the
     // bubble content, same slot as reply_preview.
     ["forwarded_at", "ALTER TABLE messages ADD COLUMN forwarded_at INTEGER"],
+    // Shared "contact card" fields for kind === 'contact' — a snapshot of a
+    // device contact (name + phone number) picked from the sender's address
+    // book, WhatsApp-style. contact_user_id/contact_avatar_url are legacy
+    // from an earlier "share one of your Beacon contacts" version of this
+    // feature and are unused by current sends, but left in place (still
+    // nullable) rather than dropped, since SQLite ALTER TABLE can't cheaply
+    // remove a column and old messages may still have them populated.
+    ["contact_user_id", "ALTER TABLE messages ADD COLUMN contact_user_id TEXT"],
+    ["contact_name", "ALTER TABLE messages ADD COLUMN contact_name TEXT"],
+    ["contact_avatar_url", "ALTER TABLE messages ADD COLUMN contact_avatar_url TEXT"],
+    ["contact_phone_number", "ALTER TABLE messages ADD COLUMN contact_phone_number TEXT"],
+    // Sender-local poster frame generated at send time (see
+    // media/videoCompression.ts) — never uploaded/sent over the wire, so
+    // this is always null on the recipient's copy of the same message.
+    ["video_thumbnail_uri", "ALTER TABLE messages ADD COLUMN video_thumbnail_uri TEXT"],
+    // Set to the local time of the most recent edit (see setMessageEdited)
+    // — null if the message/caption has never been changed since it was
+    // sent. sent_at is deliberately left untouched by an edit, same
+    // "preserve the original" story as forwarded_at leaving sent_at alone.
+    ["edited_at", "ALTER TABLE messages ADD COLUMN edited_at INTEGER"],
   ];
   for (const [column, statement] of migrations) {
     if (!existingColumns.has(column)) {
@@ -198,7 +218,7 @@ function runMigrations() {
 }
 
 export type MessageStatus = "pending" | "sent" | "delivered" | "read" | "failed";
-export type MessageKind = "text" | "voice" | "image" | "gif" | "video" | "file";
+export type MessageKind = "text" | "voice" | "image" | "gif" | "video" | "file" | "contact";
 
 // Tracks an S3-backed attachment's transfer state (image sent via the new
 // attachment pipeline, video, file). 'ready' is also the default/no-op value
@@ -262,13 +282,23 @@ export interface MessageRow {
   album_id: string | null;
   /** Local send time if this message was created via the forward flow, else null — see the forwarded_at migration above. */
   forwarded_at: number | null;
+  /** Legacy "share a Beacon contact" fields — unused by current sends, see the migration comment above. */
+  contact_user_id: string | null;
+  /** Shared contact's name, and phone number picked from the sender's device address book. Only set when kind === 'contact'. */
+  contact_name: string | null;
+  contact_avatar_url: string | null;
+  contact_phone_number: string | null;
+  /** Sender-local poster frame for a video message — see the video_thumbnail_uri migration above. Always null on the recipient's copy. */
+  video_thumbnail_uri: string | null;
+  /** Local time of the most recent edit, else null — see the edited_at migration above. */
+  edited_at: number | null;
 }
 
 export function insertMessage(message: MessageRow) {
   db.runSync(
     `INSERT INTO messages
-       (id, conversation_id, direction, plaintext, sent_at, status, delivered_at, read_at, reply_to_id, reply_preview, pinned_at, deleted_at, reaction_mine, reaction_peer, kind, audio_uri, duration_ms, waveform, image_uri, image_width, image_height, gif_url, gif_width, gif_height, video_uri, video_width, video_height, video_duration_ms, video_size, file_uri, file_name, file_mime, file_size, media_url, media_key, media_nonce, media_status, album_id, forwarded_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       (id, conversation_id, direction, plaintext, sent_at, status, delivered_at, read_at, reply_to_id, reply_preview, pinned_at, deleted_at, reaction_mine, reaction_peer, kind, audio_uri, duration_ms, waveform, image_uri, image_width, image_height, gif_url, gif_width, gif_height, video_uri, video_width, video_height, video_duration_ms, video_size, file_uri, file_name, file_mime, file_size, media_url, media_key, media_nonce, media_status, album_id, forwarded_at, contact_user_id, contact_name, contact_avatar_url, contact_phone_number, video_thumbnail_uri, edited_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [
       message.id,
       message.conversation_id,
@@ -309,8 +339,19 @@ export function insertMessage(message: MessageRow) {
       message.media_status,
       message.album_id,
       message.forwarded_at,
+      message.contact_user_id,
+      message.contact_name,
+      message.contact_avatar_url,
+      message.contact_phone_number,
+      message.video_thumbnail_uri,
+      message.edited_at,
     ]
   );
+}
+
+/** Overwrites a message's own text/caption after the sender edits it — sent_at is never touched, only plaintext + edited_at. Used for both the local optimistic update and the incoming decrypted edit (see MessagingContext). */
+export function setMessageEdited(id: string, newText: string, editedAt: number | null): void {
+  db.runSync(`UPDATE messages SET plaintext = ?, edited_at = ? WHERE id = ?`, [newText, editedAt, id]);
 }
 
 export function setMessageMediaStatus(id: string, status: MediaStatus): void {
@@ -350,6 +391,16 @@ export function getMessages(conversationId: string): MessageRow[] {
 /** Single message lookup by id, regardless of conversation — used by the forward flow to look up a message that may have scrolled out of the currently-loaded page. */
 export function getMessageById(id: string): MessageRow | null {
   return db.getFirstSync<MessageRow>(`SELECT * FROM messages WHERE id = ?`, [id]);
+}
+
+/** Outgoing attachments still stuck mid-upload in this conversation — orphaned if the app was killed before the upload finished (nothing was resuming them automatically before media/uploadQueue.ts's resume-on-reopen sweep). */
+export function getUploadingMessages(conversationId: string): MessageRow[] {
+  return db.getAllSync<MessageRow>(
+    `SELECT * FROM messages
+     WHERE conversation_id = ? AND direction = 'outgoing' AND media_status = 'uploading' AND deleted_at IS NULL
+     ORDER BY sent_at ASC`,
+    [conversationId]
+  );
 }
 
 /** Every image/video/gif shared in this conversation, either direction, most recent first — powers ContactInfoScreen's Media group and SharedMediaScreen's Media tab. */

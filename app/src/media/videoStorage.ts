@@ -33,3 +33,16 @@ export function deleteVideoMessage(uri: string): void {
   const file = new File(uri);
   if (file.exists) file.delete();
 }
+
+/** Copies a generated poster frame (see media/videoCompression.ts) into permanent app storage — sender-local only, never uploaded. */
+export async function persistVideoThumbnail(sourceUri: string, messageId: string): Promise<string> {
+  const destination = new File(videoDirectory(), `${messageId}-thumb.jpg`);
+  if (destination.exists) destination.delete();
+  await new File(sourceUri).copy(destination);
+  return destination.uri;
+}
+
+export function deleteVideoThumbnail(uri: string): void {
+  const file = new File(uri);
+  if (file.exists) file.delete();
+}

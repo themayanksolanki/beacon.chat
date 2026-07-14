@@ -95,7 +95,7 @@ export async function notifyNewMessage(payload: NewMessageNotificationPayload): 
       pressAction: { id: "default" },
     },
     ios: {
-      attachments: iosAvatarUri ? [{ url: iosAvatarUri }] : undefined,
+      ...(iosAvatarUri ? { attachments: [{ url: iosAvatarUri }] } : {}),
     },
   });
 }

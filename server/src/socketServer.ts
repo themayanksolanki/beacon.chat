@@ -69,6 +69,7 @@ function clearPendingCallDisconnect(callId: string): void {
 function endActiveCall(callId: string, io: Server, reason: string, notify: string[]): void {
   const call = activeCalls.get(callId);
   if (!call) return;
+  console.log(`[call] ending ${callId} reason=${reason} caller=${call.callerId} callee=${call.calleeId} notify=${notify.join(",")}`);
   clearPendingCallDisconnect(callId);
   activeCalls.delete(callId);
   userActiveCall.delete(call.callerId);
@@ -235,7 +236,10 @@ export function createSocketServer(httpServer: HttpServer): Server {
     // expire and no-op — the call just carries on as if the blip never
     // happened.
     const activeCallId = userActiveCall.get(userId);
-    if (activeCallId) clearPendingCallDisconnect(activeCallId);
+    if (activeCallId) {
+      console.log(`[call] ${userId} reconnected mid-call ${activeCallId}, cancelling any pending disconnect teardown`);
+      clearPendingCallDisconnect(activeCallId);
+    }
 
     // Fire-and-forget, deliberately not awaited: every socket.on(...) listener
     // below must be registered synchronously, in this same tick, before
@@ -786,6 +790,7 @@ export function createSocketServer(httpServer: HttpServer): Server {
       const callId = userActiveCall.get(userId);
       if (callId && !pendingCallDisconnectTimers.has(callId)) {
         const disconnectedUserId = userId;
+        console.log(`[call] ${disconnectedUserId} socket disconnected mid-call ${callId}, starting ${CALL_DISCONNECT_GRACE_MS}ms grace window`);
         const timer = setTimeout(() => {
           pendingCallDisconnectTimers.delete(callId);
           const call = activeCalls.get(callId);

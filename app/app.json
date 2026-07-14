@@ -94,7 +94,8 @@
       "expo-font",
       "expo-asset",
       "expo-video",
-      "expo-sharing"
+      "expo-sharing",
+      "react-native-compressor"
     ],
     "extra": {
       "eas": {
