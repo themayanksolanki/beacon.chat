@@ -246,11 +246,18 @@ export default function ActiveCallScreen() {
             onPress={toggleCamera}
           />
           <ControlButton icon="camera-reverse" onPress={switchCamera} disabled={isCameraOff} />
-          <ControlButton
-            icon="desktop-outline"
-            active={isScreenSharing}
-            onPress={() => void onToggleScreenShare()}
-          />
+          {/* iOS screen share needs a Broadcast Upload Extension requiring an
+              App Groups entitlement, which breaks code signing without a paid
+              Apple Developer Program membership (see docs/ios-screen-share-setup.md)
+              — hidden here until that's set up. Android needs no such
+              entitlement, so it stays available there. */}
+          {Platform.OS !== "ios" ? (
+            <ControlButton
+              icon="desktop-outline"
+              active={isScreenSharing}
+              onPress={() => void onToggleScreenShare()}
+            />
+          ) : null}
         </View>
         {/* Hidden native view — never actually seen, just gives
             ScreenCapturePickerViewManager.show() a node handle to target on

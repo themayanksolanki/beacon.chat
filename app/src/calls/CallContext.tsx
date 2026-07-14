@@ -67,6 +67,10 @@ async function buildIceServers(token: string | null): Promise<IceServerConfig[]>
   }
 }
 const RING_TIMEOUT_MS = 45000;
+// See the "endCall" native-event listener below — filters out CallKit/
+// ConnectionService reporting a call's end on its own, well before any human
+// could plausibly have swiped decline from the lock screen/system banner.
+const MIN_PLAUSIBLE_NATIVE_END_CALL_MS = 1500;
 // Some environments (e.g. Android with a self-managed phone account the user
 // hasn't authorized yet) accept RNCallKeep.startCall() without ever firing
 // didReceiveStartCallAction — this bounds how long we wait for it before
@@ -248,6 +252,12 @@ export function CallProvider({ children }: { children: ReactNode }) {
   );
   const remoteDescriptionSetRef = useRef(false);
   const incomingInviteRef = useRef<IncomingInvite | null>(null);
+  // Timestamp (Date.now()) of the moment an incoming call started ringing —
+  // used to sanity-check the native "endCall" event below (see its comment):
+  // a real user cannot swipe-decline from the lock screen/system banner
+  // within a few hundred ms of it appearing, so an event that fast is a
+  // CallKit/OS quirk, not a genuine decline.
+  const incomingRingStartedAtRef = useRef<number | null>(null);
   const ringTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const durationIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const connectedAtRef = useRef<number | null>(null);
@@ -424,6 +434,7 @@ export function CallProvider({ children }: { children: ReactNode }) {
     pendingCandidatesRef.current = [];
     remoteDescriptionSetRef.current = false;
     incomingInviteRef.current = null;
+    incomingRingStartedAtRef.current = null;
     if (durationIntervalRef.current) {
       clearInterval(durationIntervalRef.current);
       durationIntervalRef.current = null;
@@ -906,6 +917,7 @@ export function CallProvider({ children }: { children: ReactNode }) {
     };
     setCall(info);
     setPhase("incoming-ringing");
+    incomingRingStartedAtRef.current = Date.now();
     if (navigationRef.isReady()) navigationRef.navigate("IncomingCall");
     Vibration.vibrate([500, 1000, 500, 1000], true);
     // CallKeep (below) would normally trigger the OS's own ringtone, but it's
@@ -1340,6 +1352,24 @@ export function CallProvider({ children }: { children: ReactNode }) {
     const listener = RNCallKeep.addEventListener("endCall", ({ callUUID }) => {
       if (callRef.current?.callId !== callUUID) return;
       if (phaseRef.current === "incoming-ringing") {
+        // CallKit/ConnectionService can fire this spontaneously — no user
+        // action at all — on environments with a flaky or absent real
+        // telephony stack (confirmed on iOS Simulator: it reports the
+        // incoming call successfully, then invalidates it on its own well
+        // under a second later). A real person cannot swipe-decline from
+        // the lock screen/system banner that fast, and because this call is
+        // relayed to *every* linked device, trusting a spurious event here
+        // would silently kill the call for all of them off one flaky
+        // device. Below this threshold, ignore it and keep ringing via the
+        // app's own IncomingCallScreen (already the primary accept/decline
+        // surface) instead of RNCallKeep.rejectCall.
+        const ringingForMs = incomingRingStartedAtRef.current ? Date.now() - incomingRingStartedAtRef.current : null;
+        if (ringingForMs != null && ringingForMs < MIN_PLAUSIBLE_NATIVE_END_CALL_MS) {
+          console.warn(
+            `[call] ignoring native endCall event ${ringingForMs}ms into ringing — too fast to be a real decline, likely a CallKit/telephony-stack quirk`
+          );
+          return;
+        }
         rejectIncomingCall();
       } else if (phaseRef.current !== "idle") {
         endCall();

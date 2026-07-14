@@ -21,12 +21,7 @@
         "UIBackgroundModes": [
           "voip",
           "audio"
-        ],
-        "RTCScreenSharingExtension": "com.beaconchat.app.BeaconScreenShare",
-        "RTCAppGroupIdentifier": "group.com.beaconchat.app"
-      },
-      "entitlements": {
-        "com.apple.security.application-groups": ["group.com.beaconchat.app"]
+        ]
       }
     },
     "android": {
@@ -64,7 +59,6 @@
       "./plugins/withAndroidPip.js",
       "./plugins/withNotifeeAndroidMavenRepo.js",
       "./plugins/withAndroidReleaseSigning.js",
-      "./plugins/withIosScreenShareExtension.js",
       "@giphy/react-native-sdk",
       [
         "expo-image-picker",
