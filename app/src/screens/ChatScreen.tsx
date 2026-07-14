@@ -3,6 +3,7 @@ import {
   ActivityIndicator,
   Alert,
   Animated,
+  Easing,
   FlatList,
   Keyboard,
   KeyboardAvoidingView,
@@ -707,10 +708,10 @@ interface MessageBubbleProps {
   onOpenFile: (message: MessageRow) => void;
   /** Opens the full-screen gallery (see MediaViewerModal) — items is every viewable item in this bubble's batch (just 1 for a non-grouped bubble), initialIndex is which one was tapped. */
   onOpenMedia: (items: ViewerMedia[], initialIndex: number) => void;
-  /** Opens a shared contact's own chat, for kind === 'contact' bubbles — see ChatScreen's onOpenContact. */
-  onOpenContact: (message: MessageRow) => void;
   /** Fraction 0..1 of an in-flight attachment upload for this message, if any. */
   uploadProgress?: number;
+  /** True for a message that just arrived while this screen was already mounted (a live send/receive, not part of the initial history load) — plays a one-time slide-up/fade-in entrance (see ChatScreen's newMessageIds). */
+  shouldAnimateIn?: boolean;
   /** True while this is the currently-active in-chat search match (see the searchMatches/activeMatch state) — tints the bubble so it stands out, WhatsApp-style. */
   highlighted?: boolean;
   /** True while forward-selection mode is active (see ChatScreen's selectionMode) — swaps every tap on this bubble to toggle selection instead of its normal behavior. */
@@ -737,8 +738,8 @@ function MessageBubble({
   onDownload,
   onOpenFile,
   onOpenMedia,
-  onOpenContact,
   uploadProgress,
+  shouldAnimateIn,
   highlighted,
   selectionMode,
   selected,
@@ -747,6 +748,31 @@ function MessageBubble({
   const { colors } = useTheme();
   const styles = useMemo(() => createStyles(colors), [colors]);
   const translateX = useRef(new Animated.Value(0)).current;
+  // Slide-up/fade-in entrance for a message that just arrived while this
+  // screen was already open — starts already-settled (1) for every other
+  // bubble so this never applies retroactively. Deliberately a *separate*
+  // Animated.Value from translateX (the swipe-to-reply one) rather than
+  // reusing it, since the two run on different axes/lifetimes and mixing
+  // them would make the swipe gesture's own spring-back fight this one-shot
+  // timing animation. Read once into a plain boolean on mount — only the
+  // very first render's value matters, since this is a mount-only effect
+  // below and the prop has no reason to flip true->false->true again for
+  // the same bubble instance.
+  const entranceAnim = useRef(new Animated.Value(shouldAnimateIn ? 0 : 1)).current;
+  useEffect(() => {
+    if (!shouldAnimateIn) return;
+    Animated.timing(entranceAnim, {
+      toValue: 1,
+      duration: 280,
+      easing: Easing.out(Easing.cubic),
+      useNativeDriver: true,
+    }).start();
+    // Empty deps: this must fire exactly once, when this particular bubble
+    // instance first mounts (a genuinely new message) — not on every
+    // re-render of an already-settled one (e.g. status ticking pending ->
+    // sent reuses the same mounted instance via keyExtractor's stable id).
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
   const replyTriggered = useRef(false);
   const bubbleRef = useRef<View>(null);
 
@@ -823,7 +849,13 @@ function MessageBubble({
     <Animated.View
       {...(selectionMode ? {} : panResponder.panHandlers)}
       style={[
-        { transform: [{ translateX }] },
+        {
+          opacity: entranceAnim,
+          transform: [
+            { translateX },
+            { translateY: entranceAnim.interpolate({ inputRange: [0, 1], outputRange: [16, 0] }) },
+          ],
+        },
         hasReaction ? styles.bubbleRowReacted : isGroupEnd ? styles.bubbleRowSpaced : styles.bubbleRowTight,
       ]}
     >
@@ -1464,6 +1496,32 @@ export default function ChatScreen({ route, navigation }: Props) {
   const [calls, setCalls] = useState<CallRow[]>(() => loadInitialPage().calls);
   const [hasMoreOlderMessages, setHasMoreOlderMessages] = useState(() => loadInitialPage().hasMore);
   const [loadingOlderMessages, setLoadingOlderMessages] = useState(false);
+
+  // Seeded once with the initial page's own ids — a "these don't need the
+  // entrance animation" baseline — then only ever grows (see the effect
+  // below). A later bulk re-fetch (reloadMessages/resetAndLoadMessages
+  // swapping in fresh MessageRow object references for the same ids, e.g.
+  // on every revision bump or refocus) never re-marks an already-seen id as
+  // new, so MessageBubble's mount-only entrance effect can't replay for it.
+  const knownMessageIdsRef = useRef<Set<string> | null>(null);
+  if (knownMessageIdsRef.current === null) {
+    knownMessageIdsRef.current = new Set(messages.map((m) => m.id));
+  }
+  // Ids to play the slide-up/fade-in entrance for on this render: unseen by
+  // this component *and* recent enough to be a live arrival rather than
+  // older history paged in from scrolling up (loadOlderMessages prepends
+  // ids this component also hasn't seen yet, but those are never "new").
+  const newMessageIds = useMemo(() => {
+    const ids = new Set<string>();
+    const cutoff = Date.now() - 5000;
+    for (const m of messages) {
+      if (!knownMessageIdsRef.current!.has(m.id) && m.sent_at >= cutoff) ids.add(m.id);
+    }
+    return ids;
+  }, [messages]);
+  useEffect(() => {
+    for (const m of messages) knownMessageIdsRef.current!.add(m.id);
+  }, [messages]);
 
   // Discards any extra history the user scrolled into and jumps back to just
   // the latest page — used on focus/conversation switch, matching what the
@@ -2891,6 +2949,7 @@ export default function ChatScreen({ route, navigation }: Props) {
           contact_user_id: null,
           contact_name: null,
           contact_avatar_url: null,
+          contact_phone_number: null,
           video_thumbnail_uri: kind === "video" ? videoThumbnailUri : null,
           edited_at: null,
         };
@@ -3169,11 +3228,11 @@ export default function ChatScreen({ route, navigation }: Props) {
     [conversation, conversationId, isTestBot, replyingTo, sendGifEncrypted]
   );
 
-  // Shares one of the user's own contacts (picked via SelectContactScreen,
-  // see the route.params.shareContact effect below) as a contact-card message
-  // — no media of its own, so this mirrors sendGif's shape/local-insert flow.
+  // Shares a device contact (picked via SelectContactScreen, see the
+  // route.params.shareContact effect below) as a contact-card message — no
+  // media of its own, so this mirrors sendGif's shape/local-insert flow.
   const sendContact = useCallback(
-    (contactUserId: string, name: string, avatarUrl: string | null) => {
+    (name: string, phoneNumber: string) => {
       if (!conversation) return;
 
       const id = Crypto.randomUUID();
@@ -3203,9 +3262,8 @@ export default function ChatScreen({ route, navigation }: Props) {
         gif_width: null,
         gif_height: null,
         ...NO_MEDIA_FIELDS,
-        contact_user_id: contactUserId,
         contact_name: name,
-        contact_avatar_url: avatarUrl,
+        contact_phone_number: phoneNumber,
       };
       insertMessage(outgoing);
       setMessages((prev) => [...prev, outgoing]);
@@ -3216,20 +3274,20 @@ export default function ChatScreen({ route, navigation }: Props) {
         return;
       }
 
-      void sendContactEncrypted(id, contactUserId, name, avatarUrl);
+      void sendContactEncrypted(id, name, phoneNumber);
     },
     [conversation, conversationId, isTestBot, sendContactEncrypted]
   );
 
   // Consumes SelectContactScreen's result: it navigates back here (see
-  // AttachmentSheet's onPickContact below) with the contact the user picked,
-  // merged onto this screen's own route params — same pattern as
+  // AttachmentSheet's onPickContact below) with the device contact the user
+  // picked, merged onto this screen's own route params — same pattern as
   // forwardTargets above.
   useEffect(() => {
     const shareContact = route.params?.shareContact;
     if (!shareContact) return;
     navigation.setParams({ shareContact: undefined });
-    sendContact(shareContact.userId, shareContact.name, shareContact.avatarUrl);
+    sendContact(shareContact.name, shareContact.phoneNumber);
     // eslint-disable-next-line react-hooks/exhaustive-deps -- only reacts to the param actually changing, not every render of sendContact
   }, [route.params?.shareContact]);
 
@@ -3740,8 +3798,8 @@ export default function ChatScreen({ route, navigation }: Props) {
                 onDownload={downloadMedia}
                 onOpenFile={onOpenFile}
                 onOpenMedia={onOpenMedia}
-                onOpenContact={onOpenContact}
                 uploadProgress={uploadProgressById[item.message.id]}
+                shouldAnimateIn={newMessageIds.has(item.message.id)}
                 highlighted={item.message.id === activeMatch?.id}
                 selectionMode={selectionMode}
                 selected={selectedIds.has(item.message.id)}

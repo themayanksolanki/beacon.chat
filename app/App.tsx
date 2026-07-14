@@ -69,10 +69,10 @@ export type MainStackParamList = {
     // these conversations then clears both params.
     forwardTargets?: string[];
     forwardMessageIds?: string[];
-    // Set by SelectContactScreen when the user picks a contact — see
+    // Set by SelectContactScreen when the user picks a device contact — see
     // ChatScreen's route.params.shareContact effect, which sends it as a
     // contact-card message then clears this param.
-    shareContact?: { userId: string; name: string; avatarUrl: string | null };
+    shareContact?: { name: string; phoneNumber: string };
   };
   Forward: { messageIds: string[]; sourceConversationId: string };
   SelectContact: { conversationId: string };

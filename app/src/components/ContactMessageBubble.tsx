@@ -8,41 +8,47 @@ import type { ThemeColors } from "../theme";
 
 interface Props {
   name: string;
-  avatarUrl: string | null;
-  /** Opens the shared contact's chat — undefined when there's nothing local to open (e.g. no conversation with them yet). */
-  onPress?: () => void;
+  phoneNumber: string | null;
   onLongPress?: () => void;
 }
 
-export default function ContactMessageBubble({ name, avatarUrl, onPress, onLongPress }: Props) {
+// Purely a display card — like WhatsApp's shared-contact bubble, this shows
+// the name/number the sender picked from their device address book. There's
+// no tap-to-open action: the number isn't necessarily a Beacon account (or
+// even the recipient's own contact), so there's nothing reliable to
+// navigate to or dial from here.
+export default function ContactMessageBubble({ name, phoneNumber, onLongPress }: Props) {
   const { colors } = useTheme();
   const styles = useMemo(() => createStyles(colors), [colors]);
 
   return (
-    <Pressable style={styles.container} onPress={onPress} onLongPress={onLongPress} disabled={!onPress}>
-      <Avatar name={name} avatarUrl={avatarUrl} size={40} />
-      <View style={styles.textWrap}>
-        <Text style={styles.name} numberOfLines={1}>
-          {name}
-        </Text>
-        <Text style={styles.meta}>Contact</Text>
-      </View>
-      {onPress ? <Ionicons name="chevron-forward" size={16} color={colors.textTertiary} /> : null}
-    </Pressable>
+    <View style={styles.container}>
+      <Pressable style={styles.pressable} onLongPress={onLongPress}>
+        <Avatar name={name} avatarUrl={null} size={40} />
+        <View style={styles.textWrap}>
+          <Text style={styles.name} numberOfLines={1}>
+            {name}
+          </Text>
+          <Text style={styles.meta} numberOfLines={1}>
+            {phoneNumber ?? "Contact"}
+          </Text>
+        </View>
+        <Ionicons name="person-circle-outline" size={18} color={colors.textTertiary} />
+      </Pressable>
+    </View>
   );
 }
 
 const createStyles = (colors: ThemeColors) =>
   StyleSheet.create({
-    container: {
+    container: { minWidth: 190, maxWidth: 240 },
+    pressable: {
       flexDirection: "row",
       alignItems: "center",
       gap: 10,
       paddingVertical: 8,
       paddingHorizontal: 10,
       borderRadius: 12,
-      minWidth: 190,
-      maxWidth: 240,
     },
     textWrap: { flex: 1, minWidth: 0 },
     name: { color: colors.text, fontSize: 14, fontWeight: "600" },
